@@ -1,20 +1,19 @@
 #include "Profiler.h"
 
 #include <cassert>
+#include <cstdarg>
+#include <cstdio>
 
 CProfiler::ZoneHandle CProfiler::RegisterZone(const char* name)
 {
 #ifdef PROFILE
-	for(unsigned int i = 0; i < m_zones.size(); i++)
+	for(unsigned int i = 0; i < m_zoneNames.size(); i++)
 	{
-		const auto& zone(m_zones[i]);
-		if(zone.name == name) return i;
+		if(m_zoneNames[i] == name) return i;
 	}
-	auto newZone = ZONE();
-	newZone.name = name;
-	newZone.totalTime = 0;
-	m_zones.push_back(newZone);
-	return static_cast<CProfiler::ZoneHandle>(m_zones.size() - 1);
+	assert(m_zoneNames.size() < MAX_ZONES);
+	m_zoneNames.push_back(name);
+	return static_cast<CProfiler::ZoneHandle>(m_zoneNames.size() - 1);
 #else
 	return 0;
 #endif
@@ -22,71 +21,91 @@ CProfiler::ZoneHandle CProfiler::RegisterZone(const char* name)
 
 void CProfiler::CountCurrentZone()
 {
-	assert(std::this_thread::get_id() == m_workThreadId);
-	assert(!m_zoneStack.empty());
-
-	auto thisTime = std::chrono::high_resolution_clock::now();
-
-	{
-		auto topZoneHandle = m_zoneStack.top();
-		auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(thisTime - m_currentTime);
-		AddTimeToZone(topZoneHandle, duration.count());
-	}
-
-	m_currentTime = thisTime;
 }
 
 void CProfiler::EnterZone(ZoneHandle zoneHandle)
 {
-	assert(std::this_thread::get_id() == m_workThreadId);
-
-	auto thisTime = std::chrono::high_resolution_clock::now();
-
-	if(!m_zoneStack.empty())
-	{
-		auto topZoneHandle = m_zoneStack.top();
-		auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(thisTime - m_currentTime);
-		AddTimeToZone(topZoneHandle, duration.count());
-	}
-
 	m_zoneStack.push(zoneHandle);
-
-	m_currentTime = thisTime;
+	m_currentZone.store(zoneHandle, std::memory_order_relaxed);
 }
 
 void CProfiler::ExitZone()
 {
-	CountCurrentZone();
 	m_zoneStack.pop();
+	m_currentZone.store(m_zoneStack.empty() ? -1 : m_zoneStack.top(), std::memory_order_relaxed);
 }
 
 CProfiler::ZoneArray CProfiler::GetStats() const
 {
-	assert(std::this_thread::get_id() == m_workThreadId);
-	return m_zones;
+	ZoneArray result;
+	for(unsigned int i = 0; i < m_zoneNames.size(); i++)
+	{
+		ZONE zone;
+		zone.name = m_zoneNames[i];
+		zone.totalTime = m_zoneTimes[i].load(std::memory_order_relaxed);
+		result.push_back(zone);
+	}
+	return result;
 }
 
 void CProfiler::Reset()
 {
-	assert(std::this_thread::get_id() == m_workThreadId);
-	for(auto& zone : m_zones)
+	for(auto& zoneTime : m_zoneTimes)
 	{
-		zone.totalTime = 0;
+		zoneTime.store(0, std::memory_order_relaxed);
 	}
 }
 
 void CProfiler::SetWorkThread()
 {
-#ifndef NDEBUG
 	m_workThreadId = std::this_thread::get_id();
+#ifdef PROFILE
+	if(!m_samplerThread.joinable())
+	{
+		m_samplerThread = std::thread([this]() { SamplerThreadProc(); });
+		m_samplerThread.detach();
+	}
 #endif
 }
 
-void CProfiler::AddTimeToZone(ZoneHandle zoneHandle, uint64 timeNs)
+void CProfiler::SetPcSampler(unsigned int slot, ZoneHandle zone, const uint32* pc)
 {
-	assert(m_zones.size() > zoneHandle);
-	auto& zone = m_zones[zoneHandle];
-	zone.totalTime += timeNs;
+	assert(slot < MAX_PC_SAMPLERS);
+	m_pcSamplers[slot].pc = pc;
+	m_pcSamplers[slot].zone = zone;
+}
+
+CProfiler::PcHistogram CProfiler::TakePcHistogram(unsigned int slot)
+{
+	assert(slot < MAX_PC_SAMPLERS);
+	std::lock_guard<std::mutex> lock(m_pcSamplersMutex);
+	PcHistogram result;
+	std::swap(result, m_pcSamplers[slot].histogram);
+	return result;
+}
+
+void CProfiler::SamplerThreadProc()
+{
+	auto lastTime = std::chrono::steady_clock::now();
+	while(1)
+	{
+		std::this_thread::sleep_for(std::chrono::microseconds(500));
+		auto thisTime = std::chrono::steady_clock::now();
+		uint64 elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(thisTime - lastTime).count();
+		lastTime = thisTime;
+		int32 zone = m_currentZone.load(std::memory_order_relaxed);
+		if(zone < 0 || zone >= MAX_ZONES) continue;
+		m_zoneTimes[zone].fetch_add(elapsed, std::memory_order_relaxed);
+		for(auto& sampler : m_pcSamplers)
+		{
+			auto pc = sampler.pc.load();
+			if(sampler.zone == zone && pc)
+			{
+				std::lock_guard<std::mutex> lock(m_pcSamplersMutex);
+				sampler.histogram[*pc]++;
+			}
+		}
+	}
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -95,13 +114,33 @@ void CProfiler::AddTimeToZone(ZoneHandle zoneHandle, uint64 timeNs)
 CProfilerZone::CProfilerZone(CProfiler::ZoneHandle handle)
 {
 #ifdef PROFILE
-	CProfiler::GetInstance().EnterZone(handle);
+	m_active = CProfiler::GetInstance().IsWorkThread();
+	if(m_active) CProfiler::GetInstance().EnterZone(handle);
 #endif
 }
 
 CProfilerZone::~CProfilerZone()
 {
 #ifdef PROFILE
-	CProfiler::GetInstance().ExitZone();
+	if(m_active) CProfiler::GetInstance().ExitZone();
 #endif
+}
+
+void CProfiler::Log(const char* format, ...)
+{
+	char buffer[2048];
+	va_list args;
+	va_start(args, format);
+	vsnprintf(buffer, sizeof(buffer), format, args);
+	va_end(args);
+	std::lock_guard<std::mutex> lock(m_logMutex);
+	if(m_log.size() < 65536) m_log += buffer;
+}
+
+std::string CProfiler::TakeLog()
+{
+	std::lock_guard<std::mutex> lock(m_logMutex);
+	std::string result;
+	std::swap(result, m_log);
+	return result;
 }

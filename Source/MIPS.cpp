@@ -30,9 +30,11 @@ CMIPS::CMIPS(MEMORYMAP_ENDIANNESS endianness, bool usePageTable)
 	{
 		const uint32 pageCount = 0x100000000ULL / MIPS_PAGE_SIZE;
 		m_pageLookup = new void*[pageCount];
+		m_pageLookupWrite = new void*[pageCount];
 		for(uint32 i = 0; i < pageCount; i++)
 		{
 			m_pageLookup[i] = nullptr;
+			m_pageLookupWrite[i] = nullptr;
 		}
 	}
 
@@ -49,6 +51,7 @@ CMIPS::~CMIPS()
 	delete m_pMemoryMap;
 	delete m_analysis;
 	delete[] m_pageLookup;
+	delete[] m_pageLookupWrite;
 }
 
 void CMIPS::Reset()
@@ -158,5 +161,6 @@ void CMIPS::MapPages(uint32 vAddress, uint32 size, uint8* memory)
 	for(uint32 pageIndex = 0; pageIndex < (size / MIPS_PAGE_SIZE); pageIndex++)
 	{
 		m_pageLookup[pageBase + pageIndex] = memory + (MIPS_PAGE_SIZE * pageIndex);
+		m_pageLookupWrite[pageBase + pageIndex] = memory + (MIPS_PAGE_SIZE * pageIndex);
 	}
 }

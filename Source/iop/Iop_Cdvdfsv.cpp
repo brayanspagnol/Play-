@@ -1,4 +1,5 @@
 #include <assert.h>
+#include "../ee/EeExecutor.h"
 #include "Log.h"
 #include "../Ps2Const.h"
 #include "Iop_Cdvdfsv.h"
@@ -97,6 +98,7 @@ void CCdvdfsv::FinishPendingCommand()
 			{
 				fileSystem->ReadBlock(m_pendingReadSector + i, eeRam + (m_pendingReadAddr + (i * sectorSize)));
 			}
+			CEeExecutor::NotifyRamWritten(m_pendingReadAddr, m_pendingReadCount * sectorSize);
 		}
 	}
 	else if(m_pendingCommand == COMMAND_READIOP)
@@ -120,6 +122,7 @@ void CCdvdfsv::FinishPendingCommand()
 				fileSystem->ReadBlock(m_streamPos, eeRam + (m_pendingReadAddr + (i * sectorSize)));
 				m_streamPos++;
 			}
+			CEeExecutor::NotifyRamWritten(m_pendingReadAddr, m_pendingReadCount * sectorSize);
 		}
 	}
 	else if(m_pendingCommand == COMMAND_NDISKREADY)

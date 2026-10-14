@@ -4,6 +4,7 @@
 #include "EeBasicBlock.h"
 #include "MA_EE.h"
 #include "xxhash.h"
+#include "../Profiler.h"
 
 #if defined(__unix__) || defined(__ANDROID__) || defined(__APPLE__)
 #include <sys/mman.h>
@@ -43,7 +44,50 @@ CEeExecutor::CEeExecutor(CMIPS& context, uint8* ram)
     , m_ram(ram)
 {
 	m_pageSize = framework_getpagesize();
+#if defined(__EMSCRIPTEN__)
+	m_pageSize = MIPS_PAGE_SIZE;
+	m_protectedPages.resize(PS2::EE_RAM_SIZE / MIPS_PAGE_SIZE, 0);
+	m_context.m_writeWatchHandler = &CEeExecutor::WriteWatchHandler;
+#endif
 }
+
+#if defined(__EMSCRIPTEN__)
+
+int CEeExecutor::Execute(int cycles)
+{
+	m_executing = true;
+	int result = CGenericMipsExecutor::Execute(cycles);
+	m_executing = false;
+	return result;
+}
+
+void CEeExecutor::WriteWatchHandler(CMIPS* context, uint32 address, uint32 size)
+{
+	//Only called from JIT code (store slow path), so a block is executing
+	static_cast<CEeExecutor*>(context->m_executor.get())->InvalidateWrittenRange(address, size, true);
+}
+
+void CEeExecutor::NotifyRamWritten(uint32 address, uint32 size)
+{
+	if(!g_eeExecutor) return;
+	g_eeExecutor->InvalidateWrittenRange(address, size, g_eeExecutor->m_executing);
+}
+
+void CEeExecutor::InvalidateWrittenRange(uint32 address, uint32 size, bool executing)
+{
+	if(size == 0) return;
+	if(address >= PS2::EE_RAM_SIZE) return;
+	uint32 end = std::min<uint32>(address + size, PS2::EE_RAM_SIZE);
+	for(uint32 page = address / MIPS_PAGE_SIZE; page <= (end - 1) / MIPS_PAGE_SIZE; page++)
+	{
+		if(m_protectedPages[page])
+		{
+			ClearActiveBlocksInRange(page * MIPS_PAGE_SIZE, (page + 1) * MIPS_PAGE_SIZE, executing);
+		}
+	}
+}
+
+#endif
 
 void CEeExecutor::SetBlockFpRoundingModes(BlockFpRoundingModeMap blockFpRoundingModes)
 {
@@ -258,7 +302,24 @@ void CEeExecutor::SetMemoryProtected(void* addr, size_t size, bool protect)
 	BOOL result = VirtualProtect(addr, size, protect ? PAGE_READONLY : PAGE_READWRITE, &oldProtect);
 	assert(result == TRUE);
 #elif defined(__EMSCRIPTEN__)
-	//Not supported on JavaScript/WebAssembly env
+	{
+		ptrdiff_t offset = reinterpret_cast<uint8*>(addr) - m_ram;
+		assert(offset >= 0 && (offset + size) <= PS2::EE_RAM_SIZE);
+		if(size == 0) return;
+		uint32 firstPage = static_cast<uint32>(offset) / MIPS_PAGE_SIZE;
+		uint32 lastPage = static_cast<uint32>(offset + size - 1) / MIPS_PAGE_SIZE;
+		static const uint32 mirrorBases[] = {0x00000000, 0x20000000, 0x30000000, 0x80000000};
+		for(uint32 page = firstPage; page <= lastPage; page++)
+		{
+			if(m_protectedPages[page] == protect) continue;
+			m_protectedPages[page] = protect;
+			void* pagePtr = protect ? nullptr : (m_ram + (page * MIPS_PAGE_SIZE));
+			for(uint32 mirrorBase : mirrorBases)
+			{
+				m_context.m_pageLookupWrite[(mirrorBase / MIPS_PAGE_SIZE) + page] = pagePtr;
+			}
+		}
+	}
 #elif defined(__unix__) || defined(__ANDROID__) || defined(__APPLE__)
 	uintptr_t addrValue = reinterpret_cast<uintptr_t>(addr) & ~(m_pageSize - 1);
 	addr = reinterpret_cast<void*>(addrValue);

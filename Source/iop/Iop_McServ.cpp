@@ -1,4 +1,5 @@
 #include <assert.h>
+#include "../ee/EeExecutor.h"
 #include <stdio.h>
 #include <algorithm>
 #include <cstring>
@@ -1075,6 +1076,7 @@ void CMcServ::ProceedReadFast(CMIPS& context)
 	{
 		auto eeRam = sifManPs2->GetEeRam();
 		memcpy(eeRam + moduleData->readFastBufferAddress, cluster, readSize);
+		CEeExecutor::NotifyRamWritten(moduleData->readFastBufferAddress, readSize);
 	}
 
 	reinterpret_cast<uint32*>(moduleData->rpcBuffer)[3] = readSize;

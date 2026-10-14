@@ -86,24 +86,28 @@ uint128 MemoryUtils_GetQuadProxy(CMIPS* context, uint32 vAddress)
 void MemoryUtils_SetByteProxy(CMIPS* context, uint32 value, uint32 vAddress)
 {
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
+	if(context->m_writeWatchHandler) context->m_writeWatchHandler(context, address, 1);
 	context->m_pMemoryMap->SetByte(address, static_cast<uint8>(value));
 }
 
 void MemoryUtils_SetHalfProxy(CMIPS* context, uint32 value, uint32 vAddress)
 {
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
+	if(context->m_writeWatchHandler) context->m_writeWatchHandler(context, address, 2);
 	context->m_pMemoryMap->SetHalf(address, static_cast<uint16>(value));
 }
 
 void MemoryUtils_SetWordProxy(CMIPS* context, uint32 value, uint32 vAddress)
 {
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
+	if(context->m_writeWatchHandler) context->m_writeWatchHandler(context, address, 4);
 	context->m_pMemoryMap->SetWord(address, value);
 }
 
 void MemoryUtils_SetDoubleProxy(CMIPS* context, uint64 value64, uint32 vAddress)
 {
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
+	if(context->m_writeWatchHandler) context->m_writeWatchHandler(context, address, 8);
 	assert((address & 0x07) == 0);
 	INTEGER64 value;
 	value.q = value64;
@@ -135,6 +139,7 @@ void MemoryUtils_SetQuadProxy(CMIPS* context, const uint128& value, uint32 vAddr
 {
 	uint32 address = context->m_pAddrTranslator(context, vAddress);
 	address &= ~0x0F;
+	if(context->m_writeWatchHandler) context->m_writeWatchHandler(context, address, 16);
 	auto e = context->m_pMemoryMap->GetWriteMap(address);
 	if(!e)
 	{

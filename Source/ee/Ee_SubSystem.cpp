@@ -1,4 +1,5 @@
 #include "Ee_SubSystem.h"
+#include "../Profiler.h"
 #include "EeExecutor.h"
 #include "VuExecutor.h"
 #include "AppConfig.h"
@@ -250,7 +251,12 @@ int CSubSystem::ExecuteCpu(int quota)
 	}
 	else if(!m_EE.m_State.nHasException)
 	{
+#ifdef PROFILE
+		static const auto eeJitZone = CProfiler::GetInstance().RegisterZone("EEJIT");
+		CProfilerZone profilerZone(eeJitZone);
+#endif
 		executed = (quota - m_EE.m_executor->Execute(quota));
+		m_os->NotifyCpuExecution(executed);
 	}
 	if(m_EE.m_State.nHasException)
 	{
@@ -771,6 +777,10 @@ void CSubSystem::HandleVu1AreaWrite(uint32 offset, uint32 value)
 
 void CSubSystem::ExecuteIpu()
 {
+#ifdef PROFILE
+	static const auto ipuZone = CProfiler::GetInstance().RegisterZone("IPU");
+	CProfilerZone profilerZone(ipuZone);
+#endif
 	m_dmac.ResumeDMA4();
 	while(m_ipu.WillExecuteCommand())
 	{

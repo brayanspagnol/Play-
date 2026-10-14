@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <functional>
+#include <atomic>
+#include <chrono>
+#include "../Profiler.h"
 #include "AppConfig.h"
 #include "Log.h"
 #include "../states/MemoryStateFile.h"
@@ -2171,15 +2174,25 @@ void CGSHandler::WriteToDelayedRegister(uint32 address, uint32 value, DELAYED_RE
 	}
 }
 
+#ifdef PROFILE
+std::atomic<uint64> g_gsThreadBusyNs = 0;
+#endif
+
 void CGSHandler::ThreadProc()
 {
 	while(!m_threadDone)
 	{
 		m_mailBox.WaitForCall();
+#ifdef PROFILE
+		auto busyStart = std::chrono::steady_clock::now();
+#endif
 		while(m_mailBox.IsPending())
 		{
 			m_mailBox.ReceiveCall();
 		}
+#ifdef PROFILE
+		g_gsThreadBusyNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - busyStart).count();
+#endif
 	}
 }
 
@@ -2190,6 +2203,15 @@ void CGSHandler::SendGSCall(const CMailBox::FunctionType& function, bool waitFor
 		waitForCompletion = false;
 	}
 	waitForCompletion |= forceWaitForCompletion;
+#ifdef PROFILE
+	if(waitForCompletion)
+	{
+		static const auto gsWaitZone = CProfiler::GetInstance().RegisterZone("GSWAIT");
+		CProfilerZone profilerZone(gsWaitZone);
+		m_mailBox.SendCall(function, waitForCompletion);
+		return;
+	}
+#endif
 	m_mailBox.SendCall(function, waitForCompletion);
 }
 

@@ -144,6 +144,8 @@ endif()
 set(COMMON_SRC_FILES
 	BasicBlock.cpp
 	BasicBlock.h
+	BlockCache.cpp
+	BlockCache.h
 	BiosDebugInfoProvider.h
 	BlockLookupOneWay.h
 	BlockLookupTwoWay.h

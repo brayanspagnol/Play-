@@ -7,13 +7,15 @@ void CIdleEvaluator::Reset()
 	m_semaChecker.Reset();
 	m_selfThreadRotate.Reset();
 	m_threadRotateBounce.Reset();
+	m_tightRotate.Reset();
 }
 
 bool CIdleEvaluator::IsIdle() const
 {
 	return m_semaChecker.m_isIdle ||
 	       m_selfThreadRotate.m_isIdle ||
-	       m_threadRotateBounce.m_isIdle;
+	       m_threadRotateBounce.m_isIdle ||
+	       m_tightRotate.m_isIdle;
 }
 
 void CIdleEvaluator::NotifyEvent(EVENT eventType, uint32 arg0, uint32 arg1)
@@ -21,6 +23,44 @@ void CIdleEvaluator::NotifyEvent(EVENT eventType, uint32 arg0, uint32 arg1)
 	m_semaChecker.NotifyEvent(eventType, arg0, arg1);
 	m_selfThreadRotate.NotifyEvent(eventType, arg0, arg1);
 	m_threadRotateBounce.NotifyEvent(eventType, arg0, arg1);
+	if(eventType == EVENT_INTERRUPT)
+	{
+		m_tightRotate.m_interrupted = true;
+	}
+	m_tightRotate.m_isIdle = false;
+}
+
+void CIdleEvaluator::NotifyRotateThreadReadyQueue(uint32 threadIdBefore, uint32 threadIdAfter, uint32 executedCycles)
+{
+	NotifyEvent(EVENT_ROTATETHREADREADYQUEUE, threadIdBefore, threadIdAfter);
+
+	auto& strategy = m_tightRotate;
+	uint32 elapsed = executedCycles - strategy.m_lastCycles;
+	strategy.m_lastCycles = executedCycles;
+	if(elapsed <= STRATEGY_TIGHTROTATE::TIGHT_CYCLES)
+	{
+		strategy.m_streak++;
+	}
+	else if(!strategy.m_interrupted)
+	{
+		//Real work happened since the last rotation (interrupt handler cycles don't count)
+		strategy.m_streak = 0;
+	}
+	strategy.m_interrupted = false;
+	strategy.m_isIdle = (strategy.m_streak >= STRATEGY_TIGHTROTATE::THRESHOLD);
+}
+
+void CIdleEvaluator::BeginExecution()
+{
+	m_tightRotate.m_isIdle = false;
+}
+
+void CIdleEvaluator::STRATEGY_TIGHTROTATE::Reset()
+{
+	m_lastCycles = 0;
+	m_streak = 0;
+	m_interrupted = false;
+	m_isIdle = false;
 }
 
 void CIdleEvaluator::STRATEGY_SEMACHECKER::Reset()

@@ -325,6 +325,8 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
 		{
 			//Disable block linking because targets will be wrong
 			m_isLinkable = false;
+			//Compiles code outside of the block (branch target): keep it out of the persistent cache
+			m_cacheable = false;
 
 			assert(address >= 8);
 			uint32 branchOpcodeAddr = address - 8;
@@ -348,6 +350,8 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
 			uint32 branchOpcodeLo = m_context.m_pMemoryMap->GetInstruction(branchOpcodeAddr);
 			if(IsConditionalBranch(branchOpcodeLo))
 			{
+				//Compiles the instruction after the block: keep it out of the persistent cache
+				m_cacheable = false;
 				//So, this is a E bit in a delay slot. If branch is not taken
 				//we want to execute the instruction in the E bit delay slot.
 				jitter->PushRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));

@@ -2,6 +2,7 @@
 
 #include <thread>
 #include <future>
+#include <unordered_map>
 #include "filesystem_def.h"
 #include "Types.h"
 #include "MIPS.h"
@@ -202,6 +203,7 @@ private:
 	CProfiler::ZoneHandle m_spuProfilerZone = 0;
 	CProfiler::ZoneHandle m_gsSyncProfilerZone = 0;
 	CProfiler::ZoneHandle m_otherProfilerZone = 0;
+	CProfiler::ZoneHandle m_limiterProfilerZone = 0;
 
 	CPS2OS::RequestLoadExecutableEvent::Connection m_OnRequestLoadExecutableConnection;
 	Framework::CSignal<void()>::Connection m_OnExecutableChangeConnection;

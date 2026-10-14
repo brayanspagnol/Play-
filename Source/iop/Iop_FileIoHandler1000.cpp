@@ -1,4 +1,5 @@
 #include <cstring>
+#include "../ee/EeExecutor.h"
 #include "Iop_FileIoHandler1000.h"
 #include "Iop_Ioman.h"
 #include "Iop_SifManPs2.h"
@@ -194,6 +195,7 @@ std::pair<bool, int32> CFileIoHandler1000::FinishReadRequest(MODULEDATA* moduleD
 	else
 	{
 		memcpy(eeRam + moduleData->eeBufferAddr, moduleData->buffer, result);
+		CEeExecutor::NotifyRamWritten(moduleData->eeBufferAddr, result);
 		moduleData->bytesProcessed += result;
 		moduleData->eeBufferAddr += result;
 		moduleData->size -= result;

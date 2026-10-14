@@ -1,4 +1,5 @@
 #include <cstring>
+#include "EeExecutor.h"
 #include <stdio.h>
 #include "DMAC.h"
 #include "../Ps2Const.h"
@@ -210,6 +211,10 @@ uint32 CDMAC::ResumeDMA3(const void* pBuffer, uint32 nSize)
 	}
 
 	memcpy(pDst, pBuffer, nSize * 0x10);
+	if(pDst != m_spr + (m_D3_MADR & (PS2::EE_SPR_SIZE - 1)))
+	{
+		CEeExecutor::NotifyRamWritten(m_D3_MADR & (PS2::EE_RAM_SIZE - 1), nSize * 0x10);
+	}
 
 	m_D3_MADR += (nSize * 0x10);
 	m_D3_QWC -= nSize;
@@ -297,6 +302,10 @@ uint32 CDMAC::ReceiveDMA8(uint32 nDstAddress, uint32 nCount, uint32 unused, bool
 		uint32 remainSpr = (PS2::EE_SPR_SIZE - m_D8_SADR) / 0x10;
 		uint32 copySize = std::min<uint32>(remainSpr, remainTransfer);
 		memcpy(dstPtr + nDstAddress, m_spr + m_D8_SADR, copySize * 0x10);
+		if(dstPtr == m_ram)
+		{
+			CEeExecutor::NotifyRamWritten(nDstAddress, copySize * 0x10);
+		}
 
 		remainTransfer -= copySize;
 		nDstAddress += (copySize * 0x10);

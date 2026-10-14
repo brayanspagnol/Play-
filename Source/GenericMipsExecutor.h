@@ -3,6 +3,7 @@
 #include <unordered_set>
 #include "MIPS.h"
 #include "BasicBlock.h"
+#include "Profiler.h"
 
 #include "BlockLookupOneWay.h"
 #include "BlockLookupTwoWay.h"
@@ -67,6 +68,16 @@ public:
 		{
 			uint32 address = m_context.m_State.nPC & m_addressMask;
 			auto block = m_blockLookup.FindBlockAt(address);
+#ifdef PROFILE
+			if(m_blockCategory == BLOCK_CATEGORY_PS2_EE)
+			{
+				static const auto blockZone = CProfiler::GetInstance().RegisterZone("EEBLOCK");
+				auto prevZone = CProfiler::GetInstance().SwapCurrentZone(blockZone);
+				block->Execute();
+				CProfiler::GetInstance().SwapCurrentZone(prevZone);
+				continue;
+			}
+#endif
 			block->Execute();
 		}
 		m_context.m_State.nHasException &= ~MIPS_EXCEPTION_STATUS_QUOTADONE;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <vector>
+
 #ifdef _WIN32
 #define NOMINMAX
 #include <Windows.h>
@@ -40,6 +42,20 @@ public:
 
 	BasicBlockPtr BlockFactory(CMIPS&, uint32, uint32) override;
 
+#if defined(__EMSCRIPTEN__)
+	int Execute(int) override;
+
+	//Software write protection of code pages (no mprotect on WebAssembly): JIT stores to
+	//protected pages take the slow path (null write page table entry) and invalidate the
+	//blocks of that page, like the access fault handler does on desktop platforms.
+	//C++ code writing EE RAM directly (DMA, HLE IOP modules) must call NotifyRamWritten.
+	static void NotifyRamWritten(uint32 address, uint32 size);
+#else
+	static void NotifyRamWritten(uint32, uint32)
+	{
+	}
+#endif
+
 private:
 	typedef std::map<CachedBlockKey, BasicBlockPtr> CachedBlockMap;
 	CachedBlockMap m_cachedBlocks;
@@ -50,6 +66,14 @@ private:
 
 	uint8* m_ram = nullptr;
 	size_t m_pageSize = 0;
+
+#if defined(__EMSCRIPTEN__)
+	static void WriteWatchHandler(CMIPS*, uint32, uint32);
+	void InvalidateWrittenRange(uint32, uint32, bool);
+
+	std::vector<uint8> m_protectedPages;
+	bool m_executing = false;
+#endif
 
 	bool HandleAccessFault(intptr_t);
 	void SetMemoryProtected(void*, size_t, bool);

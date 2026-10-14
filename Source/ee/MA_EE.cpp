@@ -153,12 +153,12 @@ void CMA_EE::LQ()
 //1F
 void CMA_EE::SQ()
 {
-	ComputeMemAccessPageRef();
+	ComputeMemAccessPageRef(true);
 
 	m_codeGen->PushCst(0);
 	m_codeGen->BeginIf(Jitter::CONDITION_NE);
 	{
-		ComputeMemAccessRefIdx(0x10);
+		ComputeMemAccessRefIdx(0x10, true);
 
 		m_codeGen->MD_PushRel(offsetof(CMIPS, m_State.nGPR[m_nRT]));
 		m_codeGen->MD_StoreAtRefIdx(1);

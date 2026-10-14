@@ -1,6 +1,12 @@
 #pragma once
 
 #include "Stream.h"
+#include <string>
+
+// Optional URL (same-origin, must honour HTTP Range) the emulation thread reads
+// directly with synchronous XHR, bypassing the main-thread round trip per sector.
+// Empty string = read through Module.discImageDevice on the main thread.
+void Js_SetDiscImageUrl(const std::string&);
 
 class CJsDiscImageDeviceStream : public Framework::CStream
 {

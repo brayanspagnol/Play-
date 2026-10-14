@@ -160,4 +160,7 @@
 		<!-- SLUS-21240 Version 2.01 -->
 		<IdleLoopBlock Address="0x00427F40" CheckBlockKey="6D8515A293E38030EE880D6C915CEAA2;12"/>
 	</GameConfig>
+	<GameConfig Executable="SLES_525.41;1" Title="Grand Theft Auto: San Andreas (Europe)">
+		<IdleLoopBlock Address="0x0034DFD8" Description="Polling loop waiting for the render queue (interrupt-driven counters), ~75% of EE time in cutscenes/gameplay." />
+	</GameConfig>
 </GameConfigs>

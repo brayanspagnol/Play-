@@ -825,12 +825,12 @@ void CMA_MIPSIV::SD()
 {
 	if(!Ensure64BitRegs()) return;
 
-	ComputeMemAccessPageRef();
+	ComputeMemAccessPageRef(true);
 
 	m_codeGen->PushCst(0);
 	m_codeGen->BeginIf(Jitter::CONDITION_NE);
 	{
-		ComputeMemAccessRefIdx(8);
+		ComputeMemAccessRefIdx(8, true);
 
 		m_codeGen->PushRel64(offsetof(CMIPS, m_State.nGPR[m_nRT]));
 		m_codeGen->Store64AtRefIdx(1);

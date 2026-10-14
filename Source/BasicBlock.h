@@ -77,6 +77,8 @@ public:
 	virtual void CompileRange(CMipsJitter*);
 
 	void AddBlockCompileHints(uint32);
+	//Extra codegen-affecting state (besides instruction words and compile hints) for the persistent block cache key.
+	void AddCacheVariant(uint32);
 
 	uint32 GetBeginAddress() const;
 	uint32 GetEndAddress() const;
@@ -106,6 +108,9 @@ protected:
 	CMIPS& m_context;
 
 	uint32 m_blockCompileHints = 0;
+	uint32 m_cacheVariant = 0;
+	//Cleared by CompileRange when the generated code depends on more than the block's own words.
+	bool m_cacheable = true;
 
 	virtual void CompileProlog(CMipsJitter*);
 	virtual void CompileEpilog(CMipsJitter*, bool);

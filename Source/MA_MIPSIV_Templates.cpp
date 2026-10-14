@@ -137,12 +137,12 @@ void CMA_MIPSIV::Template_Store32Idx(const MemoryAccessIdxTraits& traits)
 
 	if(usePageLookup)
 	{
-		ComputeMemAccessPageRef();
+		ComputeMemAccessPageRef(true);
 
 		m_codeGen->PushCst(0);
 		m_codeGen->BeginIf(Jitter::CONDITION_NE);
 		{
-			ComputeMemAccessRefIdx(traits.elementSize);
+			ComputeMemAccessRefIdx(traits.elementSize, true);
 
 			m_codeGen->PushRel(offsetof(CMIPS, m_State.nGPR[m_nRT].nV[0]));
 			((m_codeGen)->*(traits.storeFunction))(1);

@@ -1,8 +1,14 @@
+#include <atomic>
+#include "Profiler.h"
 #include "BasicBlock.h"
 #include "MemStream.h"
 #include "offsetof_def.h"
 #include "MipsJitter.h"
 #include "Jitter_CodeGenFactory.h"
+#ifdef __EMSCRIPTEN__
+#include "BlockCache.h"
+#include "xxhash.h"
+#endif
 
 #if defined(AOT_BUILD_CACHE) || defined(AOT_USE_CACHE)
 #define AOT_ENABLED
@@ -74,9 +80,54 @@ void CBasicBlock::SetAotBlockOutputStream(Framework::CStdStream* outputStream)
 
 #endif
 
+#ifdef PROFILE
+std::atomic<uint32> g_blockCompileCount = 0;
+#endif
+
 void CBasicBlock::Compile()
 {
+#ifdef PROFILE
+	static const auto compileZone = CProfiler::GetInstance().RegisterZone("COMPILE");
+	CProfilerZone profilerZone(compileZone);
+	g_blockCompileCount++;
+#endif
 #ifndef AOT_USE_CACHE
+
+#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+	//Persistent block cache: reuse the wasm bytes generated for the same code in an earlier run.
+	//Code is position independent (context-relative accesses, PC-relative branches, import table
+	//indexes fixed at startup), so the key is the block contents plus everything else that changes codegen.
+	BlockCache::KEY cacheKey = {};
+	bool useBlockCache = BlockCache::IsEnabled() && !IsEmpty();
+	if(useBlockCache)
+	{
+		uint32 wordCount = ((m_end - m_begin) / 4) + 1;
+		thread_local std::vector<uint32> words;
+		words.resize(wordCount);
+		for(uint32 i = 0; i < wordCount; i++)
+		{
+			words[i] = m_context.m_pMemoryMap->GetInstruction(m_begin + (i * 4));
+		}
+		auto xxHash = XXH3_128bits(words.data(), wordCount * 4);
+		cacheKey.category = m_category;
+		cacheKey.size = wordCount * 4;
+		cacheKey.hints = m_blockCompileHints;
+		cacheKey.variant = m_cacheVariant;
+		cacheKey.hash[0] = xxHash.low64;
+		cacheKey.hash[1] = xxHash.high64;
+
+		thread_local std::vector<uint8> cachedCode;
+		if(BlockCache::Find(cacheKey, cachedCode))
+		{
+#ifdef PROFILE
+			static const auto compileWasmZone = CProfiler::GetInstance().RegisterZone("COMPILE_WASM");
+			CProfilerZone profilerZone(compileWasmZone);
+#endif
+			m_function = CMemoryFunction(cachedCode.data(), cachedCode.size());
+			return;
+		}
+	}
+#endif
 
 	Framework::CMemStream stream;
 	{
@@ -98,7 +149,20 @@ void CBasicBlock::Compile()
 		jitter->End();
 	}
 
-	m_function = CMemoryFunction(stream.GetBuffer(), stream.GetSize());
+	{
+#ifdef PROFILE
+		static const auto compileWasmZone = CProfiler::GetInstance().RegisterZone("COMPILE_WASM");
+		CProfilerZone profilerZone(compileWasmZone);
+#endif
+		m_function = CMemoryFunction(stream.GetBuffer(), stream.GetSize());
+	}
+
+#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+	if(useBlockCache && m_cacheable)
+	{
+		BlockCache::Add(cacheKey, stream.GetBuffer(), stream.GetSize());
+	}
+#endif
 
 #ifdef VTUNE_ENABLED
 	if(iJIT_IsProfilingActive() == iJIT_SAMPLING_ON)
@@ -189,6 +253,11 @@ void CBasicBlock::Compile()
 void CBasicBlock::AddBlockCompileHints(uint32 compileHints)
 {
 	m_blockCompileHints |= compileHints;
+}
+
+void CBasicBlock::AddCacheVariant(uint32 variant)
+{
+	m_cacheVariant |= variant;
 }
 
 void CBasicBlock::CompileRange(CMipsJitter* jitter)

@@ -33,6 +33,7 @@ public:
 	void Release();
 
 	bool IsIdle() const;
+	void NotifyCpuExecution(uint32);
 
 	void BootFromFile(const fs::path&);
 	void BootFromVirtualPath(const char*, const ArgumentList&);
@@ -475,6 +476,7 @@ private:
 	//For display purposes only
 	std::string m_executableName;
 
+	uint32 m_executedCycles = 0;
 	Ee::CIdleEvaluator m_idleEvaluator;
 
 #ifdef DEBUGGER_INCLUDED

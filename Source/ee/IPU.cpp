@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <exception>
 #include <functional>
+#include <array>
+#include <cmath>
 #include "maybe_unused.h"
 #include "EndianUtils.h"
 #include "IPU_MacroblockAddressIncrementTable.h"
@@ -23,6 +25,7 @@
 #include "idct/TrivialC.h"
 #include "idct/IEEE1180.h"
 #include "Log.h"
+#include "../Profiler.h"
 #include "DMAC.h"
 #include "INTC.h"
 #include "Ps2Const.h"
@@ -1311,6 +1314,63 @@ void CIPU::CBDECCommand::Initialize(CINFIFO* inFifo, COUTFIFO* outFifo, uint32 c
 	m_currentBlockIndex = 0;
 }
 
+//Same separable transform as IDCT::CIEEE1180 (reference mpeg2decode IDCT), computed in
+//single precision with loops the compiler vectorizes (the double precision version was
+//the main cost of FMV decoding on WebAssembly). Results only differ on rare .5 rounding ties.
+static void FastIdct(const int16* input, int16* output)
+{
+#ifdef PROFILE
+	static const auto profilerZoneHandle = CProfiler::GetInstance().RegisterZone("IPU_IDCT");
+	CProfilerZone profilerZone(profilerZoneHandle);
+#endif
+	static const auto coefs = []() {
+		std::array<float, 64> result;
+		for(int freq = 0; freq < 8; freq++)
+		{
+			double scale = (freq == 0) ? sqrt(0.125) : 0.5;
+			for(int time = 0; time < 8; time++)
+			{
+				result[freq * 8 + time] = static_cast<float>(scale * cos((3.14159265358979323846 / 8.0) * freq * (time + 0.5)));
+			}
+		}
+		return result;
+	}();
+
+	float temp[64];
+	for(int i = 0; i < 8; i++)
+	{
+		float acc[8] = {};
+		for(int k = 0; k < 8; k++)
+		{
+			float value = input[8 * i + k];
+			for(int j = 0; j < 8; j++)
+			{
+				acc[j] += coefs[k * 8 + j] * value;
+			}
+		}
+		for(int j = 0; j < 8; j++)
+		{
+			temp[8 * i + j] = acc[j];
+		}
+	}
+	for(int i = 0; i < 8; i++)
+	{
+		float acc[8] = {};
+		for(int k = 0; k < 8; k++)
+		{
+			float coef = coefs[k * 8 + i];
+			for(int j = 0; j < 8; j++)
+			{
+				acc[j] += coef * temp[8 * k + j];
+			}
+		}
+		for(int j = 0; j < 8; j++)
+		{
+			output[8 * i + j] = static_cast<int16>(floorf(acc[j] + 0.5f));
+		}
+	}
+}
+
 bool CIPU::CBDECCommand::Execute()
 {
 	while(1)
@@ -1408,7 +1468,7 @@ bool CIPU::CBDECCommand::Execute()
 
 			memcpy(blockTemp, blockInfo.block, sizeof(int16) * 0x40);
 
-			IDCT::CIEEE1180::GetInstance()->Transform(blockTemp, blockInfo.block);
+			FastIdct(blockTemp, blockInfo.block);
 
 			m_state = STATE_DECODEBLOCK_GOTONEXT;
 		}
@@ -1511,6 +1571,10 @@ void CIPU::CBDECCommand_ReadDct::Initialize(CINFIFO* fifo, int16* block, unsigne
 
 bool CIPU::CBDECCommand_ReadDct::Execute()
 {
+#ifdef PROFILE
+	static const auto profilerZoneHandle = CProfiler::GetInstance().RegisterZone("IPU_VLC");
+	CProfilerZone profilerZone(profilerZoneHandle);
+#endif
 	while(1)
 	{
 		switch(m_state)
@@ -1916,6 +1980,10 @@ void CIPU::CCSCCommand::Initialize(CINFIFO* input, COUTFIFO* output, uint32 comm
 
 bool CIPU::CCSCCommand::Execute()
 {
+#ifdef PROFILE
+	static const auto profilerZoneHandle = CProfiler::GetInstance().RegisterZone("IPU_CSC");
+	CProfilerZone profilerZone(profilerZoneHandle);
+#endif
 	while(1)
 	{
 		switch(m_state)

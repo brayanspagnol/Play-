@@ -1,4 +1,5 @@
 #include <cstring>
+#include "../ee/EeExecutor.h"
 #include "Iop_SifManPs2.h"
 #include "../Ps2Const.h"
 
@@ -86,6 +87,7 @@ void CSifManPs2::ExecuteSifDma(uint32 structAddr, uint32 count)
 		{
 			uint8* dst = m_eeRam + dstAddr;
 			memcpy(dst, src, dmaReg.size);
+			CEeExecutor::NotifyRamWritten(dstAddr, dmaReg.size);
 		}
 	}
 }

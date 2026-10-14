@@ -1,4 +1,5 @@
 #include <cstring>
+#include "EeExecutor.h"
 #include <stdio.h>
 #include "Log.h"
 #include "../Ps2Const.h"
@@ -6,6 +7,7 @@
 #include "../states/MemoryStateFile.h"
 #include "../iop/IopBios.h"
 #include "SIF.h"
+#include "../Profiler.h"
 #include "lexical_cast_ex.h"
 #include "string_format.h"
 
@@ -284,6 +286,7 @@ void CSIF::MarkPacketProcessed()
 void CSIF::SendDMA(const void* data, uint32 dstAddr, uint32 size)
 {
 	memcpy(m_eeRam + dstAddr, data, size);
+	CEeExecutor::NotifyRamWritten(dstAddr, size);
 
 	uint32 qwc = (size + 0x0F) / 0x10;
 	m_dmac.SetRegister(CDMAC::D5_MADR, dstAddr);
@@ -584,6 +587,7 @@ void CSIF::Cmd_Call(const SIFCMDHEADER* hdr)
 		                           reinterpret_cast<uint32*>(m_eeRam + m_nDataAddr), call->sendSize,
 		                           reinterpret_cast<uint32*>(m_eeRam + recvAddr), call->recvSize,
 		                           m_eeRam);
+		CEeExecutor::NotifyRamWritten(recvAddr, call->recvSize);
 	}
 	else
 	{
@@ -635,6 +639,7 @@ void CSIF::Cmd_GetOtherData(const SIFCMDHEADER* hdr)
 	uint32 srcPtr = otherData->srcPtr & (PS2::IOP_RAM_SIZE - 1);
 
 	memcpy(m_eeRam + dstPtr, m_iopRam + srcPtr, otherData->size);
+	CEeExecutor::NotifyRamWritten(dstPtr, otherData->size);
 
 	{
 		SIFRPCREQUESTEND rend;
@@ -670,6 +675,7 @@ void CSIF::SendCallReply(uint32 serverId, const void* returnData)
 		assert((requestInfo.call.recvSize & 0x03) == 0);
 		uint32 dstSize = (requestInfo.call.recvSize + 0x03) & ~0x03;
 		memcpy(m_eeRam + dstPtr, returnData, dstSize);
+		CEeExecutor::NotifyRamWritten(dstPtr, dstSize);
 	}
 	SendPacket(&requestInfo.reply, sizeof(SIFRPCREQUESTEND));
 	m_callReplies.erase(replyIterator);

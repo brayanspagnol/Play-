@@ -170,6 +170,13 @@ public:
 
 	void* m_vuMem = nullptr;
 	void** m_pageLookup = nullptr;
+	//Page table used by JIT stores. Same as m_pageLookup unless pages are write protected in
+	//software (WebAssembly has no mprotect): a null entry sends the store through the slow path.
+	void** m_pageLookupWrite = nullptr;
+
+	//Called by the slow path store proxies with the physical address and size written
+	typedef void (*WriteWatchHandler)(CMIPS*, uint32, uint32);
+	WriteWatchHandler m_writeWatchHandler = nullptr;
 
 	std::function<void(CMIPS*)> m_emptyBlockHandler;
 

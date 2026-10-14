@@ -1,9 +1,17 @@
+#include <atomic>
+#include "Types.h"
+#ifdef PROFILE
+std::atomic<uint32> g_eeSyscallCounts[0x100];
+std::atomic<uint32> g_eeInterruptCount;
+#endif
+
 #include <cstring>
 #include <stddef.h>
 #include <stdlib.h>
 #include <exception>
 #include "string_format.h"
 #include "PS2OS.h"
+#include "../Profiler.h"
 #include "StdStream.h"
 #include "StdStreamUtils.h"
 #ifdef __ANDROID__
@@ -279,6 +287,12 @@ void CPS2OS::Initialize(uint32 ramSize)
 void CPS2OS::Release()
 {
 	UnloadExecutable();
+}
+
+void CPS2OS::NotifyCpuExecution(uint32 executedCycles)
+{
+	m_executedCycles += executedCycles;
+	m_idleEvaluator.BeginExecution();
 }
 
 bool CPS2OS::IsIdle() const
@@ -1366,6 +1380,9 @@ void CPS2OS::HandleInterrupt(int32 cpuIntLine)
 		return;
 	}
 
+#ifdef PROFILE
+	g_eeInterruptCount++;
+#endif
 	if(m_currentThreadId != m_idleThreadId)
 	{
 		auto thread = m_threads[m_currentThreadId];
@@ -2223,7 +2240,7 @@ void CPS2OS::sc_RotateThreadReadyQueue()
 
 	ThreadShakeAndBake();
 
-	m_idleEvaluator.NotifyEvent(Ee::CIdleEvaluator::EVENT_ROTATETHREADREADYQUEUE, threadIdBefore, m_currentThreadId);
+	m_idleEvaluator.NotifyRotateThreadReadyQueue(threadIdBefore, m_currentThreadId, m_executedCycles);
 }
 
 //2D/2E
@@ -2881,6 +2898,12 @@ void CPS2OS::sc_GetCop0()
 void CPS2OS::sc_FlushCache()
 {
 	FRAMEWORK_MAYBE_UNUSED uint32 operationType = m_ee.m_State.nGPR[SC_PARAM0].nV[0];
+#ifdef PROFILE
+	if(operationType != 0)
+	{
+		CProfiler::GetInstance().Log("FlushCache(%d) from ra=%08X\n", operationType, m_ee.m_State.nGPR[CMIPS::RA].nV[0]);
+	}
+#endif
 }
 
 //70
@@ -3214,6 +3237,9 @@ void CPS2OS::HandleSyscall()
 		}
 		//Save for custom handler
 		m_ee.m_State.nGPR[3].nV[0] = func;
+#ifdef PROFILE
+		g_eeSyscallCounts[func & 0xFF]++;
+#endif
 
 		if(GetCustomSyscallTable()[func] == 0)
 		{

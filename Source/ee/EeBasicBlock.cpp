@@ -4,11 +4,13 @@
 void CEeBasicBlock::SetFpRoundingMode(Jitter::CJitter::ROUNDINGMODE fpRoundingMode)
 {
 	m_fpRoundingMode = fpRoundingMode;
+	AddCacheVariant((static_cast<uint32>(fpRoundingMode) + 1) << 8);
 }
 
 void CEeBasicBlock::SetIsIdleLoopBlock()
 {
 	m_isIdleLoopBlock = true;
+	AddCacheVariant(1 << 16);
 }
 
 void CEeBasicBlock::CompileProlog(CMipsJitter* jitter)

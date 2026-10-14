@@ -30,8 +30,8 @@ public:
 protected:
 	void ComputeMemAccessAddr();
 	void ComputeMemAccessAddrNoXlat();
-	void ComputeMemAccessRefIdx(uint32);
-	void ComputeMemAccessPageRef();
+	void ComputeMemAccessRefIdx(uint32, bool forWrite = false);
+	void ComputeMemAccessPageRef(bool forWrite = false);
 
 	void CheckTLBExceptions(bool);
 	void CheckTrap();

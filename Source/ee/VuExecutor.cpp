@@ -71,6 +71,8 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
 
 	//Totally new block, build it from scratch
 	auto result = std::make_shared<CVuBasicBlock>(context, begin, end, m_blockCategory);
+	//VU0 and VU1 generate different code (memory address mask)
+	result->AddCacheVariant(m_maxAddress);
 
 	auto blockCompileHintsIterator = std::find_if(std::begin(g_blockCompileHints), std::end(g_blockCompileHints),
 	                                              [&](const auto& item) { return item.blockKey == blockKey; });

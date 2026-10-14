@@ -137,9 +137,9 @@ void CMIPSInstructionFactory::ComputeMemAccessAddrNoXlat()
 	}
 }
 
-void CMIPSInstructionFactory::ComputeMemAccessRefIdx(uint32 accessSize)
+void CMIPSInstructionFactory::ComputeMemAccessRefIdx(uint32 accessSize, bool forWrite)
 {
-	ComputeMemAccessPageRef();
+	ComputeMemAccessPageRef(forWrite);
 
 	auto rs = static_cast<uint8>((m_nOpcode >> 21) & 0x001F);
 	auto immediate = static_cast<uint16>((m_nOpcode >> 0) & 0xFFFF);
@@ -151,12 +151,12 @@ void CMIPSInstructionFactory::ComputeMemAccessRefIdx(uint32 accessSize)
 	m_codeGen->And();
 }
 
-void CMIPSInstructionFactory::ComputeMemAccessPageRef()
+void CMIPSInstructionFactory::ComputeMemAccessPageRef(bool forWrite)
 {
 	auto rs = static_cast<uint8>((m_nOpcode >> 21) & 0x001F);
 	auto immediate = static_cast<int16>((m_nOpcode >> 0) & 0xFFFF);
 	constexpr int32 pageSizeShift = Framework::GetPowerOf2(MIPS_PAGE_SIZE);
-	m_codeGen->PushRelRef(offsetof(CMIPS, m_pageLookup));
+	m_codeGen->PushRelRef(forWrite ? offsetof(CMIPS, m_pageLookupWrite) : offsetof(CMIPS, m_pageLookup));
 
 	m_codeGen->PushRel(offsetof(CMIPS, m_State.nGPR[rs].nV[0]));
 	m_codeGen->PushCst(immediate);

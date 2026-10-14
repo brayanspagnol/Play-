@@ -620,12 +620,12 @@ void CCOP_FPU::SWC1()
 
 	if(usePageLookup)
 	{
-		ComputeMemAccessPageRef();
+		ComputeMemAccessPageRef(true);
 
 		m_codeGen->PushCst(0);
 		m_codeGen->BeginIf(Jitter::CONDITION_NE);
 		{
-			ComputeMemAccessRefIdx(4);
+			ComputeMemAccessRefIdx(4, true);
 
 			m_codeGen->PushRel(offsetof(CMIPS, m_State.nCOP1[m_ft]));
 			m_codeGen->StoreAtRefIdx(1);

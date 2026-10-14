@@ -59,6 +59,7 @@ CPS2VM::CPS2VM()
     , m_spuProfilerZone(CProfiler::GetInstance().RegisterZone("SPU"))
     , m_gsSyncProfilerZone(CProfiler::GetInstance().RegisterZone("GSSYNC"))
     , m_otherProfilerZone(CProfiler::GetInstance().RegisterZone("OTHER"))
+    , m_limiterProfilerZone(CProfiler::GetInstance().RegisterZone("LIMITER"))
 {
 	// clang-format off
 	static const std::pair<const char*, const char*> basicDirectorySettings[] =
@@ -713,6 +714,11 @@ void CPS2VM::DestroySoundHandlerImpl()
 	m_soundHandler = nullptr;
 }
 
+#ifdef PROFILE
+std::atomic<uint32> g_eeSlices;
+std::atomic<uint32> g_eeIdleSlices;
+#endif
+
 void CPS2VM::UpdateEe()
 {
 #ifdef PROFILE
@@ -722,8 +728,14 @@ void CPS2VM::UpdateEe()
 	while(m_eeExecutionTicks > 0)
 	{
 		int executed = m_ee->ExecuteCpu(m_singleStepEe ? 1 : m_eeExecutionTicks);
+#ifdef PROFILE
+		g_eeSlices++;
+#endif
 		if(m_ee->IsCpuIdle())
 		{
+#ifdef PROFILE
+			g_eeIdleSlices++;
+#endif
 			m_cpuUtilisation.eeIdleTicks += (m_eeExecutionTicks - executed);
 			executed = m_eeExecutionTicks;
 		}
@@ -734,7 +746,13 @@ void CPS2VM::UpdateEe()
 
 		m_eeExecutionTicks -= executed;
 		m_spuUpdateTicks -= (static_cast<int64>(executed) << SPU_UPDATE_TICKS_PRECISION);
-		m_ee->CountTicks(executed);
+		{
+#ifdef PROFILE
+			static const auto ticksZone = CProfiler::GetInstance().RegisterZone("EETICKS");
+			CProfilerZone profilerZone(ticksZone);
+#endif
+			m_ee->CountTicks(executed);
+		}
 		m_hblankTicks -= executed;
 		m_vblankTicks -= executed;
 
@@ -900,6 +918,10 @@ void CPS2VM::EmuThread()
 	fesetround(FE_TOWARDZERO);
 	FpUtils::SetDenormalHandlingMode();
 	CProfiler::GetInstance().SetWorkThread();
+#ifdef PROFILE
+	CProfiler::GetInstance().SetPcSampler(0, CProfiler::GetInstance().RegisterZone("EEBLOCK"), &m_ee->m_EE.m_State.nPC);
+	CProfiler::GetInstance().SetPcSampler(1, m_iopProfilerZone, &m_iop->m_cpu.m_State.nPC);
+#endif
 #ifdef __ANDROID__
 	JNIEnv* env = nullptr;
 	Framework::CJavaVM::AttachCurrentThread(&env, THREAD_NAME);
@@ -979,7 +1001,12 @@ void CPS2VM::EmuThread()
 						{
 							m_ee->m_gs->ResetVBlank();
 						}
-						m_frameLimiter.EndFrame();
+						{
+#ifdef PROFILE
+							CProfilerZone profilerZone(m_limiterProfilerZone);
+#endif
+							m_frameLimiter.EndFrame();
+						}
 						m_frameLimiter.BeginFrame();
 					}
 				}

@@ -1,4 +1,5 @@
 #include <cassert>
+#include "../ee/EeExecutor.h"
 #include <cstring>
 #include "Iop_FileIoHandler2200.h"
 #include "Iop_Ioman.h"
@@ -202,6 +203,7 @@ uint32 CFileIoHandler2200::InvokeRead(uint32* args, uint32 argsSize, uint32* ret
 	auto command = reinterpret_cast<READCOMMAND*>(args);
 	uint32 readAddress = command->buffer & (PS2::EE_RAM_SIZE - 1);
 	auto result = m_ioman->Read(command->fd, command->size, reinterpret_cast<void*>(ram + readAddress));
+	CEeExecutor::NotifyRamWritten(readAddress, command->size);
 
 	READREPLY reply;
 	reply.header.commandId = COMMANDID_READ;
@@ -531,6 +533,7 @@ void CFileIoHandler2200::SendPendingReply(uint8* ram)
 	if(m_resultPtr[0] != 0)
 	{
 		memcpy(ram + m_resultPtr[0], m_pendingReply.buffer.data(), m_pendingReply.replySize);
+		CEeExecutor::NotifyRamWritten(m_resultPtr[0], m_pendingReply.replySize);
 	}
 	SendSifReply();
 	m_pendingReply.valid = false;

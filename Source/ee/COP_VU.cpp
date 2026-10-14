@@ -114,12 +114,12 @@ void CCOP_VU::LQC2()
 //3E
 void CCOP_VU::SQC2()
 {
-	ComputeMemAccessPageRef();
+	ComputeMemAccessPageRef(true);
 
 	m_codeGen->PushCst(0);
 	m_codeGen->BeginIf(Jitter::CONDITION_NE);
 	{
-		ComputeMemAccessRefIdx(0x10);
+		ComputeMemAccessRefIdx(0x10, true);
 
 		m_codeGen->MD_PushRel(offsetof(CMIPS, m_State.nCOP2[m_nFT]));
 		m_codeGen->MD_StoreAtRefIdx(1);
