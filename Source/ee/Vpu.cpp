@@ -18,6 +18,7 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+#include <cstdio>
 #include <atomic>
 #include <mutex>
 #include <vector>
@@ -34,6 +35,11 @@ extern bool g_vuContextPromotion;
 extern bool g_vuDiffSuppressKick;
 std::atomic<uint32> g_vuCaptureRequest = 0;
 std::atomic<uint32> g_vuReplayRequest = 0;
+int g_vuReplayExperiment = 0;
+extern int g_vuExperiment;
+bool g_vuReplayIoActive = false;
+uint32 g_vuReplayTop = 0;
+uint32 g_vuReplayItop = 0;
 std::mutex g_vuReplayResultMutex;
 std::string g_vuReplayResult;
 
@@ -42,6 +48,8 @@ namespace
 	struct VU_CAPTURE
 	{
 		uint32 address;
+		uint32 top;
+		uint32 itop;
 		MIPSSTATE state;
 		std::vector<uint8> microMem;
 		std::vector<uint8> vuMem;
@@ -251,10 +259,31 @@ void CVpu::ExecuteMicroProgram(uint32 nAddress)
 			g_vuCaptureRequest--;
 			VU_CAPTURE capture;
 			capture.address = nAddress;
+			capture.top = m_vif->GetTOP();
+			capture.itop = m_vif->GetITOP();
 			memcpy(&capture.state, &m_ctx->m_State, sizeof(MIPSSTATE));
 			capture.microMem.assign(m_microMem, m_microMem + m_microMemSize);
 			capture.vuMem.assign(m_vuMem, m_vuMem + m_vuMemSize);
 			g_vuCaptures.push_back(std::move(capture));
+			if(g_vuCaptureRequest == 0)
+			{
+				//Done: save them so the same programs can be replayed by another build or session
+				if(FILE* file = fopen("/work/vucap.bin", "wb"))
+				{
+					uint32 count = static_cast<uint32>(g_vuCaptures.size());
+					fwrite(&count, 4, 1, file);
+					for(const auto& saved : g_vuCaptures)
+					{
+						fwrite(&saved.address, 4, 1, file);
+						fwrite(&saved.top, 4, 1, file);
+						fwrite(&saved.itop, 4, 1, file);
+						fwrite(&saved.state, sizeof(MIPSSTATE), 1, file);
+						fwrite(saved.microMem.data(), 1, saved.microMem.size(), file);
+						fwrite(saved.vuMem.data(), 1, saved.vuMem.size(), file);
+					}
+					fclose(file);
+				}
+			}
 		}
 	}
 #endif
@@ -282,6 +311,29 @@ uint32 CVpu::GetReplayCaptureCount()
 
 void CVpu::RunReplayBenchmark(uint32 iterations)
 {
+	if(g_vuCaptures.empty())
+	{
+		//Captures saved by an earlier session (see ExecuteMicroProgram)
+		if(FILE* file = fopen("/work/vucap.bin", "rb"))
+		{
+			uint32 count = 0;
+			fread(&count, 4, 1, file);
+			for(uint32 i = 0; i < count; i++)
+			{
+				VU_CAPTURE capture;
+				capture.microMem.resize(m_microMemSize);
+				capture.vuMem.resize(m_vuMemSize);
+				fread(&capture.address, 4, 1, file);
+				fread(&capture.top, 4, 1, file);
+				fread(&capture.itop, 4, 1, file);
+				fread(&capture.state, sizeof(MIPSSTATE), 1, file);
+				fread(capture.microMem.data(), 1, m_microMemSize, file);
+				fread(capture.vuMem.data(), 1, m_vuMemSize, file);
+				g_vuCaptures.push_back(std::move(capture));
+			}
+			fclose(file);
+		}
+	}
 	if(g_vuCaptures.empty()) return;
 
 	MIPSSTATE liveState;
@@ -303,6 +355,8 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 		}
 		memcpy(m_vuMem, capture.vuMem.data(), m_vuMemSize);
 		m_ctx->m_State.nPC = capture.address;
+		g_vuReplayTop = capture.top;
+		g_vuReplayItop = capture.itop;
 		for(uint32 i = 0; i < 1000; i++)
 		{
 			m_ctx->m_executor->Execute(5000);
@@ -323,12 +377,15 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 	std::string result;
 	std::vector<uint64> refHashes;
 	g_vuDiffSuppressKick = true;
+	g_vuReplayIoActive = true;
+	int liveExperiment = g_vuExperiment;
 	//Variants alternate (reference, promoted, reference, promoted). Each starts from freshly
 	//instantiated blocks, so it first runs for a while to let the engine tier the code up.
 	for(int round = 0; round < 8; round++)
 	{
 		int variant = round & 1;
 		g_vuContextPromotion = (variant == 1);
+		g_vuExperiment = (variant == 1) ? g_vuReplayExperiment : 0;
 		static_cast<CVuExecutor*>(m_ctx->m_executor.get())->ResetBlocks();
 		std::vector<uint64> hashes;
 		for(const auto& capture : g_vuCaptures) hashes.push_back(runCapture(capture, true));
@@ -364,6 +421,8 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 		                        static_cast<uint32>(g_vuCaptures.size()), iterations, mismatches);
 	}
 	g_vuDiffSuppressKick = false;
+	g_vuReplayIoActive = false;
+	g_vuExperiment = liveExperiment;
 
 	//Back to the live program
 	g_vuContextPromotion = livePromotion;

@@ -131,7 +131,8 @@ void CBasicBlock::Compile()
 	//Code is position independent (context-relative accesses, PC-relative branches, import table
 	//indexes fixed at startup), so the key is the block contents plus everything else that changes codegen.
 	BlockCache::KEY cacheKey = {};
-	bool useBlockCache = BlockCache::IsEnabled() && !IsEmpty();
+	extern int g_vuExperiment;
+	bool useBlockCache = BlockCache::IsEnabled() && !IsEmpty() && (g_vuExperiment == 0);
 	if(useBlockCache)
 	{
 		uint32 wordCount = ((m_end - m_begin) / 4) + 1;
@@ -145,7 +146,7 @@ void CBasicBlock::Compile()
 		cacheKey.category = m_category;
 		cacheKey.size = wordCount * 4;
 		cacheKey.hints = m_blockCompileHints;
-		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000);
+		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000) | (IsSuperBlock() ? 0x20000000 : 0);
 		cacheKey.hash[0] = xxHash.low64;
 		cacheKey.hash[1] = xxHash.high64;
 
@@ -168,9 +169,14 @@ void CBasicBlock::Compile()
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
 	if(g_vuDiffMode && (m_category == BLOCK_CATEGORY_PS2_VU) && UsesContextPromotion())
 	{
-		Framework::CMemStream refStream;
-		CompileToStream(refStream, false);
-		m_refFunction = CMemoryFunction(refStream.GetBuffer(), refStream.GetSize());
+		//Superblocks are checked against the reference blocks run one by one (see CVuBasicBlock)
+		if(!IsSuperBlock())
+		{
+			Framework::CMemStream refStream;
+			CompileToStream(refStream, false);
+			m_refFunction = CMemoryFunction(refStream.GetBuffer(), refStream.GetSize());
+		}
+		m_diffExecute = true;
 	}
 #endif
 
@@ -442,12 +448,13 @@ void CBasicBlock::CompileToStream(Framework::CMemStream& stream, bool contextPro
 	{
 		const char* prefix = (m_category == BLOCK_CATEGORY_PS2_VU) ? (m_diffDataSize > 0x1000 ? "vu1" : "vu0") : (m_category == BLOCK_CATEGORY_PS2_EE) ? "ee" : "iop";
 		char name[64];
-		snprintf(name, sizeof(name), "%s_%08X_%08X", prefix, m_begin, m_end);
+		snprintf(name, sizeof(name), "%s%s%s_%08X_%08X", prefix, contextPromotion ? "p" : "", IsSuperBlock() ? "s" : "", m_begin, m_end);
 		wasmCodeGen->SetFunctionName(name);
 	}
 #endif
 	//Flag value forwarding: VU blocks only (straight-line FMAC code), part of the optimized VU codegen
-	VUShared::ResetFlagForwarding((m_category == BLOCK_CATEGORY_PS2_VU) && contextPromotion);
+	m_compileOptimized = (m_category == BLOCK_CATEGORY_PS2_VU) && contextPromotion;
+	VUShared::ResetFlagForwarding(m_compileOptimized);
 	jitter->GetCodeGen()->SetExternalSymbolReferencedHandler([&](auto symbol, auto offset, auto refType) { this->HandleExternalFunctionReference(symbol, offset, refType); });
 	jitter->SetStream(&stream);
 	jitter->Begin();
@@ -458,13 +465,41 @@ void CBasicBlock::CompileToStream(Framework::CMemStream& stream, bool contextPro
 bool CBasicBlock::UsesContextPromotion() const
 {
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
-	return (m_category == BLOCK_CATEGORY_PS2_VU) && g_vuContextPromotion;
+	return (m_category == BLOCK_CATEGORY_PS2_VU) && g_vuContextPromotion && !m_forceReference;
 #else
 	return false;
 #endif
 }
 
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+void VuDiffCompare(uint32 begin, uint32 end, const MIPSSTATE& refState, const MIPSSTATE& newState, const uint8* refMem, const uint8* newMem, uint32 dataSize)
+{
+	g_vuDiffRuns++;
+	bool stateDiffers = memcmp(&refState, &newState, sizeof(MIPSSTATE)) != 0;
+	bool memDiffers = memcmp(refMem, newMem, dataSize) != 0;
+	if(stateDiffers || memDiffers)
+	{
+		uint32 count = g_vuDiffMismatches++;
+		if(count < 50)
+		{
+			auto ref = reinterpret_cast<const uint32*>(&refState);
+			auto cur = reinterpret_cast<const uint32*>(&newState);
+			for(uint32 i = 0; i < sizeof(MIPSSTATE) / 4; i++)
+			{
+				if(ref[i] != cur[i])
+				{
+					VuDiffLog("VUDIFF block %08X-%08X (size %u) state offset 0x%X: ref %08X new %08X\n",
+					          begin, end, dataSize, i * 4, ref[i], cur[i]);
+				}
+			}
+			if(memDiffers)
+			{
+				VuDiffLog("VUDIFF block %08X-%08X data memory differs\n", begin, end);
+			}
+		}
+	}
+}
+
 void CBasicBlock::ExecuteDiff()
 {
 	uint32 dataSize = m_diffDataSize;
@@ -488,37 +523,14 @@ void CBasicBlock::ExecuteDiff()
 
 	m_function(&m_context);
 
-	g_vuDiffRuns++;
-	bool stateDiffers = memcmp(&refState, &m_context.m_State, sizeof(MIPSSTATE)) != 0;
-	bool memDiffers = memcmp(refMem.data(), dataMem, dataSize) != 0;
-	if(stateDiffers || memDiffers)
-	{
-		uint32 count = g_vuDiffMismatches++;
-		if(count < 50)
-		{
-			auto ref = reinterpret_cast<const uint32*>(&refState);
-			auto cur = reinterpret_cast<const uint32*>(&m_context.m_State);
-			for(uint32 i = 0; i < sizeof(MIPSSTATE) / 4; i++)
-			{
-				if(ref[i] != cur[i])
-				{
-					VuDiffLog("VUDIFF block %08X-%08X (size %u) state offset 0x%X: ref %08X new %08X\n",
-					       m_begin, m_end, dataSize, i * 4, ref[i], cur[i]);
-				}
-			}
-			if(memDiffers)
-			{
-				VuDiffLog("VUDIFF block %08X-%08X data memory differs\n", m_begin, m_end);
-			}
-		}
-	}
+	VuDiffCompare(m_begin, m_end, refState, m_context.m_State, refMem.data(), dataMem, dataSize);
 }
 #endif
 
 void CBasicBlock::Execute()
 {
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
-	if(!m_refFunction.IsEmpty())
+	if(m_diffExecute)
 	{
 		ExecuteDiff();
 		return;
@@ -652,6 +664,7 @@ void CBasicBlock::CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& other)
 	{
 		m_refFunction = other->m_refFunction.CreateInstance();
 	}
+	m_diffExecute = other->m_diffExecute;
 #endif
 	std::copy(std::begin(other->m_linkBlockTrampolineOffset), std::end(other->m_linkBlockTrampolineOffset), m_linkBlockTrampolineOffset);
 #ifdef _DEBUG

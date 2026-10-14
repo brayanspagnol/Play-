@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+#include <vector>
 #include "../BasicBlock.h"
 
 class CVuBasicBlock : public CBasicBlock
@@ -10,8 +12,29 @@ public:
 
 	bool IsLinkable() const;
 
+	//Superblock: several VU blocks compiled into one function with a dispatch loop on nPC, so
+	//block transitions stay inside the function (state in wasm locals). parts[0] is this block's
+	//own range, the other parts are blocks reachable from it, all inside [begin, end].
+	struct SUPERBLOCK_PART
+	{
+		uint32 begin = 0;
+		uint32 end = 0;
+	};
+	void SetSuperBlockParts(std::vector<SUPERBLOCK_PART>);
+	bool IsSuperBlock() const override;
+	//Differential test of superblocks: runs reference blocks one at a time
+	typedef std::function<CBasicBlock*(uint32)> ReferenceBlockProvider;
+	void SetReferenceBlockProvider(ReferenceBlockProvider);
+
+	//Static analysis helpers (also used by the executor to plan superblocks)
+	static bool IsConditionalBranch(uint32);
+	static bool IsNonConditionalBranch(uint32);
+
 protected:
 	void CompileRange(CMipsJitter*) override;
+#ifdef __EMSCRIPTEN__
+	void ExecuteDiff() override;
+#endif
 
 private:
 	struct INTEGER_BRANCH_DELAY_INFO
@@ -21,8 +44,8 @@ private:
 		uint32 useRegAddress = MIPS_INVALID_PC;
 	};
 
-	static bool IsConditionalBranch(uint32);
-	static bool IsNonConditionalBranch(uint32);
+	void CompileBody(CMipsJitter*, bool allowSelfLoop);
+	void CompileSuperBlock(CMipsJitter*);
 
 	typedef uint32 FmacRegWriteTimes[32][4];
 	struct BlockFmacPipelineInfo
@@ -45,4 +68,6 @@ private:
 	static void EmitXgKick(CMipsJitter*);
 
 	bool m_isLinkable = true;
+	std::vector<SUPERBLOCK_PART> m_superBlockParts;
+	ReferenceBlockProvider m_referenceBlockProvider;
 };

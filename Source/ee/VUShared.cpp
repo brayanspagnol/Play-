@@ -254,6 +254,7 @@ void VUShared::MakeComparableFromFloat(CMipsJitter* codeGen)
 
 void VUShared::TestSZFlags(CMipsJitter* codeGen, uint8 dest, size_t regOffset, uint32 relativePipeTime, uint32 compileHints)
 {
+	if(IsExperiment(1)) return;
 	codeGen->MD_PushRel(regOffset);
 	codeGen->MD_MakeSignZero();
 
@@ -1876,6 +1877,8 @@ void VUShared::CheckFlagPipeline(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* cod
 	}
 }
 
+int g_vuExperiment = 0; //Debug: drop parts of the optimized VU codegen to measure their cost (results become wrong)
+
 namespace
 {
 	thread_local bool g_flagForwardingEnabled = false;
@@ -1898,6 +1901,11 @@ namespace
 		codeGen->PullRel(offsetof(CMIPS, m_jitFlagScratch[index]));
 		g_flagForwardingValid |= (1 << index);
 	}
+}
+
+bool VUShared::IsExperiment(int bit)
+{
+	return g_flagForwardingEnabled && (g_vuExperiment & bit);
 }
 
 void VUShared::ResetFlagForwarding(bool enabled)

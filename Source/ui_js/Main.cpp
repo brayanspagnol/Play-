@@ -168,6 +168,13 @@ extern std::string g_vuReplayResult;
 
 //VU1 replay benchmark (see CVpu::RunReplayBenchmark): capture the next count programs, then
 //request a replay; the result string appears once VU1 starts its next program.
+extern int g_vuReplayExperiment;
+//Debug: parts of the optimized VU codegen dropped in the promoted rounds of the next replay
+void setVuExperiment(int bits)
+{
+	g_vuReplayExperiment = bits;
+}
+
 void vuCapture(uint32 count)
 {
 	g_vuCaptureRequest = count;
@@ -381,6 +388,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("setVuJitOptions", &setVuJitOptions);
 	function("vuDiffStats", &vuDiffStats);
 	function("vuCapture", &vuCapture);
+	function("setVuExperiment", &setVuExperiment);
 	function("vuReplay", &vuReplay);
 	function("vuReplayResult", &vuReplayResult);
 	function("saveState", &saveState);

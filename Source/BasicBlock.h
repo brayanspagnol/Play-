@@ -115,13 +115,24 @@ protected:
 
 	void CompileToStream(Framework::CMemStream&, bool contextPromotion);
 	bool UsesContextPromotion() const;
+	virtual bool IsSuperBlock() const
+	{
+		return false;
+	}
 #if defined(__EMSCRIPTEN__)
-	void ExecuteDiff();
+	virtual void ExecuteDiff();
 	CMemoryFunction m_refFunction;
+	bool m_diffExecute = false;
+#endif
+	//Set while compiling: true with the optimized VU codegen (context promotion and friends)
+	bool m_compileOptimized = false;
+#if defined(__EMSCRIPTEN__)
 
 public:
 	//Size of the VU data memory, saved/restored by the differential test
 	uint32 m_diffDataSize = 0;
+	//Compile with the reference (unoptimized) codegen, used by the differential test
+	bool m_forceReference = false;
 
 protected:
 #endif
