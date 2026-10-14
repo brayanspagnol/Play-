@@ -64,7 +64,12 @@ int CEeExecutor::Execute(int cycles)
 void CEeExecutor::WriteWatchHandler(CMIPS* context, uint32 address, uint32 size)
 {
 	//Only called from JIT code (store slow path), so a block is executing
-	static_cast<CEeExecutor*>(context->m_executor.get())->InvalidateWrittenRange(address, size, true);
+	auto executor = static_cast<CEeExecutor*>(context->m_executor.get());
+	if((address >= PS2::EE_RAM_SIZE) && executor->m_ioWriteHandler)
+	{
+		executor->m_ioWriteHandler(address);
+	}
+	executor->InvalidateWrittenRange(address, size, true);
 }
 
 void CEeExecutor::NotifyRamWritten(uint32 address, uint32 size)

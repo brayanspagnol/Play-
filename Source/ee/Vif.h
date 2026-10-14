@@ -22,10 +22,19 @@
 #endif
 
 class CINTC;
+class CVu1Thread;
 
 class CVif
 {
 public:
+	//ROLE_FRONT/ROLE_BACK are used when VU1 runs on its own thread (see Vu1Thread.h)
+	enum ROLE
+	{
+		ROLE_NORMAL,
+		ROLE_FRONT,
+		ROLE_BACK,
+	};
+
 	enum
 	{
 		REGS0_START = 0x10003800,
@@ -82,6 +91,16 @@ public:
 	virtual uint32 ReceiveDMA(uint32, uint32, uint32, bool);
 
 	bool IsWaitingForProgramEnd() const;
+
+	void SetRole(ROLE, CVu1Thread*);
+	//Front: pushes the qwords consumed since the last call to the VU1 thread
+	void ForwardConsumedData();
+	//Back: decodes data forwarded by the front, returns false if it is stalled (GIF busy)
+	void BeginForwardedData(uint8*, uint32, bool);
+	bool ProcessForwardedData();
+	//Copies the decoder state (used when switching VU1 threading on or off)
+	virtual void CopyStateFrom(const CVif&);
+	void CopyRowFrom(const CVif&);
 
 protected:
 	enum
@@ -203,10 +222,40 @@ protected:
 			}
 		}
 
+		//Same as Read without copying (front decoder)
+		inline void Skip(uint32 size)
+		{
+			uint32 bufferAvailable = BUFFERSIZE - m_bufferPosition;
+			if(size <= bufferAvailable)
+			{
+				m_bufferPosition += size;
+				return;
+			}
+			size -= bufferAvailable;
+			m_bufferPosition = BUFFERSIZE;
+			if(!m_tagIncluded)
+			{
+				//Only the last qword touched needs to be loaded in the buffer
+				uint32 wholeQwords = (size - 1) / BUFFERSIZE;
+				m_nextAddress += wholeQwords * BUFFERSIZE;
+				size -= wholeQwords * BUFFERSIZE;
+			}
+			while(size != 0)
+			{
+				SyncBuffer();
+				uint32 amount = std::min<uint32>(size, BUFFERSIZE - m_bufferPosition);
+				m_bufferPosition += amount;
+				size -= amount;
+			}
+		}
+
 		void Flush();
 		inline void Align32();
 		void SetDmaParams(uint32, uint32, bool);
 		void SetFifoParams(uint8*, uint32);
+		void SetRawParams(uint8*, uint32, bool);
+		//Returns the qwords loaded from the source since the previous call
+		bool TakeLoaded(const uint8*&, uint32&, bool&);
 
 		uint8* GetDirectPointer() const;
 		void Advance(uint32);
@@ -251,6 +300,8 @@ protected:
 		uint32 m_endAddress = 0;
 		bool m_tagIncluded = false;
 		uint8* m_source = nullptr;
+		uint32 m_forwardAddress = 0;
+		bool m_initialTagIncluded = false;
 	};
 
 	typedef CFifoStream StreamType;
@@ -329,6 +380,25 @@ protected:
 	void Cmd_STMASK(StreamType&, CODE);
 
 	inline uint32 GetColMaskOp(unsigned int) const;
+
+	inline bool IsVuReadyForVif() const
+	{
+		//The front never waits for VU1: the back executes everything in order.
+		//The back never sees VU1 running (programs run to completion), but a program stopped by
+		//a T/D bit must not stall it forever.
+		switch(m_role)
+		{
+		case ROLE_FRONT:
+			return true;
+		case ROLE_BACK:
+			return !m_vpu.IsVuRunning();
+		default:
+			return m_vpu.IsVuReady();
+		}
+	}
+
+	void ExecuteMicroProgram(uint32);
+	void SkipUnpack(StreamType&, CODE);
 
 	inline bool Unpack_S32(StreamType& stream, uint128& result)
 	{
@@ -700,6 +770,8 @@ protected:
 	void DisassembleSet(uint32, uint32);
 
 	unsigned int m_number = 0;
+	ROLE m_role = ROLE_NORMAL;
+	CVu1Thread* m_vu1Thread = nullptr;
 	CVpu& m_vpu;
 	CINTC& m_intc;
 	uint8* m_ram = nullptr;

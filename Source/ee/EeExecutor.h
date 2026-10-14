@@ -50,6 +50,9 @@ public:
 	//blocks of that page, like the access fault handler does on desktop platforms.
 	//C++ code writing EE RAM directly (DMA, HLE IOP modules) must call NotifyRamWritten.
 	static void NotifyRamWritten(uint32 address, uint32 size);
+
+	//Called before JIT stores outside of RAM/scratchpad (used to sync with the VU1 thread)
+	std::function<void(uint32)> m_ioWriteHandler;
 #else
 	static void NotifyRamWritten(uint32, uint32)
 	{

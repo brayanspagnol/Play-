@@ -46,7 +46,7 @@ void CINTC::SetRegister(uint32 nAddress, uint32 nValue)
 	switch(nAddress)
 	{
 	case INTC_STAT:
-		m_INTC_STAT &= ~nValue;
+		m_INTC_STAT.fetch_and(~nValue);
 		break;
 	case INTC_MASK:
 		m_INTC_MASK ^= nValue;
@@ -59,7 +59,7 @@ void CINTC::SetRegister(uint32 nAddress, uint32 nValue)
 
 void CINTC::AssertLine(uint32 nLine)
 {
-	m_INTC_STAT |= (1 << nLine);
+	m_INTC_STAT.fetch_or(1 << nLine);
 }
 
 void CINTC::LoadState(Framework::CZipArchiveReader& archive)

@@ -83,6 +83,8 @@ public:
 	CVif& GetVif();
 
 	void SetFbrst(uint32);
+	//VU1 thread: microprograms run until they end instead of being continued by Execute()
+	void SetRunToCompletion(bool);
 
 	void ExecuteMicroProgram(uint32);
 	void InvalidateMicroProgram();
@@ -132,6 +134,7 @@ protected:
 
 	VU_STATE m_vuState = VU_STATE_READY;
 	uint32 m_fbrst = 0;
+	bool m_runToCompletion = false;
 
 	CProfiler::ZoneHandle m_vuProfilerZone = 0;
 };

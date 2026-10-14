@@ -21,6 +21,7 @@
 
 #ifdef PROFILE
 extern std::atomic<uint64> g_gsThreadBusyNs;
+extern std::atomic<uint64> g_vu1ThreadBusyNs;
 extern std::atomic<uint32> g_blockCompileCount;
 extern std::atomic<uint32> g_eeSyscallCounts[0x100];
 extern std::atomic<uint32> g_eeInterruptCount;
@@ -108,10 +109,12 @@ std::string getProfile()
 		zones += string_format("%s\"%s\":%.1f", zones.empty() ? "" : ",", zone.first.c_str(), zone.second / 1e6);
 	}
 	uint64 gsBusyNs = 0;
+	uint64 vu1BusyNs = 0;
 	uint32 compiles = 0;
 	std::string extra;
 #ifdef PROFILE
 	gsBusyNs = g_gsThreadBusyNs.exchange(0);
+	vu1BusyNs = g_vu1ThreadBusyNs.exchange(0);
 	compiles = g_blockCompileCount.exchange(0);
 	{
 		std::string syscalls;
@@ -128,14 +131,19 @@ std::string getProfile()
 			if(c == '\n') { escapedLog += "\\n"; continue; }
 			if(static_cast<unsigned char>(c) >= 0x20) escapedLog += c;
 		}
-		extra = string_format(",\"log\":\"%s\",\"syscalls\":{%s},\"eeInts\":%u,\"eeSlices\":%u,\"eeIdleSlices\":%u",
-		                      escapedLog.c_str(), syscalls.c_str(), g_eeInterruptCount.exchange(0), g_eeSlices.exchange(0), g_eeIdleSlices.exchange(0));
+		std::string counters;
+		for(uint32 i = 0; i < PCNT_MAX; i++)
+		{
+			counters += string_format("%s\"%s\":%u", i ? "," : "", g_profileCounterNames[i], g_profileCounters[i].exchange(0));
+		}
+		extra = string_format(",\"counters\":{%s},\"log\":\"%s\",\"syscalls\":{%s},\"eeInts\":%u,\"eeSlices\":%u,\"eeIdleSlices\":%u",
+		                      counters.c_str(), escapedLog.c_str(), syscalls.c_str(), g_eeInterruptCount.exchange(0), g_eeSlices.exchange(0), g_eeIdleSlices.exchange(0));
 	}
 #endif
 	return string_format("{\"wallMs\":%.1f,\"vblanks\":%u,\"eeTotal\":%d,\"eeIdle\":%d,\"iopTotal\":%d,\"iopIdle\":%d,"
-	                     "\"gsBusyMs\":%.1f,\"compiles\":%u,\"cacheHits\":%u,\"zonesMs\":{%s},\"eePcs\":[%s],\"iopPcs\":[%s]%s}",
+	                     "\"gsBusyMs\":%.1f,\"vu1BusyMs\":%.1f,\"compiles\":%u,\"cacheHits\":%u,\"zonesMs\":{%s},\"eePcs\":[%s],\"iopPcs\":[%s]%s}",
 	                     wallMs, profile.vblanks, profile.cpu.eeTotalTicks, profile.cpu.eeIdleTicks,
-	                     profile.cpu.iopTotalTicks, profile.cpu.iopIdleTicks, gsBusyNs / 1e6, compiles, BlockCache::TakeHitCount(),
+	                     profile.cpu.iopTotalTicks, profile.cpu.iopIdleTicks, gsBusyNs / 1e6, vu1BusyNs / 1e6, compiles, BlockCache::TakeHitCount(),
 	                     zones.c_str(), profile.eePcs.c_str(), profile.iopPcs.c_str(), extra.c_str());
 }
 
@@ -164,6 +172,12 @@ int stateStatus()
 		g_stateResult = g_stateFuture.get() ? 1 : 0;
 	}
 	return g_stateResult;
+}
+
+//VU1 on its own thread (on by default), applied at the next vblank
+void setVu1Threaded(bool enabled)
+{
+	g_virtualMachine->SetVu1Threaded(enabled);
 }
 
 void setFrameLimit(bool enabled)
@@ -262,6 +276,8 @@ extern "C" void initVm()
 		g_virtualMachine->CreateSoundHandler(CSH_WebAudio::GetFactoryFunction());
 	}
 
+	g_virtualMachine->SetVu1Threaded(true);
+
 	g_vmNewFrameConnection = g_virtualMachine->OnNewFrame.Connect(&OnVmNewFrame);
 	g_gsNewFrameConnection = g_virtualMachine->GetGSHandler()->OnNewFrame.Connect(std::bind(&CStatsManager::OnGsNewFrame, &CStatsManager::GetInstance(), std::placeholders::_1));
 
@@ -331,6 +347,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("loadState", &loadState);
 	function("stateStatus", &stateStatus);
 	function("setFrameLimit", &setFrameLimit);
+	function("setVu1Threaded", &setVu1Threaded);
 	function("setEeFrequencyScale", &setEeFrequencyScale);
 	function("blockCacheEnable", &BlockCache::SetEnabled);
 	function("blockCacheClear", &BlockCache::Clear);

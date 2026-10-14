@@ -21,10 +21,21 @@ void CVuExecutor::SetBlockNoClamping(BlockNoClampingSet blockNoClamping)
 	m_blockNoClamping = std::move(blockNoClamping);
 }
 
+const CVuExecutor::BlockNoClampingSet& CVuExecutor::GetBlockNoClamping() const
+{
+	return m_blockNoClamping;
+}
+
 void CVuExecutor::Reset()
 {
 	m_cachedBlocks.clear();
 	m_blockNoClamping.clear();
+	CGenericMipsExecutor::Reset();
+}
+
+void CVuExecutor::DropBlocks()
+{
+	m_cachedBlocks.clear();
 	CGenericMipsExecutor::Reset();
 }
 
