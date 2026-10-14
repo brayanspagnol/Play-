@@ -2,7 +2,7 @@
 #include <emscripten/bind.h>
 #include "Ps2VmJs.h"
 #include "GSH_OpenGLJs.h"
-#include "sound/SH_OpenAL/SH_OpenALProxy.h"
+#include "SH_WebAudio.h"
 #include "input/PH_GenericInput.h"
 #include "InputProviderEmscripten.h"
 #include "ui_shared/StatsManager.h"
@@ -32,7 +32,6 @@ CPs2VmJs* g_virtualMachine = nullptr;
 CGSHandler::NewFrameEvent::Connection g_gsNewFrameConnection;
 EMSCRIPTEN_WEBGL_CONTEXT_HANDLE g_context = 0;
 std::shared_ptr<CInputProviderEmscripten> g_inputProvider;
-CSH_OpenAL* g_soundHandler = nullptr;
 Framework::CSignal<void()>::Connection g_vmNewFrameConnection;
 
 //Profiling/stats snapshot, filled on the emulation thread at every vblank, read by getProfile() on the main thread.
@@ -255,8 +254,12 @@ extern "C" void initVm()
 	}
 
 	{
-		g_soundHandler = new CSH_OpenAL();
-		g_virtualMachine->CreateSoundHandler(CSH_OpenALProxy::GetFactoryFunction(g_soundHandler));
+		//Hand samples to the output every 10 SPU blocks (~10 ms) instead of 100 (~100 ms): the worklet keeps
+		//~100 ms queued, so it needs a smooth supply.
+		CAppConfig::GetInstance().SetPreferenceInteger(PREF_AUDIO_SPUBLOCKCOUNT, 10);
+		g_virtualMachine->ReloadSpuBlockCount();
+		CSH_WebAudio::Start();
+		g_virtualMachine->CreateSoundHandler(CSH_WebAudio::GetFactoryFunction());
 	}
 
 	g_vmNewFrameConnection = g_virtualMachine->OnNewFrame.Connect(&OnVmNewFrame);
