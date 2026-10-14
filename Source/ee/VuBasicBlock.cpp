@@ -376,6 +376,8 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
 				//we want to execute the instruction in the E bit delay slot.
 				jitter->PushRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
 				jitter->PushCst(MIPS_INVALID_PC);
+				//Conditionally executed code: don't forward flag values into or out of it
+				VUShared::ResetFlagForwarding(false);
 				jitter->BeginIf(Jitter::CONDITION_EQ);
 				{
 					//If we haven't taken the jump, execute the instruction after the delay slot

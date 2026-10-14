@@ -238,6 +238,12 @@ namespace VUShared
 	void CheckFlagPipeline(const FLAG_PIPEINFO&, CMipsJitter*, uint32);
 	void QueueInFlagPipeline(const FLAG_PIPEINFO&, CMipsJitter*, uint32, uint32);
 	void ResetFlagPipeline(const FLAG_PIPEINFO&, CMipsJitter*);
+	//Pushes the latest value queued in a flag pipeline (values[index - 1])
+	void PushLatestFlagPipelineValue(const FLAG_PIPEINFO&, CMipsJitter*);
+	//Flag forwarding: inside one VU block, the latest value queued in a flag pipeline is also kept
+	//in CMIPS::m_jitFlagScratch so later reads don't go through the ring buffer. Must be reset at the
+	//start of every block and around code that is only conditionally executed.
+	void ResetFlagForwarding(bool enabled);
 
 	void CheckFlagPipelineImmediate(const FLAG_PIPEINFO&, CMIPS*, uint32);
 	void ResetFlagPipelineImmediate(const FLAG_PIPEINFO&, CMIPS*, uint32);

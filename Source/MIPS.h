@@ -174,6 +174,10 @@ public:
 	//software (WebAssembly has no mprotect): a null entry sends the store through the slow path.
 	void** m_pageLookupWrite = nullptr;
 
+	//JIT scratch values (not architectural state, never saved): latest value queued in the MAC,
+	//sticky and clip flag pipelines by the block being executed (see VUShared flag forwarding)
+	alignas(16) uint32 m_jitFlagScratch[4] = {};
+
 	//Called by the slow path store proxies with the physical address and size written
 	typedef void (*WriteWatchHandler)(CMIPS*, uint32, uint32);
 	WriteWatchHandler m_writeWatchHandler = nullptr;

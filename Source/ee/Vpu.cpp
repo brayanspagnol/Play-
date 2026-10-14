@@ -21,6 +21,7 @@
 #include <atomic>
 #include <mutex>
 #include <vector>
+#include <algorithm>
 #include "xxhash.h"
 #include "VuExecutor.h"
 
@@ -289,12 +290,18 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 	std::vector<uint8> liveVuMem(m_vuMem, m_vuMem + m_vuMemSize);
 	bool livePromotion = g_vuContextPromotion;
 
-	uint32 blockCount = 0;
-	auto runCapture = [&](const VU_CAPTURE& capture) {
+	//Keep captures that share a microprogram together: switching programs invalidates blocks
+	std::stable_sort(g_vuCaptures.begin(), g_vuCaptures.end(), [](const VU_CAPTURE& a, const VU_CAPTURE& b) {
+		return XXH64(a.microMem.data(), a.microMem.size(), 0) < XXH64(b.microMem.data(), b.microMem.size(), 0);
+	});
+	auto runCapture = [&](const VU_CAPTURE& capture, bool withHash) -> uint64 {
 		memcpy(&m_ctx->m_State, &capture.state, sizeof(MIPSSTATE));
-		memcpy(m_microMem, capture.microMem.data(), m_microMemSize);
+		if(memcmp(m_microMem, capture.microMem.data(), m_microMemSize) != 0)
+		{
+			memcpy(m_microMem, capture.microMem.data(), m_microMemSize);
+			InvalidateMicroProgram();
+		}
 		memcpy(m_vuMem, capture.vuMem.data(), m_vuMemSize);
-		InvalidateMicroProgram();
 		m_ctx->m_State.nPC = capture.address;
 		for(uint32 i = 0; i < 1000; i++)
 		{
@@ -302,6 +309,7 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 			uint32 exception = m_ctx->m_State.nHasException;
 			if((exception == MIPS_EXCEPTION_VU_EBIT) || (exception == MIPS_EXCEPTION_VU_TBIT) || (exception == MIPS_EXCEPTION_VU_DBIT)) break;
 		}
+		if(!withHash) return 0;
 		//Result fingerprint: registers and data memory
 		XXH64_state_t* hashState = XXH64_createState();
 		XXH64_reset(hashState, 0);
@@ -315,25 +323,35 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 	std::string result;
 	std::vector<uint64> refHashes;
 	g_vuDiffSuppressKick = true;
-	for(int variant = 0; variant < 2; variant++)
+	//Variants alternate (reference, promoted, reference, promoted). Each starts from freshly
+	//instantiated blocks, so it first runs for a while to let the engine tier the code up.
+	for(int round = 0; round < 8; round++)
 	{
+		int variant = round & 1;
 		g_vuContextPromotion = (variant == 1);
 		static_cast<CVuExecutor*>(m_ctx->m_executor.get())->ResetBlocks();
 		std::vector<uint64> hashes;
-		//Warm up: compile every block and let the engine optimize them
-		for(uint32 i = 0; i < 20; i++)
+		for(const auto& capture : g_vuCaptures) hashes.push_back(runCapture(capture, true));
+		double warmStart = emscripten_get_now();
+		while(emscripten_get_now() - warmStart < 1500.0)
 		{
-			hashes.clear();
-			for(const auto& capture : g_vuCaptures) hashes.push_back(runCapture(capture));
+			for(const auto& capture : g_vuCaptures) runCapture(capture, false);
 		}
+#ifdef PROFILE
+		extern std::atomic<uint32> g_vuBlockExecCount;
+		uint32 blocksBefore = g_vuBlockExecCount;
+#endif
 		double start = emscripten_get_now();
 		for(uint32 i = 0; i < iterations; i++)
 		{
-			for(const auto& capture : g_vuCaptures) runCapture(capture);
+			for(const auto& capture : g_vuCaptures) runCapture(capture, false);
 		}
 		double elapsed = emscripten_get_now() - start;
+#ifdef PROFILE
+		result += string_format("blocks/program %.1f\n", static_cast<double>(g_vuBlockExecCount - blocksBefore) / (iterations * g_vuCaptures.size()));
+#endif
 		uint32 mismatches = 0;
-		if(variant == 0)
+		if(round == 0)
 		{
 			refHashes = hashes;
 		}

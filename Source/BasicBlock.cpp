@@ -5,6 +5,7 @@
 #include "offsetof_def.h"
 #include "MipsJitter.h"
 #include "Jitter_CodeGenFactory.h"
+#include "ee/VUShared.h"
 #ifdef __EMSCRIPTEN__
 #include <cstdarg>
 #include <cstdio>
@@ -445,6 +446,8 @@ void CBasicBlock::CompileToStream(Framework::CMemStream& stream, bool contextPro
 		wasmCodeGen->SetFunctionName(name);
 	}
 #endif
+	//Flag value forwarding: VU blocks only (straight-line FMAC code), part of the optimized VU codegen
+	VUShared::ResetFlagForwarding((m_category == BLOCK_CATEGORY_PS2_VU) && contextPromotion);
 	jitter->GetCodeGen()->SetExternalSymbolReferencedHandler([&](auto symbol, auto offset, auto refType) { this->HandleExternalFunctionReference(symbol, offset, refType); });
 	jitter->SetStream(&stream);
 	jitter->Begin();
