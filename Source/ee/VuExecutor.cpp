@@ -28,6 +28,12 @@ void CVuExecutor::Reset()
 	CGenericMipsExecutor::Reset();
 }
 
+void CVuExecutor::ResetBlocks()
+{
+	m_cachedBlocks.clear();
+	CGenericMipsExecutor::Reset();
+}
+
 BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end)
 {
 	uint32 blockSize = ((end - begin) + 4) / 4;
@@ -63,6 +69,8 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
 		if(beginBlockIterator != endBlockIterator)
 		{
 			auto result = std::make_shared<CVuBasicBlock>(context, begin, end, m_blockCategory);
+			//VU data memory is as large as micro memory (4 KB VU0, 16 KB VU1)
+			result->m_diffDataSize = m_maxAddress;
 			result->CopyFunctionFrom(beginBlockIterator->second);
 			m_cachedBlocks.insert(std::make_pair(blockKey, result));
 			return result;
@@ -71,6 +79,7 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
 
 	//Totally new block, build it from scratch
 	auto result = std::make_shared<CVuBasicBlock>(context, begin, end, m_blockCategory);
+	result->m_diffDataSize = m_maxAddress;
 	//VU0 and VU1 generate different code (memory address mask)
 	result->AddCacheVariant(m_maxAddress);
 

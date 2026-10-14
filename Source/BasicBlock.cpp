@@ -6,8 +6,39 @@
 #include "MipsJitter.h"
 #include "Jitter_CodeGenFactory.h"
 #ifdef __EMSCRIPTEN__
+#include <cstdarg>
+#include <cstdio>
+#include <string>
+#include <cstring>
+#include <vector>
 #include "BlockCache.h"
 #include "xxhash.h"
+#include "Jitter_CodeGen_Wasm.h"
+
+//VU blocks keep context symbols (VF/VI registers, flags, pipeline state) in wasm locals.
+bool g_vuContextPromotion = true;
+//Differential test: every VU block also gets a reference version (no promotion); both run from
+//the same state and their results are compared. See CBasicBlock::ExecuteDiff.
+bool g_vuDiffMode = false;
+bool g_vuDiffSuppressKick = false;
+//Name every JIT function (wasm name section) so CPU profiles tell blocks apart
+bool g_jitFunctionNames = false;
+std::atomic<uint32> g_vuDiffRuns = 0;
+std::atomic<uint32> g_vuDiffMismatches = 0;
+std::mutex g_vuDiffLogMutex;
+std::string g_vuDiffLog;
+
+static void VuDiffLog(const char* format, ...)
+{
+	char line[256];
+	va_list args;
+	va_start(args, format);
+	vsnprintf(line, sizeof(line), format, args);
+	va_end(args);
+	printf("%s", line);
+	std::lock_guard<std::mutex> lock(g_vuDiffLogMutex);
+	if(g_vuDiffLog.size() < 8192) g_vuDiffLog += line;
+}
 #endif
 
 #if defined(AOT_BUILD_CACHE) || defined(AOT_USE_CACHE)
@@ -82,6 +113,7 @@ void CBasicBlock::SetAotBlockOutputStream(Framework::CStdStream* outputStream)
 
 #ifdef PROFILE
 std::atomic<uint32> g_blockCompileCount = 0;
+std::atomic<uint32> g_vuBlockExecCount = 0;
 #endif
 
 void CBasicBlock::Compile()
@@ -112,7 +144,7 @@ void CBasicBlock::Compile()
 		cacheKey.category = m_category;
 		cacheKey.size = wordCount * 4;
 		cacheKey.hints = m_blockCompileHints;
-		cacheKey.variant = m_cacheVariant;
+		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000);
 		cacheKey.hash[0] = xxHash.low64;
 		cacheKey.hash[1] = xxHash.high64;
 
@@ -130,24 +162,16 @@ void CBasicBlock::Compile()
 #endif
 
 	Framework::CMemStream stream;
-	{
-		static
-#ifdef AOT_BUILD_CACHE
-		    thread_local
-#endif
-		    CMipsJitter* jitter = nullptr;
-		if(jitter == nullptr)
-		{
-			Jitter::CCodeGen* codeGen = Jitter::CreateCodeGen();
-			jitter = new CMipsJitter(codeGen);
-		}
+	CompileToStream(stream, UsesContextPromotion());
 
-		jitter->GetCodeGen()->SetExternalSymbolReferencedHandler([&](auto symbol, auto offset, auto refType) { this->HandleExternalFunctionReference(symbol, offset, refType); });
-		jitter->SetStream(&stream);
-		jitter->Begin();
-		CompileRange(jitter);
-		jitter->End();
+#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+	if(g_vuDiffMode && (m_category == BLOCK_CATEGORY_PS2_VU) && UsesContextPromotion())
+	{
+		Framework::CMemStream refStream;
+		CompileToStream(refStream, false);
+		m_refFunction = CMemoryFunction(refStream.GetBuffer(), refStream.GetSize());
 	}
+#endif
 
 	{
 #ifdef PROFILE
@@ -397,8 +421,106 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 	jitter->EndIf();
 }
 
+void CBasicBlock::CompileToStream(Framework::CMemStream& stream, bool contextPromotion)
+{
+	static
+#ifdef AOT_BUILD_CACHE
+	    thread_local
+#endif
+	    CMipsJitter* jitter = nullptr;
+	if(jitter == nullptr)
+	{
+		Jitter::CCodeGen* codeGen = Jitter::CreateCodeGen();
+		jitter = new CMipsJitter(codeGen);
+	}
+
+#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+	auto wasmCodeGen = static_cast<Jitter::CCodeGen_Wasm*>(jitter->GetCodeGen());
+	wasmCodeGen->SetContextPromotion(contextPromotion);
+	if(g_jitFunctionNames)
+	{
+		const char* prefix = (m_category == BLOCK_CATEGORY_PS2_VU) ? (m_diffDataSize > 0x1000 ? "vu1" : "vu0") : (m_category == BLOCK_CATEGORY_PS2_EE) ? "ee" : "iop";
+		char name[64];
+		snprintf(name, sizeof(name), "%s_%08X_%08X", prefix, m_begin, m_end);
+		wasmCodeGen->SetFunctionName(name);
+	}
+#endif
+	jitter->GetCodeGen()->SetExternalSymbolReferencedHandler([&](auto symbol, auto offset, auto refType) { this->HandleExternalFunctionReference(symbol, offset, refType); });
+	jitter->SetStream(&stream);
+	jitter->Begin();
+	CompileRange(jitter);
+	jitter->End();
+}
+
+bool CBasicBlock::UsesContextPromotion() const
+{
+#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+	return (m_category == BLOCK_CATEGORY_PS2_VU) && g_vuContextPromotion;
+#else
+	return false;
+#endif
+}
+
+#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+void CBasicBlock::ExecuteDiff()
+{
+	uint32 dataSize = m_diffDataSize;
+	auto dataMem = reinterpret_cast<uint8*>(m_context.m_vuMem);
+	static MIPSSTATE initState, refState;
+	static std::vector<uint8> initMem, refMem;
+	initMem.resize(dataSize);
+	refMem.resize(dataSize);
+
+	memcpy(&initState, &m_context.m_State, sizeof(MIPSSTATE));
+	memcpy(initMem.data(), dataMem, dataSize);
+
+	g_vuDiffSuppressKick = true;
+	m_refFunction(&m_context);
+	g_vuDiffSuppressKick = false;
+
+	memcpy(&refState, &m_context.m_State, sizeof(MIPSSTATE));
+	memcpy(refMem.data(), dataMem, dataSize);
+	memcpy(&m_context.m_State, &initState, sizeof(MIPSSTATE));
+	memcpy(dataMem, initMem.data(), dataSize);
+
+	m_function(&m_context);
+
+	g_vuDiffRuns++;
+	bool stateDiffers = memcmp(&refState, &m_context.m_State, sizeof(MIPSSTATE)) != 0;
+	bool memDiffers = memcmp(refMem.data(), dataMem, dataSize) != 0;
+	if(stateDiffers || memDiffers)
+	{
+		uint32 count = g_vuDiffMismatches++;
+		if(count < 50)
+		{
+			auto ref = reinterpret_cast<const uint32*>(&refState);
+			auto cur = reinterpret_cast<const uint32*>(&m_context.m_State);
+			for(uint32 i = 0; i < sizeof(MIPSSTATE) / 4; i++)
+			{
+				if(ref[i] != cur[i])
+				{
+					VuDiffLog("VUDIFF block %08X-%08X (size %u) state offset 0x%X: ref %08X new %08X\n",
+					       m_begin, m_end, dataSize, i * 4, ref[i], cur[i]);
+				}
+			}
+			if(memDiffers)
+			{
+				VuDiffLog("VUDIFF block %08X-%08X data memory differs\n", m_begin, m_end);
+			}
+		}
+	}
+}
+#endif
+
 void CBasicBlock::Execute()
 {
+#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+	if(!m_refFunction.IsEmpty())
+	{
+		ExecuteDiff();
+		return;
+	}
+#endif
 	m_function(&m_context);
 
 	assert(m_context.m_State.nGPR[0].nV0 == 0);
@@ -522,6 +644,12 @@ void CBasicBlock::CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& other)
 {
 #ifndef AOT_USE_CACHE
 	m_function = other->m_function.CreateInstance();
+#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+	if(!other->m_refFunction.IsEmpty())
+	{
+		m_refFunction = other->m_refFunction.CreateInstance();
+	}
+#endif
 	std::copy(std::begin(other->m_linkBlockTrampolineOffset), std::end(other->m_linkBlockTrampolineOffset), m_linkBlockTrampolineOffset);
 #ifdef _DEBUG
 	std::copy(std::begin(other->m_linkBlock), std::end(other->m_linkBlock), m_linkBlock);

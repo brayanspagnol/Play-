@@ -12,6 +12,7 @@
 #include "AppConfig.h"
 #include "string_format.h"
 #include "BlockCache.h"
+#include "ee/Vpu.h"
 #include <future>
 #include <mutex>
 #include <map>
@@ -22,6 +23,7 @@
 #ifdef PROFILE
 extern std::atomic<uint64> g_gsThreadBusyNs;
 extern std::atomic<uint32> g_blockCompileCount;
+extern std::atomic<uint32> g_vuBlockExecCount;
 extern std::atomic<uint32> g_eeSyscallCounts[0x100];
 extern std::atomic<uint32> g_eeInterruptCount;
 extern std::atomic<uint32> g_eeSlices;
@@ -129,8 +131,8 @@ std::string getProfile()
 			if(c == '\n') { escapedLog += "\\n"; continue; }
 			if(static_cast<unsigned char>(c) >= 0x20) escapedLog += c;
 		}
-		extra = string_format(",\"log\":\"%s\",\"syscalls\":{%s},\"eeInts\":%u,\"eeSlices\":%u,\"eeIdleSlices\":%u",
-		                      escapedLog.c_str(), syscalls.c_str(), g_eeInterruptCount.exchange(0), g_eeSlices.exchange(0), g_eeIdleSlices.exchange(0));
+		extra = string_format(",\"vuBlocks\":%u,\"log\":\"%s\",\"syscalls\":{%s},\"eeInts\":%u,\"eeSlices\":%u,\"eeIdleSlices\":%u",
+		                      g_vuBlockExecCount.exchange(0), escapedLog.c_str(), syscalls.c_str(), g_eeInterruptCount.exchange(0), g_eeSlices.exchange(0), g_eeIdleSlices.exchange(0));
 	}
 #endif
 	return string_format("{\"wallMs\":%.1f,\"vblanks\":%u,\"eeTotal\":%d,\"eeIdle\":%d,\"iopTotal\":%d,\"iopIdle\":%d,"
@@ -138,6 +140,58 @@ std::string getProfile()
 	                     wallMs, profile.vblanks, profile.cpu.eeTotalTicks, profile.cpu.eeIdleTicks,
 	                     profile.cpu.iopTotalTicks, profile.cpu.iopIdleTicks, gsBusyNs / 1e6, compiles, BlockCache::TakeHitCount(),
 	                     zones.c_str(), profile.eePcs.c_str(), profile.iopPcs.c_str(), extra.c_str());
+}
+
+extern bool g_vuContextPromotion;
+extern bool g_vuDiffMode;
+extern std::atomic<uint32> g_vuDiffRuns;
+extern std::atomic<uint32> g_vuDiffMismatches;
+
+//VU JIT debug options (call before booting): promotion of VU context state into wasm locals,
+//and the differential test (each VU block runs with and without promotion, results compared).
+extern bool g_jitFunctionNames;
+
+void setVuJitOptions(bool promotion, bool diff, bool names)
+{
+	g_vuContextPromotion = promotion;
+	g_vuDiffMode = diff;
+	g_jitFunctionNames = names;
+}
+
+extern std::mutex g_vuDiffLogMutex;
+extern std::string g_vuDiffLog;
+
+extern std::atomic<uint32> g_vuCaptureRequest;
+extern std::atomic<uint32> g_vuReplayRequest;
+extern std::mutex g_vuReplayResultMutex;
+extern std::string g_vuReplayResult;
+
+//VU1 replay benchmark (see CVpu::RunReplayBenchmark): capture the next count programs, then
+//request a replay; the result string appears once VU1 starts its next program.
+void vuCapture(uint32 count)
+{
+	g_vuCaptureRequest = count;
+}
+
+void vuReplay(uint32 iterations)
+{
+	{
+		std::lock_guard<std::mutex> lock(g_vuReplayResultMutex);
+		g_vuReplayResult.clear();
+	}
+	g_vuReplayRequest = iterations;
+}
+
+std::string vuReplayResult()
+{
+	std::lock_guard<std::mutex> lock(g_vuReplayResultMutex);
+	return string_format("captures=%u\n%s", CVpu::GetReplayCaptureCount(), g_vuReplayResult.c_str());
+}
+
+std::string vuDiffStats()
+{
+	std::lock_guard<std::mutex> lock(g_vuDiffLogMutex);
+	return string_format("runs=%u mismatches=%u\n%s", g_vuDiffRuns.load(), g_vuDiffMismatches.load(), g_vuDiffLog.c_str());
 }
 
 //Save states run on the emulation thread; never block the main thread on them
@@ -324,6 +378,11 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("getFrames", &getFrames);
 	function("clearStats", &clearStats);
 	function("getProfile", &getProfile);
+	function("setVuJitOptions", &setVuJitOptions);
+	function("vuDiffStats", &vuDiffStats);
+	function("vuCapture", &vuCapture);
+	function("vuReplay", &vuReplay);
+	function("vuReplayResult", &vuReplayResult);
 	function("saveState", &saveState);
 	function("loadState", &loadState);
 	function("stateStatus", &stateStatus);

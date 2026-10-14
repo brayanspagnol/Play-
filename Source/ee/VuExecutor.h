@@ -15,6 +15,8 @@ public:
 	void SetBlockNoClamping(BlockNoClampingSet);
 
 	void Reset() override;
+	//Drops every compiled block (keeps per-game settings), used by the replay benchmark
+	void ResetBlocks();
 
 protected:
 	typedef std::multimap<CachedBlockKey, BasicBlockPtr> CachedBlockMap;

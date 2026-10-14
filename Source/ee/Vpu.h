@@ -85,6 +85,11 @@ public:
 	void SetFbrst(uint32);
 
 	void ExecuteMicroProgram(uint32);
+#ifdef __EMSCRIPTEN__
+	static void ClearReplayCaptures();
+	static uint32 GetReplayCaptureCount();
+	void RunReplayBenchmark(uint32 iterations);
+#endif
 	void InvalidateMicroProgram();
 	void InvalidateMicroProgram(uint32, uint32);
 

@@ -11,6 +11,10 @@
 #include "Vif.h"
 #include "placeholder_def.h"
 
+#ifdef __EMSCRIPTEN__
+extern bool g_vuDiffSuppressKick;
+#endif
+
 using namespace Ee;
 
 #define LOG_NAME ("ee_subsystem")
@@ -704,6 +708,10 @@ uint32 CSubSystem::Vu1IoPortWriteHandler(uint32 address, uint32 value)
 	switch(address)
 	{
 	case CVpu::VU_ADDR_XGKICK:
+#ifdef __EMSCRIPTEN__
+		//The VU differential test runs blocks twice; only the second run may kick
+		if(g_vuDiffSuppressKick) break;
+#endif
 		m_vpu1->ProcessXgKick(value);
 		break;
 	default:

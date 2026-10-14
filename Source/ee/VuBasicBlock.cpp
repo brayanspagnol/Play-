@@ -4,9 +4,29 @@
 #include "MemoryUtils.h"
 #include "Vpu.h"
 
+#ifdef __EMSCRIPTEN__
+#include "Jitter_CodeGen_Wasm.h"
+#endif
+
 CVuBasicBlock::CVuBasicBlock(CMIPS& context, uint32 begin, uint32 end, BLOCK_CATEGORY category)
     : CBasicBlock(context, begin, end, category)
 {
+#ifdef __EMSCRIPTEN__
+	//Context arrays that VU code indexes through references: never cached in wasm locals
+	static bool arraysRegistered = [] {
+		auto registerArray = [](size_t offset, size_t size) {
+			Jitter::CCodeGen_Wasm::RegisterContextArray(static_cast<uint32>(offset), static_cast<uint32>(size));
+		};
+		registerArray(offsetof(CMIPS, m_State.nCOP2VI), sizeof(MIPSSTATE::nCOP2VI));
+		for(auto pipe : {offsetof(CMIPS, m_State.pipeMac), offsetof(CMIPS, m_State.pipeSticky), offsetof(CMIPS, m_State.pipeClip)})
+		{
+			registerArray(pipe + offsetof(FLAG_PIPELINE, values), sizeof(FLAG_PIPELINE::values));
+			registerArray(pipe + offsetof(FLAG_PIPELINE, pipeTimes), sizeof(FLAG_PIPELINE::pipeTimes));
+		}
+		return true;
+	}();
+	(void)arraysRegistered;
+#endif
 }
 
 bool CVuBasicBlock::IsLinkable() const

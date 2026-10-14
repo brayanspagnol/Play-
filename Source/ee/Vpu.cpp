@@ -16,6 +16,39 @@
 #define STATE_REGS_VUSTATE ("vuState")
 #define STATE_REGS_FBRST ("fbrst")
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <atomic>
+#include <mutex>
+#include <vector>
+#include "xxhash.h"
+#include "VuExecutor.h"
+
+//VU1 replay benchmark (WebAssembly debug tool): capture the inputs of the next N VU1 microprogram
+//starts (registers, micro and data memory), then replay them in a tight loop with the reference
+//codegen and with context promotion, timing both and checking that their results are identical.
+//Requests come from the main thread; capture and replay run on the VM thread when VU1 starts a
+//program. XGKICKs are suppressed during replay and the live VU1 state is restored afterwards.
+extern bool g_vuContextPromotion;
+extern bool g_vuDiffSuppressKick;
+std::atomic<uint32> g_vuCaptureRequest = 0;
+std::atomic<uint32> g_vuReplayRequest = 0;
+std::mutex g_vuReplayResultMutex;
+std::string g_vuReplayResult;
+
+namespace
+{
+	struct VU_CAPTURE
+	{
+		uint32 address;
+		MIPSSTATE state;
+		std::vector<uint8> microMem;
+		std::vector<uint8> vuMem;
+	};
+	std::vector<VU_CAPTURE> g_vuCaptures;
+}
+#endif
+
 CVpu::CVpu(unsigned int number, const VPUINIT& vpuInit, CGIF& gif, CINTC& intc, uint8* ram, uint8* spr)
     : m_number(number)
     , m_vif((number == 0) ? std::make_unique<CVif>(0, *this, intc, ram, spr) : std::make_unique<CVif1>(1, *this, gif, intc, ram, spr))
@@ -205,6 +238,26 @@ void CVpu::ExecuteMicroProgram(uint32 nAddress)
 	SaveMiniState();
 #endif
 
+#ifdef __EMSCRIPTEN__
+	if(m_number == 1)
+	{
+		if(g_vuReplayRequest != 0)
+		{
+			RunReplayBenchmark(g_vuReplayRequest.exchange(0));
+		}
+		if(g_vuCaptureRequest != 0)
+		{
+			g_vuCaptureRequest--;
+			VU_CAPTURE capture;
+			capture.address = nAddress;
+			memcpy(&capture.state, &m_ctx->m_State, sizeof(MIPSSTATE));
+			capture.microMem.assign(m_microMem, m_microMem + m_microMemSize);
+			capture.vuMem.assign(m_vuMem, m_vuMem + m_vuMemSize);
+			g_vuCaptures.push_back(std::move(capture));
+		}
+	}
+#endif
+
 	assert(m_vuState != VU_STATE_RUNNING);
 	m_vuState = VU_STATE_RUNNING;
 	VuStateChanged(m_vuState);
@@ -214,6 +267,97 @@ void CVpu::ExecuteMicroProgram(uint32 nAddress)
 		if(m_vuState != VU_STATE_RUNNING) break;
 	}
 }
+
+#ifdef __EMSCRIPTEN__
+void CVpu::ClearReplayCaptures()
+{
+	g_vuCaptures.clear();
+}
+
+uint32 CVpu::GetReplayCaptureCount()
+{
+	return static_cast<uint32>(g_vuCaptures.size());
+}
+
+void CVpu::RunReplayBenchmark(uint32 iterations)
+{
+	if(g_vuCaptures.empty()) return;
+
+	MIPSSTATE liveState;
+	memcpy(&liveState, &m_ctx->m_State, sizeof(MIPSSTATE));
+	std::vector<uint8> liveMicroMem(m_microMem, m_microMem + m_microMemSize);
+	std::vector<uint8> liveVuMem(m_vuMem, m_vuMem + m_vuMemSize);
+	bool livePromotion = g_vuContextPromotion;
+
+	uint32 blockCount = 0;
+	auto runCapture = [&](const VU_CAPTURE& capture) {
+		memcpy(&m_ctx->m_State, &capture.state, sizeof(MIPSSTATE));
+		memcpy(m_microMem, capture.microMem.data(), m_microMemSize);
+		memcpy(m_vuMem, capture.vuMem.data(), m_vuMemSize);
+		InvalidateMicroProgram();
+		m_ctx->m_State.nPC = capture.address;
+		for(uint32 i = 0; i < 1000; i++)
+		{
+			m_ctx->m_executor->Execute(5000);
+			uint32 exception = m_ctx->m_State.nHasException;
+			if((exception == MIPS_EXCEPTION_VU_EBIT) || (exception == MIPS_EXCEPTION_VU_TBIT) || (exception == MIPS_EXCEPTION_VU_DBIT)) break;
+		}
+		//Result fingerprint: registers and data memory
+		XXH64_state_t* hashState = XXH64_createState();
+		XXH64_reset(hashState, 0);
+		XXH64_update(hashState, &m_ctx->m_State, sizeof(MIPSSTATE));
+		XXH64_update(hashState, m_vuMem, m_vuMemSize);
+		uint64 hash = XXH64_digest(hashState);
+		XXH64_freeState(hashState);
+		return hash;
+	};
+
+	std::string result;
+	std::vector<uint64> refHashes;
+	g_vuDiffSuppressKick = true;
+	for(int variant = 0; variant < 2; variant++)
+	{
+		g_vuContextPromotion = (variant == 1);
+		static_cast<CVuExecutor*>(m_ctx->m_executor.get())->ResetBlocks();
+		std::vector<uint64> hashes;
+		//Warm up: compile every block and let the engine optimize them
+		for(uint32 i = 0; i < 20; i++)
+		{
+			hashes.clear();
+			for(const auto& capture : g_vuCaptures) hashes.push_back(runCapture(capture));
+		}
+		double start = emscripten_get_now();
+		for(uint32 i = 0; i < iterations; i++)
+		{
+			for(const auto& capture : g_vuCaptures) runCapture(capture);
+		}
+		double elapsed = emscripten_get_now() - start;
+		uint32 mismatches = 0;
+		if(variant == 0)
+		{
+			refHashes = hashes;
+		}
+		else
+		{
+			for(size_t i = 0; i < hashes.size(); i++) mismatches += (hashes[i] != refHashes[i]) ? 1 : 0;
+		}
+		result += string_format("%s: %.1f us/program (%u programs x %u), mismatches %u\n",
+		                        variant ? "promoted" : "reference", elapsed * 1000.0 / (iterations * g_vuCaptures.size()),
+		                        static_cast<uint32>(g_vuCaptures.size()), iterations, mismatches);
+	}
+	g_vuDiffSuppressKick = false;
+
+	//Back to the live program
+	g_vuContextPromotion = livePromotion;
+	memcpy(&m_ctx->m_State, &liveState, sizeof(MIPSSTATE));
+	memcpy(m_microMem, liveMicroMem.data(), m_microMemSize);
+	memcpy(m_vuMem, liveVuMem.data(), m_vuMemSize);
+	static_cast<CVuExecutor*>(m_ctx->m_executor.get())->ResetBlocks();
+
+	std::lock_guard<std::mutex> lock(g_vuReplayResultMutex);
+	g_vuReplayResult = result;
+}
+#endif
 
 void CVpu::InvalidateMicroProgram()
 {

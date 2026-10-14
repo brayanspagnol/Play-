@@ -2,6 +2,7 @@
 
 #include "MIPS.h"
 #include "MemoryFunction.h"
+#include "MemStream.h"
 #ifdef AOT_BUILD_CACHE
 #include "StdStream.h"
 #include <mutex>
@@ -111,6 +112,19 @@ protected:
 	uint32 m_cacheVariant = 0;
 	//Cleared by CompileRange when the generated code depends on more than the block's own words.
 	bool m_cacheable = true;
+
+	void CompileToStream(Framework::CMemStream&, bool contextPromotion);
+	bool UsesContextPromotion() const;
+#if defined(__EMSCRIPTEN__)
+	void ExecuteDiff();
+	CMemoryFunction m_refFunction;
+
+public:
+	//Size of the VU data memory, saved/restored by the differential test
+	uint32 m_diffDataSize = 0;
+
+protected:
+#endif
 
 	virtual void CompileProlog(CMipsJitter*);
 	virtual void CompileEpilog(CMipsJitter*, bool);
