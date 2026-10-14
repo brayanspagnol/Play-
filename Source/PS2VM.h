@@ -183,6 +183,7 @@ private:
 
 	std::atomic<bool> m_vu1ThreadedPreference = false;
 	bool m_gameAllowsVu1Threaded = true;
+	std::atomic<uint32> m_vu1PendingFlips = 0;
 	bool m_singleStepEe = false;
 	bool m_singleStepIop = false;
 	bool m_singleStepVu0 = false;

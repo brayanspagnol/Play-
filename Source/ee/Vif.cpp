@@ -609,14 +609,7 @@ void CVif::Cmd_MPG(StreamType& stream, CODE nCommand)
 	if((nSize != 0) && (m_role == ROLE_FRONT))
 	{
 		//Consume the data, the back decoder writes it to micro memory
-		uint8 discard[0x100];
-		uint32 remain = nSize;
-		while(remain != 0)
-		{
-			uint32 amount = std::min<uint32>(remain, sizeof(discard));
-			stream.Read(discard, amount);
-			remain -= amount;
-		}
+		stream.Skip(nSize);
 	}
 	else if(nSize != 0)
 	{
@@ -1193,14 +1186,22 @@ void CVif::SkipUnpack(StreamType& stream, CODE nCommand)
 	}
 
 	uint32 currentNum = (m_NUM == 0) ? 256 : m_NUM;
-	uint8 discard[0x10];
-	while(currentNum != 0)
+	if(cl == wl)
+	{
+		//Every vector is read (most common case): skip them all at once
+		assert(m_readTick == m_writeTick);
+		uint32 count = std::min<uint32>(currentNum, stream.GetAvailableReadBytes() / elementSize);
+		stream.Skip(count * elementSize);
+		currentNum -= count;
+		m_readTick = m_writeTick = (m_readTick + count) % cl;
+	}
+	while((cl != wl) && (currentNum != 0))
 	{
 		bool mustRead = clGreaterEqualWl ? (m_readTick < wl) : (m_writeTick < cl);
 		if(mustRead)
 		{
 			if(stream.GetAvailableReadBytes() < elementSize) break;
-			stream.Read(discard, elementSize);
+			stream.Skip(elementSize);
 		}
 		if(mustRead || !clGreaterEqualWl)
 		{

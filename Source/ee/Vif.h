@@ -222,6 +222,33 @@ protected:
 			}
 		}
 
+		//Same as Read without copying (front decoder)
+		inline void Skip(uint32 size)
+		{
+			uint32 bufferAvailable = BUFFERSIZE - m_bufferPosition;
+			if(size <= bufferAvailable)
+			{
+				m_bufferPosition += size;
+				return;
+			}
+			size -= bufferAvailable;
+			m_bufferPosition = BUFFERSIZE;
+			if(!m_tagIncluded)
+			{
+				//Only the last qword touched needs to be loaded in the buffer
+				uint32 wholeQwords = (size - 1) / BUFFERSIZE;
+				m_nextAddress += wholeQwords * BUFFERSIZE;
+				size -= wholeQwords * BUFFERSIZE;
+			}
+			while(size != 0)
+			{
+				SyncBuffer();
+				uint32 amount = std::min<uint32>(size, BUFFERSIZE - m_bufferPosition);
+				m_bufferPosition += amount;
+				size -= amount;
+			}
+		}
+
 		void Flush();
 		inline void Align32();
 		void SetDmaParams(uint32, uint32, bool);

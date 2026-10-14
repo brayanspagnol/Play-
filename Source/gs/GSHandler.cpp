@@ -408,6 +408,24 @@ void CGSHandler::SetVBlank()
 		Flip();
 	}
 
+	SetVBlankEvent();
+}
+
+void CGSHandler::FinishAndFlip(const DISPLAY_INFO& displayInfo)
+{
+	Finish();
+	SendGSCall(
+	    [this, displayInfo]() {
+		    if(m_regsDirty)
+		    {
+			    FlipImpl(displayInfo);
+		    }
+		    m_regsDirty = false;
+	    });
+}
+
+void CGSHandler::SetVBlankEvent()
+{
 	std::lock_guard registerMutexLock(m_registerMutex);
 	m_nCSR |= CSR_VSYNC_INT;
 	NotifyEvent(CSR_VSYNC_INT);

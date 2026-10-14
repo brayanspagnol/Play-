@@ -848,6 +848,10 @@ public:
 
 	void SetHBlank();
 	void SetVBlank();
+	//SetVBlank in two parts, for when another thread (VU1) is still writing to the GS:
+	//FinishAndFlip runs on that thread (in order with its writes) with the display info taken at vblank time.
+	void FinishAndFlip(const DISPLAY_INFO&);
+	void SetVBlankEvent();
 	void ResetVBlank();
 
 	void FeedImageData(const void*, uint32);

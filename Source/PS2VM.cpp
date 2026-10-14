@@ -992,9 +992,26 @@ void CPS2VM::EmuThread()
 #ifdef PROFILE
 							CProfilerZone profilerZone(m_gsSyncProfilerZone);
 #endif
-							//Flushes the GS write buffer: the VU1 thread must be done with this frame
-							auto gifLock = m_ee->SyncVu1AndLockGif();
-							m_ee->m_gs->SetVBlank();
+							if(m_ee->IsVu1Threaded())
+							{
+								//The VU1 thread may still be sending this frame to the GS: flip in order with it.
+								//Don't let the VM thread get more than a frame ahead (input latency, ring size).
+								if(m_vu1PendingFlips >= 2)
+								{
+									m_ee->SyncVu1(CVu1Thread::SYNC_VBLANK);
+								}
+								auto gs = m_ee->m_gs;
+								m_vu1PendingFlips++;
+								m_ee->RunOnVu1Thread([this, gs, displayInfo = gs->GetCurrentDisplayInfo()]() {
+									gs->FinishAndFlip(displayInfo);
+									m_vu1PendingFlips--;
+								});
+								gs->SetVBlankEvent();
+							}
+							else
+							{
+								m_ee->m_gs->SetVBlank();
+							}
 						}
 
 						if(m_pad != NULL)

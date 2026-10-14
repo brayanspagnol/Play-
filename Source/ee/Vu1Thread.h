@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -10,6 +11,7 @@
 
 class CVpu;
 class CVif;
+class CGIF;
 
 //Runs VU1 on its own thread (like PCSX2's MTVU).
 //
@@ -29,7 +31,20 @@ class CVu1Thread
 public:
 	typedef std::function<void()> FunctionType;
 
-	CVu1Thread(CVpu&, CVif&);
+	//Why the VM thread waits (profiling builds report the wait time per reason as zone SYNC_<reason>)
+	enum SYNC_REASON
+	{
+		SYNC_OTHER,
+		SYNC_VBLANK,
+		SYNC_GIFFIFO,
+		SYNC_GSREAD,
+		SYNC_VU1MEM,
+		SYNC_VU1REG,
+		SYNC_ROW,
+		SYNC_MAX
+	};
+
+	CVu1Thread(CVpu&, CVif&, CGIF&);
 	~CVu1Thread();
 
 	//Called once on the new thread before anything else (the wasm frontend registers the JIT import table there).
@@ -38,14 +53,16 @@ public:
 	//Producer side (VM thread only)
 	void PushVifData(const uint8*, uint32, bool);
 	void PushStartMicroProgram(uint32);
+	//PATH3 data (GIF DMA) accepted by the VM thread
+	void PushPath3(const uint8*, uint32);
 	void PushFunction(FunctionType);
 	void RunSync(FunctionType);
 
 	//Waits until the VU1 thread is idle (or stalled on the GIF). Calls the flush handler first so that
 	//data the front decoder has consumed but not pushed yet is pushed.
-	void Sync();
+	void Sync(SYNC_REASON = SYNC_OTHER);
 	//Sync + exclusive access to the GIF/GS register write path.
-	std::unique_lock<std::mutex> SyncAndLockGif();
+	std::unique_lock<std::mutex> SyncAndLockGif(SYNC_REASON = SYNC_OTHER);
 	//Sync, then drops whatever is left (stalled data) before a reset or a state load
 	void SyncAndDiscard();
 
@@ -58,6 +75,7 @@ private:
 		MESSAGE_VIFDATA,
 		MESSAGE_STARTMICRO,
 		MESSAGE_FUNCTION,
+		MESSAGE_PATH3,
 	};
 
 	struct MESSAGE_HEADER
@@ -78,9 +96,19 @@ private:
 	void Commit(const MESSAGE_HEADER&);
 	void ThreadProc();
 	bool ProcessMessage(const MESSAGE_HEADER&, uint8*);
+	bool ProcessPath3Queue();
+	void SleepStalled(std::unique_lock<std::mutex>&, uint64);
 
+	struct PATH3_CHUNK
+	{
+		std::vector<uint8> data;
+		uint32 offset = 0;
+	};
+	//PATH3 data waiting for the GIF (PATH2 packet in progress, SIGNAL): VIF1 data behind it can go first
+	std::deque<PATH3_CHUNK> m_path3Queue;
 	CVpu& m_vpu;
 	CVif& m_vif;
+	CGIF& m_gif;
 
 	std::vector<uint8> m_ringStorage;
 	uint8* m_ring = nullptr;
@@ -93,6 +121,8 @@ private:
 	std::condition_variable m_idleCondition;
 	bool m_idle = true;
 	bool m_stalled = false;
+	uint64 m_stalledPublishedPos = 0;
+	std::atomic<bool> m_sleeping = false;
 	bool m_currentStarted = false;
 	bool m_quit = false;
 	bool m_discard = false;

@@ -69,6 +69,8 @@ public:
 
 	//When VU1 is threaded, PATH1/PATH2 are sent from the VU1 thread; PATH3 (VM thread) syncs with it first.
 	void SetVu1Thread(CVu1Thread*);
+	//VU1 thread: sends PATH3 data accepted by ReceiveDMA on the VM thread. Returns the bytes processed.
+	uint32 ProcessQueuedPath3(const uint8*, uint32);
 
 	void LoadState(Framework::CZipArchiveReader&);
 	void SaveState(Framework::CZipArchiveWriter&);
@@ -125,6 +127,13 @@ private:
 	CGSHandler*& m_gs;
 	CDMAC& m_dmac;
 	CVu1Thread* m_vu1Thread = nullptr;
+	//Threaded mode: the VM thread decides how much PATH3 data goes through (masking happens at packet
+	//boundaries), so it follows the PATH3 packets' tags itself. The VU1 thread ignores the mask.
+	uint32 AcceptPath3(const uint8*, uint32);
+	bool m_path3MaskBypass = false;
+	uint32 m_path3TagRemain = 0;
+	bool m_path3InPacket = false;
+	bool m_path3Eop = false;
 
 	CProfiler::ZoneHandle m_gifProfilerZone = 0;
 };

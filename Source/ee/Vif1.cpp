@@ -101,7 +101,7 @@ uint32 CVif1::ReceiveDMA(uint32 address, uint32 qwc, uint32 direction, bool tagI
 		PROFILE_COUNT(PCNT_VIF1_FIFOREAD, 1);
 		//GS download: everything sent to the GS before must have been processed
 		std::unique_lock<std::mutex> gifLock;
-		if(m_role == ROLE_FRONT) gifLock = m_vu1Thread->SyncAndLockGif();
+		if(m_role == ROLE_FRONT) gifLock = m_vu1Thread->SyncAndLockGif(CVu1Thread::SYNC_GSREAD);
 		auto gs = m_gif.GetGsHandler();
 		gs->ReadImageData(source + address, size);
 		return qwc;
@@ -193,13 +193,7 @@ void CVif1::Cmd_DIRECT(StreamType& stream, CODE nCommand)
 		//Consume the data as if the GIF took all of it, the back decoder sends it to the GIF
 		uint32 remain = std::min<uint32>(nSize, (m_CODE.nIMM * QWORD_SIZE) - m_directQwordBufferIndex);
 		uint32 total = m_directQwordBufferIndex + remain;
-		uint8 discard[0x100];
-		while(remain != 0)
-		{
-			uint32 amount = std::min<uint32>(remain, sizeof(discard));
-			stream.Read(discard, amount);
-			remain -= amount;
-		}
+		stream.Skip(remain);
 		m_CODE.nIMM -= (total / QWORD_SIZE);
 		m_directQwordBufferIndex = total % QWORD_SIZE;
 		m_STAT.nVPS = (m_CODE.nIMM == 0) ? 0 : 1;

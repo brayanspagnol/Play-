@@ -48,8 +48,10 @@ namespace Ee
 		bool SetVu1Threaded(bool);
 		bool IsVu1Threaded() const;
 		//Waits for the VU1 thread to be idle (no-op if VU1 is not threaded)
-		void SyncVu1();
-		std::unique_lock<std::mutex> SyncVu1AndLockGif();
+		//Runs a function on the VU1 thread after the work queued so far (VU1 must be threaded)
+		void RunOnVu1Thread(CVu1Thread::FunctionType);
+		void SyncVu1(CVu1Thread::SYNC_REASON = CVu1Thread::SYNC_OTHER);
+		std::unique_lock<std::mutex> SyncVu1AndLockGif(CVu1Thread::SYNC_REASON = CVu1Thread::SYNC_OTHER);
 		//Sets the per game VU1 settings on both VU1 executors (VM thread and VU1 thread)
 		void SetVu1BlockNoClamping(const CVuExecutor::BlockNoClampingSet&);
 
