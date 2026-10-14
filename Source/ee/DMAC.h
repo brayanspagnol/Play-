@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include "Types.h"
 #include "zip/ZipArchiveWriter.h"
 #include "zip/ZipArchiveReader.h"
@@ -10,6 +11,9 @@ class CMIPS;
 class CDMAC
 {
 public:
+	//Called before a transfer reads VU1 memory (VU1 thread sync)
+	std::function<void()> Vu1MemoryAccessHandler;
+
 	friend class Dmac::CChannel;
 
 	enum CHANNEL_ID

@@ -183,6 +183,11 @@ CVif& CVpu::GetVif()
 	return *m_vif.get();
 }
 
+void CVpu::SetRunToCompletion(bool runToCompletion)
+{
+	m_runToCompletion = runToCompletion;
+}
+
 void CVpu::SetFbrst(uint32 fbrst)
 {
 	//Only keep DE and TE bits
@@ -193,6 +198,7 @@ void CVpu::ExecuteMicroProgram(uint32 nAddress)
 {
 	CLog::GetInstance().Print(LOG_NAME, "Starting microprogram execution at 0x%08X.\r\n", nAddress);
 
+	if(m_number == 1) PROFILE_COUNT(PCNT_VIF1_MSCAL, 1);
 	m_ctx->m_State.nPC = nAddress;
 	m_ctx->m_State.pipeTime = 0;
 	m_ctx->m_State.pipeFmacWrite[0] = {};
@@ -208,7 +214,7 @@ void CVpu::ExecuteMicroProgram(uint32 nAddress)
 	assert(m_vuState != VU_STATE_RUNNING);
 	m_vuState = VU_STATE_RUNNING;
 	VuStateChanged(m_vuState);
-	for(unsigned int i = 0; i < 100; i++)
+	for(unsigned int i = 0; m_runToCompletion || (i < 100); i++)
 	{
 		Execute(5000);
 		if(m_vuState != VU_STATE_RUNNING) break;
@@ -227,6 +233,7 @@ void CVpu::InvalidateMicroProgram(uint32 start, uint32 end)
 
 void CVpu::ProcessXgKick(uint32 address)
 {
+	PROFILE_COUNT(PCNT_VU1_XGKICK, 1);
 	address &= 0x3FF;
 	address *= 0x10;
 

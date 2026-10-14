@@ -19,6 +19,8 @@ public:
 
 	uint32 ReceiveDMA(uint32, uint32, uint32, bool) override;
 
+	void CopyStateFrom(const CVif&) override;
+
 private:
 	void ExecuteCommand(StreamType&, CODE) override;
 

@@ -687,15 +687,19 @@ void CGSHandler::ProcessWriteBuffer(const CGsPacketMetadata* metadata)
 			siglblid.sigid &= ~signal.idmsk;
 			siglblid.sigid |= signal.id;
 			m_nSIGLBLID = siglblid;
+			std::lock_guard registerMutexLock(m_registerMutex);
 			assert((m_nCSR & CSR_SIGNAL_EVENT) == 0);
 			m_nCSR |= CSR_SIGNAL_EVENT;
 			NotifyEvent(CSR_SIGNAL_EVENT);
 		}
 		break;
 		case GS_REG_FINISH:
+		{
+			std::lock_guard registerMutexLock(m_registerMutex);
 			m_nCSR |= CSR_FINISH_EVENT;
 			NotifyEvent(CSR_FINISH_EVENT);
-			break;
+		}
+		break;
 		case GS_REG_LABEL:
 		{
 			auto label = make_convertible<LABEL>(write.second);

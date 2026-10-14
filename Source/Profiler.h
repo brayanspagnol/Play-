@@ -91,6 +91,37 @@ private:
 	std::thread m_samplerThread;
 };
 
+//Event counters for profiling builds (any thread), reported by getProfile() as "counters".
+enum PROFILE_COUNTER
+{
+	PCNT_VIF1_DMA,
+	PCNT_VIF1_DMA_QW,
+	PCNT_VIF1_MSCAL,
+	PCNT_VIF1_UNPACK,
+	PCNT_VIF1_MPG,
+	PCNT_VIF1_DIRECT,
+	PCNT_VIF1_FLUSH,
+	PCNT_VIF1_IBIT,
+	PCNT_VIF1_MSKPATH3,
+	PCNT_VIF1_REGREAD,
+	PCNT_VIF1_FIFOREAD,
+	PCNT_PATH3_DMA,
+	PCNT_PATH3_DMA_QW,
+	PCNT_GIF_STAT_READ,
+	PCNT_VU1_MEM_EE,
+	PCNT_VU1_CMSAR,
+	PCNT_VU1_XGKICK,
+	PCNT_VU1_SYNC,
+	PCNT_MAX
+};
+extern std::atomic<uint32> g_profileCounters[PCNT_MAX];
+extern const char* const g_profileCounterNames[PCNT_MAX];
+#ifdef PROFILE
+#define PROFILE_COUNT(counter, value) g_profileCounters[counter].fetch_add(value, std::memory_order_relaxed)
+#else
+#define PROFILE_COUNT(counter, value)
+#endif
+
 class CProfilerZone
 {
 public:

@@ -9,6 +9,7 @@
 #include "../states/MemoryStateFile.h"
 #include "GIF.h"
 #include "DMAC.h"
+#include "Vu1Thread.h"
 
 #define QTEMP_INIT (0x3F800000)
 
@@ -471,6 +472,19 @@ void CGIF::DrainFifo()
 uint32 CGIF::ReceiveDMA(uint32 address, uint32 qwc, uint32 unused, bool tagIncluded)
 {
 	uint32 size = qwc * 0x10;
+	std::unique_lock<std::mutex> gifLock;
+	if(m_vu1Thread)
+	{
+		//Nothing can go through while PATH3 is masked: don't wait for the VU1 thread for nothing
+		if((m_path3Masked || (m_maskedPath3XferState == MASKED_PATH3_XFER_DONE)) && (m_activePath != 3))
+		{
+			return 0;
+		}
+		//Everything sent on PATH1/PATH2 before this transfer must reach the GS first
+		gifLock = m_vu1Thread->SyncAndLockGif();
+	}
+	PROFILE_COUNT(PCNT_PATH3_DMA, 1);
+	PROFILE_COUNT(PCNT_PATH3_DMA_QW, qwc);
 
 	uint8* memory = nullptr;
 	uint32 memorySize = 0;
@@ -545,6 +559,7 @@ uint32 CGIF::GetRegister(uint32 address)
 	switch(address)
 	{
 	case GIF_STAT:
+		PROFILE_COUNT(PCNT_GIF_STAT_READ, 1);
 		if(m_path3Masked)
 		{
 			result |= GIF_STAT_M3P;
@@ -581,6 +596,8 @@ void CGIF::SetRegister(uint32 address, uint32 value)
 {
 	if(address >= GIF_FIFO_START && address < GIF_FIFO_END)
 	{
+		std::unique_lock<std::mutex> gifLock;
+		if(m_vu1Thread) gifLock = m_vu1Thread->SyncAndLockGif();
 		ProcessFifoWrite(address, value);
 	}
 	else
@@ -605,6 +622,11 @@ CGSHandler* CGIF::GetGsHandler()
 uint32 CGIF::GetActivePath() const
 {
 	return m_activePath;
+}
+
+void CGIF::SetVu1Thread(CVu1Thread* vu1Thread)
+{
+	m_vu1Thread = vu1Thread;
 }
 
 void CGIF::SetPath3Masked(bool masked)

@@ -13,8 +13,11 @@ public:
 	virtual ~CVuExecutor() = default;
 
 	void SetBlockNoClamping(BlockNoClampingSet);
+	const BlockNoClampingSet& GetBlockNoClamping() const;
 
 	void Reset() override;
+	//Drops every compiled block (keeps the per game settings)
+	void DropBlocks();
 
 protected:
 	typedef std::multimap<CachedBlockKey, BasicBlockPtr> CachedBlockMap;

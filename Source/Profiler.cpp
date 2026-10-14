@@ -4,6 +4,13 @@
 #include <cstdarg>
 #include <cstdio>
 
+std::atomic<uint32> g_profileCounters[PCNT_MAX];
+const char* const g_profileCounterNames[PCNT_MAX] =
+    {
+        "vif1Dma", "vif1DmaQw", "mscal", "unpack", "mpg", "direct", "flush", "ibit", "mskpath3",
+        "vif1RegRead", "vif1FifoRead", "path3Dma", "path3DmaQw", "gifStatRead", "vu1MemEe", "vu1Cmsar",
+        "xgkick", "vu1Sync"};
+
 CProfiler::ZoneHandle CProfiler::RegisterZone(const char* name)
 {
 #ifdef PROFILE

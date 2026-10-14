@@ -7,6 +7,7 @@
 #include "Dmac_Channel.h"
 #include "Vpu.h"
 #include "Vif1.h"
+#include "Vu1Thread.h"
 
 #define STATE_PATH_FORMAT ("vpu/vif1_%d.xml")
 #define STATE_REGS_BASE ("BASE")
@@ -62,6 +63,18 @@ void CVif1::LoadState(Framework::CZipArchiveReader& archive)
 	m_directQwordBufferIndex = registerFile.GetRegister32(STATE_REGS_DIRECTQWORDBUFFER_INDEX);
 }
 
+void CVif1::CopyStateFrom(const CVif& src)
+{
+	CVif::CopyStateFrom(src);
+	auto& src1 = static_cast<const CVif1&>(src);
+	m_BASE = src1.m_BASE;
+	m_OFST = src1.m_OFST;
+	m_TOP = src1.m_TOP;
+	m_TOPS = src1.m_TOPS;
+	memcpy(m_directQwordBuffer, src1.m_directQwordBuffer, sizeof(m_directQwordBuffer));
+	m_directQwordBufferIndex = src1.m_directQwordBufferIndex;
+}
+
 uint32 CVif1::GetTOP() const
 {
 	return m_TOP;
@@ -85,6 +98,10 @@ uint32 CVif1::ReceiveDMA(uint32 address, uint32 qwc, uint32 direction, bool tagI
 			address &= (PS2::EE_RAM_SIZE - 1);
 			assert((address + size) <= PS2::EE_RAM_SIZE);
 		}
+		PROFILE_COUNT(PCNT_VIF1_FIFOREAD, 1);
+		//GS download: everything sent to the GS before must have been processed
+		std::unique_lock<std::mutex> gifLock;
+		if(m_role == ROLE_FRONT) gifLock = m_vu1Thread->SyncAndLockGif();
 		auto gs = m_gif.GetGsHandler();
 		gs->ReadImageData(source + address, size);
 		return qwc;
@@ -111,10 +128,16 @@ void CVif1::ExecuteCommand(StreamType& stream, CODE nCommand)
 		m_BASE = nCommand.nIMM;
 		break;
 	case CODE_CMD_MSKPATH3:
-		m_gif.SetPath3Masked((nCommand.nIMM & 0x8000) != 0);
+		PROFILE_COUNT(PCNT_VIF1_MSKPATH3, 1);
+		//PATH3 is handled on the VM thread (front)
+		if(m_role != ROLE_BACK)
+		{
+			m_gif.SetPath3Masked((nCommand.nIMM & 0x8000) != 0);
+		}
 		break;
 	case CODE_CMD_FLUSH:
-		if(!m_vpu.IsVuReady())
+		PROFILE_COUNT(PCNT_VIF1_FLUSH, 1);
+		if(!IsVuReadyForVif())
 		{
 			m_STAT.nVEW = 1;
 		}
@@ -129,7 +152,8 @@ void CVif1::ExecuteCommand(StreamType& stream, CODE nCommand)
 		}
 		break;
 	case CODE_CMD_FLUSHA:
-		if(!m_vpu.IsVuReady())
+		PROFILE_COUNT(PCNT_VIF1_FLUSH, 1);
+		if(!IsVuReadyForVif())
 		{
 			m_STAT.nVEW = 1;
 		}
@@ -150,6 +174,7 @@ void CVif1::ExecuteCommand(StreamType& stream, CODE nCommand)
 			m_STAT.nVEW = 1;
 			return;
 		}
+		PROFILE_COUNT(PCNT_VIF1_DIRECT, 1);
 		Cmd_DIRECT(stream, nCommand);
 		break;
 	default:
@@ -162,6 +187,24 @@ void CVif1::Cmd_DIRECT(StreamType& stream, CODE nCommand)
 {
 	uint32 nSize = stream.GetAvailableReadBytes();
 	assert((nSize & 0x03) == 0);
+
+	if(m_role == ROLE_FRONT)
+	{
+		//Consume the data as if the GIF took all of it, the back decoder sends it to the GIF
+		uint32 remain = std::min<uint32>(nSize, (m_CODE.nIMM * QWORD_SIZE) - m_directQwordBufferIndex);
+		uint32 total = m_directQwordBufferIndex + remain;
+		uint8 discard[0x100];
+		while(remain != 0)
+		{
+			uint32 amount = std::min<uint32>(remain, sizeof(discard));
+			stream.Read(discard, amount);
+			remain -= amount;
+		}
+		m_CODE.nIMM -= (total / QWORD_SIZE);
+		m_directQwordBufferIndex = total % QWORD_SIZE;
+		m_STAT.nVPS = (m_CODE.nIMM == 0) ? 0 : 1;
+		return;
+	}
 
 	if(nSize != 0)
 	{
@@ -220,6 +263,7 @@ void CVif1::Cmd_DIRECT(StreamType& stream, CODE nCommand)
 
 void CVif1::Cmd_UNPACK(StreamType& stream, CODE nCommand, uint32 nDstAddr)
 {
+	PROFILE_COUNT(PCNT_VIF1_UNPACK, 1);
 	bool nFlg = (m_CODE.nIMM & 0x8000) != 0;
 	if(nFlg)
 	{

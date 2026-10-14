@@ -7,6 +7,7 @@
 #include "../Profiler.h"
 
 class CDMAC;
+class CVu1Thread;
 
 class CGIF
 {
@@ -66,6 +67,9 @@ public:
 	uint32 GetActivePath() const;
 	void SetPath3Masked(bool);
 
+	//When VU1 is threaded, PATH1/PATH2 are sent from the VU1 thread; PATH3 (VM thread) syncs with it first.
+	void SetVu1Thread(CVu1Thread*);
+
 	void LoadState(Framework::CZipArchiveReader&);
 	void SaveState(Framework::CZipArchiveWriter&);
 
@@ -120,6 +124,7 @@ private:
 	uint8* m_spr;
 	CGSHandler*& m_gs;
 	CDMAC& m_dmac;
+	CVu1Thread* m_vu1Thread = nullptr;
 
 	CProfiler::ZoneHandle m_gifProfilerZone = 0;
 };

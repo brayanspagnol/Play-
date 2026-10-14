@@ -1,6 +1,7 @@
 #pragma once
 
 #include <thread>
+#include <atomic>
 #include <future>
 #include <unordered_map>
 #include "filesystem_def.h"
@@ -71,6 +72,11 @@ public:
 
 	void SetEeFrequencyScale(uint32, uint32);
 	void ReloadFrameRateLimit();
+
+	//VU1 on its own thread (see ee/Vu1Thread.h). Applied by the VM thread at the next vblank.
+	//The game config can turn it off for a game (<Vu1Threaded Enabled="false"/>).
+	void SetVu1Threaded(bool);
+	void SetGameAllowsVu1Threaded(bool);
 
 	static fs::path GetStateDirectoryPath();
 	fs::path GenerateStatePath(unsigned int) const;
@@ -175,6 +181,8 @@ private:
 
 	CPU_UTILISATION_INFO m_cpuUtilisation;
 
+	std::atomic<bool> m_vu1ThreadedPreference = false;
+	bool m_gameAllowsVu1Threaded = true;
 	bool m_singleStepEe = false;
 	bool m_singleStepIop = false;
 	bool m_singleStepVu0 = false;

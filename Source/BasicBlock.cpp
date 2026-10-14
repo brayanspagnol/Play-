@@ -131,11 +131,8 @@ void CBasicBlock::Compile()
 
 	Framework::CMemStream stream;
 	{
-		static
-#ifdef AOT_BUILD_CACHE
-		    thread_local
-#endif
-		    CMipsJitter* jitter = nullptr;
+		//One jitter per thread (VU1 can compile on its own thread)
+		static thread_local CMipsJitter* jitter = nullptr;
 		if(jitter == nullptr)
 		{
 			Jitter::CCodeGen* codeGen = Jitter::CreateCodeGen();

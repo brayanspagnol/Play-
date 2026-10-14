@@ -556,6 +556,7 @@ bool CPS2VM::SaveVMState(const fs::path& statePath)
 		auto stateStream = Framework::CreateOutputStdStream(statePath.native());
 		Framework::CZipArchiveWriter archive;
 
+		m_ee->SyncVu1();
 		m_ee->SaveState(archive);
 		m_iop->SaveState(archive);
 		m_ee->m_gs->SaveState(archive);
@@ -586,6 +587,7 @@ bool CPS2VM::LoadVMState(const fs::path& statePath)
 
 		try
 		{
+			m_ee->SyncVu1();
 			m_ee->LoadState(archive);
 			m_iop->LoadState(archive);
 			m_ee->m_gs->LoadState(archive);
@@ -742,7 +744,10 @@ void CPS2VM::UpdateEe()
 		m_cpuUtilisation.eeTotalTicks += executed;
 
 		m_ee->m_vpu0->Execute(m_singleStepVu0 ? 1 : executed);
-		m_ee->m_vpu1->Execute(m_singleStepVu1 ? 1 : executed);
+		if(!m_ee->IsVu1Threaded())
+		{
+			m_ee->m_vpu1->Execute(m_singleStepVu1 ? 1 : executed);
+		}
 
 		m_eeExecutionTicks -= executed;
 		m_spuUpdateTicks -= (static_cast<int64>(executed) << SPU_UPDATE_TICKS_PRECISION);
@@ -904,7 +909,19 @@ void CPS2VM::ReloadExecutable(const char* executablePath, const CPS2OS::Argument
 
 void CPS2VM::OnExecutableChange()
 {
+	m_ee->SyncVu1();
+	m_gameAllowsVu1Threaded = true;
 	CGameConfig::ApplyGameConfig(*this);
+}
+
+void CPS2VM::SetVu1Threaded(bool threaded)
+{
+	m_vu1ThreadedPreference = threaded;
+}
+
+void CPS2VM::SetGameAllowsVu1Threaded(bool allowed)
+{
+	m_gameAllowsVu1Threaded = allowed;
 }
 
 void CPS2VM::OnCrtModeChange()
@@ -975,6 +992,8 @@ void CPS2VM::EmuThread()
 #ifdef PROFILE
 							CProfilerZone profilerZone(m_gsSyncProfilerZone);
 #endif
+							//Flushes the GS write buffer: the VU1 thread must be done with this frame
+							auto gifLock = m_ee->SyncVu1AndLockGif();
 							m_ee->m_gs->SetVBlank();
 						}
 
@@ -987,6 +1006,13 @@ void CPS2VM::EmuThread()
 						CProfiler::GetInstance().CountCurrentZone();
 #endif
 						OnNewFrame();
+						{
+							bool vu1Threaded = m_vu1ThreadedPreference && m_gameAllowsVu1Threaded;
+							if(vu1Threaded != m_ee->IsVu1Threaded())
+							{
+								m_ee->SetVu1Threaded(vu1Threaded);
+							}
+						}
 #ifdef PROFILE
 						CProfiler::GetInstance().Reset();
 #endif

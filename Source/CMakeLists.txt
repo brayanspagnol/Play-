@@ -234,6 +234,7 @@ set(COMMON_SRC_FILES
 	ee/Vif.cpp
 	ee/Vif.h
 	ee/Vif1.cpp
+	ee/Vu1Thread.cpp
 	ee/Vif1.h
 	ee/Vpu.cpp
 	ee/Vpu.h
