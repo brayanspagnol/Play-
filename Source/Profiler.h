@@ -47,6 +47,8 @@ public:
 	void Reset();
 
 	void SetWorkThread();
+	//A second thread with its own zone accounting (VU1 thread), reported as "VU1:<zone>"
+	void SetSecondWorkThread();
 
 	//While the work thread is in 'zone', the sampler also records '*pc' in histogram 'slot'.
 	void SetPcSampler(unsigned int slot, ZoneHandle zone, const uint32* pc);
@@ -67,6 +69,11 @@ public:
 		return std::this_thread::get_id() == m_workThreadId;
 	}
 
+	bool IsSecondWorkThread() const
+	{
+		return std::this_thread::get_id() == m_secondWorkThreadId;
+	}
+
 private:
 	void SamplerThreadProc();
 
@@ -74,6 +81,10 @@ private:
 	std::atomic<uint64> m_zoneTimes[MAX_ZONES] = {};
 	std::stack<ZoneHandle> m_zoneStack;
 	std::atomic<int32> m_currentZone = -1;
+	std::atomic<uint64> m_secondZoneTimes[MAX_ZONES] = {};
+	std::stack<ZoneHandle> m_secondZoneStack;
+	std::atomic<int32> m_secondCurrentZone = -1;
+	std::thread::id m_secondWorkThreadId;
 
 	struct PC_SAMPLER
 	{

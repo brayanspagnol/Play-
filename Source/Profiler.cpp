@@ -14,6 +14,8 @@ const char* const g_profileCounterNames[PCNT_MAX] =
 CProfiler::ZoneHandle CProfiler::RegisterZone(const char* name)
 {
 #ifdef PROFILE
+	static std::mutex registerMutex;
+	std::lock_guard<std::mutex> registerLock(registerMutex);
 	for(unsigned int i = 0; i < m_zoneNames.size(); i++)
 	{
 		if(m_zoneNames[i] == name) return i;
@@ -32,14 +34,18 @@ void CProfiler::CountCurrentZone()
 
 void CProfiler::EnterZone(ZoneHandle zoneHandle)
 {
-	m_zoneStack.push(zoneHandle);
-	m_currentZone.store(zoneHandle, std::memory_order_relaxed);
+	bool second = IsSecondWorkThread();
+	auto& zoneStack = second ? m_secondZoneStack : m_zoneStack;
+	zoneStack.push(zoneHandle);
+	(second ? m_secondCurrentZone : m_currentZone).store(zoneHandle, std::memory_order_relaxed);
 }
 
 void CProfiler::ExitZone()
 {
-	m_zoneStack.pop();
-	m_currentZone.store(m_zoneStack.empty() ? -1 : m_zoneStack.top(), std::memory_order_relaxed);
+	bool second = IsSecondWorkThread();
+	auto& zoneStack = second ? m_secondZoneStack : m_zoneStack;
+	zoneStack.pop();
+	(second ? m_secondCurrentZone : m_currentZone).store(zoneStack.empty() ? -1 : zoneStack.top(), std::memory_order_relaxed);
 }
 
 CProfiler::ZoneArray CProfiler::GetStats() const
@@ -51,6 +57,11 @@ CProfiler::ZoneArray CProfiler::GetStats() const
 		zone.name = m_zoneNames[i];
 		zone.totalTime = m_zoneTimes[i].load(std::memory_order_relaxed);
 		result.push_back(zone);
+		uint64 secondTime = m_secondZoneTimes[i].load(std::memory_order_relaxed);
+		if(secondTime != 0)
+		{
+			result.push_back({"VU1:" + m_zoneNames[i], secondTime});
+		}
 	}
 	return result;
 }
@@ -58,6 +69,10 @@ CProfiler::ZoneArray CProfiler::GetStats() const
 void CProfiler::Reset()
 {
 	for(auto& zoneTime : m_zoneTimes)
+	{
+		zoneTime.store(0, std::memory_order_relaxed);
+	}
+	for(auto& zoneTime : m_secondZoneTimes)
 	{
 		zoneTime.store(0, std::memory_order_relaxed);
 	}
@@ -73,6 +88,11 @@ void CProfiler::SetWorkThread()
 		m_samplerThread.detach();
 	}
 #endif
+}
+
+void CProfiler::SetSecondWorkThread()
+{
+	m_secondWorkThreadId = std::this_thread::get_id();
 }
 
 void CProfiler::SetPcSampler(unsigned int slot, ZoneHandle zone, const uint32* pc)
@@ -100,6 +120,11 @@ void CProfiler::SamplerThreadProc()
 		auto thisTime = std::chrono::steady_clock::now();
 		uint64 elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(thisTime - lastTime).count();
 		lastTime = thisTime;
+		int32 secondZone = m_secondCurrentZone.load(std::memory_order_relaxed);
+		if(secondZone >= 0 && secondZone < MAX_ZONES)
+		{
+			m_secondZoneTimes[secondZone].fetch_add(elapsed, std::memory_order_relaxed);
+		}
 		int32 zone = m_currentZone.load(std::memory_order_relaxed);
 		if(zone < 0 || zone >= MAX_ZONES) continue;
 		m_zoneTimes[zone].fetch_add(elapsed, std::memory_order_relaxed);
@@ -121,7 +146,7 @@ void CProfiler::SamplerThreadProc()
 CProfilerZone::CProfilerZone(CProfiler::ZoneHandle handle)
 {
 #ifdef PROFILE
-	m_active = CProfiler::GetInstance().IsWorkThread();
+	m_active = CProfiler::GetInstance().IsWorkThread() || CProfiler::GetInstance().IsSecondWorkThread();
 	if(m_active) CProfiler::GetInstance().EnterZone(handle);
 #endif
 }

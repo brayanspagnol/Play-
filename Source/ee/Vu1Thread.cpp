@@ -188,6 +188,15 @@ bool CVu1Thread::ProcessPath3Queue()
 
 bool CVu1Thread::ProcessMessage(const MESSAGE_HEADER& header, uint8* payload)
 {
+#ifdef PROFILE
+	static const CProfiler::ZoneHandle zones[] = {
+	    CProfiler::GetInstance().RegisterZone("OTHER"),
+	    CProfiler::GetInstance().RegisterZone("VIF1BACK"),
+	    CProfiler::GetInstance().RegisterZone("STARTMICRO"),
+	    CProfiler::GetInstance().RegisterZone("FUNCTION"),
+	    CProfiler::GetInstance().RegisterZone("PATH3")};
+	CProfilerZone profilerZone(zones[std::min<uint32>(header.type, 4)]);
+#endif
 	switch(header.type)
 	{
 	case MESSAGE_VIFDATA:
@@ -236,6 +245,9 @@ void CVu1Thread::SleepStalled(std::unique_lock<std::mutex>& lock, uint64 publish
 	m_sleeping = true;
 	if(m_publishedPos == published)
 	{
+#ifdef PROFILE
+		CProfilerZone profilerZone(CProfiler::GetInstance().RegisterZone("STALLED"));
+#endif
 		m_workCondition.wait_for(lock, std::chrono::milliseconds(1));
 	}
 	m_sleeping = false;
@@ -247,6 +259,10 @@ void CVu1Thread::ThreadProc()
 	fesetround(FE_TOWARDZERO);
 	FpUtils::SetDenormalHandlingMode();
 	if(ThreadInitHandler) ThreadInitHandler();
+#ifdef PROFILE
+	CProfiler::GetInstance().SetSecondWorkThread();
+	CProfilerZone busyZone(CProfiler::GetInstance().RegisterZone("BUSY"));
+#endif
 	std::unique_lock lock(m_mutex);
 	while(!m_quit)
 	{
@@ -297,6 +313,9 @@ void CVu1Thread::ThreadProc()
 			m_sleeping = true;
 			if(m_publishedPos == published)
 			{
+#ifdef PROFILE
+				CProfilerZone profilerZone(CProfiler::GetInstance().RegisterZone("IDLE"));
+#endif
 				m_workCondition.wait(lock);
 			}
 			m_sleeping = false;

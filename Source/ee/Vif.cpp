@@ -1186,16 +1186,32 @@ void CVif::SkipUnpack(StreamType& stream, CODE nCommand)
 	}
 
 	uint32 currentNum = (m_NUM == 0) ? 256 : m_NUM;
-	if(cl == wl)
+	if(clGreaterEqualWl)
 	{
-		//Every vector is read (most common case): skip them all at once
-		assert(m_readTick == m_writeTick);
-		uint32 count = std::min<uint32>(currentNum, stream.GetAvailableReadBytes() / elementSize);
-		stream.Skip(count * elementSize);
-		currentNum -= count;
-		m_readTick = m_writeTick = (m_readTick + count) % cl;
+		//Groups of cl ticks: wl vectors read, then (cl - wl) skipped without data
+		while(currentNum != 0)
+		{
+			if(m_readTick < wl)
+			{
+				uint32 count = std::min<uint32>(std::min<uint32>(wl - m_readTick, currentNum), stream.GetAvailableReadBytes() / elementSize);
+				if(count == 0) break;
+				stream.Skip(count * elementSize);
+				currentNum -= count;
+				m_readTick += count;
+				m_writeTick = std::min<uint32>(m_writeTick + count, wl);
+			}
+			else
+			{
+				m_readTick = cl;
+			}
+			if(m_readTick == cl)
+			{
+				m_writeTick = 0;
+				m_readTick = 0;
+			}
+		}
 	}
-	while((cl != wl) && (currentNum != 0))
+	while(!clGreaterEqualWl && (currentNum != 0))
 	{
 		bool mustRead = clGreaterEqualWl ? (m_readTick < wl) : (m_writeTick < cl);
 		if(mustRead)
