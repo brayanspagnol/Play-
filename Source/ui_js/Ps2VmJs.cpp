@@ -42,7 +42,7 @@ static const struct
 };
 
 //Defined by CodeGen (EM_JS): adds a function to this thread's Module.codeGenImportTable
-extern "C" int RegisterExternFunction(const char*, const char*);
+extern "C" int RegisterExternFunction(const char*, const char*, uintptr_t);
 
 void CPs2VmJs::CreateVM()
 {
@@ -58,7 +58,7 @@ void CPs2VmJs::CreateVM()
 	CVu1Thread::ThreadInitHandler = []() {
 		for(const auto& function : g_codeGenFunctions)
 		{
-			RegisterExternFunction(function.name, function.signature);
+			RegisterExternFunction(function.name, function.signature, function.function);
 		}
 	};
 
