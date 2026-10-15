@@ -18,6 +18,8 @@
 #include <atomic>
 #include <algorithm>
 #include <emscripten.h>
+#include "xxhash.h"
+#include "Ps2Const.h"
 
 #ifdef PROFILE
 extern std::atomic<uint64> g_gsThreadBusyNs;
@@ -34,6 +36,7 @@ CGSHandler::NewFrameEvent::Connection g_gsNewFrameConnection;
 EMSCRIPTEN_WEBGL_CONTEXT_HANDLE g_context = 0;
 std::shared_ptr<CInputProviderEmscripten> g_inputProvider;
 Framework::CSignal<void()>::Connection g_vmNewFrameConnection;
+Framework::CSignal<void()>::Connection g_vmStateLoadedConnection;
 
 //Profiling/stats snapshot, filled on the emulation thread at every vblank, read by getProfile() on the main thread.
 struct PROFILE_ACCUM
@@ -65,9 +68,43 @@ static std::string TopPcs(CProfiler::PcHistogram histogram)
 }
 #endif
 
+//Differential tests: hashes of the EE/IOP state and RAM at each of the first N vblanks after the next
+//state load (deterministic points in emulated time), see eeHashAfterLoad/eeHashResult.
+static std::atomic<int> g_hashRequest = 0;
+static int g_hashRemaining = 0;
+static std::mutex g_hashMutex;
+static std::string g_hashResult;
+
+static void OnVmStateLoaded()
+{
+	g_hashRemaining = g_hashRequest.exchange(0);
+}
+
+static void HashVmState()
+{
+	auto& ee = *g_virtualMachine->m_ee;
+	auto& iop = *g_virtualMachine->m_iop;
+	XXH3_state_t* state = XXH3_createState();
+	XXH3_128bits_reset(state);
+	XXH3_128bits_update(state, &ee.m_EE.m_State, sizeof(MIPSSTATE));
+	XXH3_128bits_update(state, ee.m_ram, PS2::EE_RAM_SIZE);
+	XXH3_128bits_update(state, ee.m_spr, PS2::EE_SPR_SIZE);
+	XXH3_128bits_update(state, &iop.m_cpu.m_State, sizeof(MIPSSTATE));
+	XXH3_128bits_update(state, iop.m_ram, PS2::IOP_RAM_SIZE);
+	auto hash = XXH3_128bits_digest(state);
+	XXH3_freeState(state);
+	std::lock_guard<std::mutex> lock(g_hashMutex);
+	g_hashResult += string_format("%s%08X:%016llX", g_hashResult.empty() ? "" : " ", ee.m_EE.m_State.nPC, static_cast<unsigned long long>(hash.low64 ^ hash.high64));
+}
+
 //Runs on the emulation thread (CPS2VM::OnNewFrame, at vblank start)
 static void OnVmNewFrame()
 {
+	if(g_hashRemaining > 0)
+	{
+		g_hashRemaining--;
+		HashVmState();
+	}
 	auto cpu = g_virtualMachine->GetCpuUtilisationInfo();
 	std::lock_guard<std::mutex> lock(g_profileMutex);
 	g_profile.vblanks++;
@@ -151,6 +188,26 @@ std::string getProfile()
 //(the GS thread may need the main thread for proxied GL calls). Poll stateStatus().
 static std::future<bool> g_stateFuture;
 static int g_stateResult = 1;
+
+//EE block chaining (tail calls between JIT blocks); applies to blocks compiled afterwards, set before boot
+extern bool g_eeBlockChaining;
+void setEeBlockChaining(bool enabled)
+{
+	g_eeBlockChaining = enabled;
+}
+
+void eeHashAfterLoad(int vblanks)
+{
+	std::lock_guard<std::mutex> lock(g_hashMutex);
+	g_hashResult.clear();
+	g_hashRequest = vblanks;
+}
+
+std::string eeHashResult()
+{
+	std::lock_guard<std::mutex> lock(g_hashMutex);
+	return g_hashResult;
+}
 
 void saveState(std::string path)
 {
@@ -279,6 +336,7 @@ extern "C" void initVm()
 	g_virtualMachine->SetVu1Threaded(true);
 
 	g_vmNewFrameConnection = g_virtualMachine->OnNewFrame.Connect(&OnVmNewFrame);
+	g_vmStateLoadedConnection = g_virtualMachine->OnStateLoaded.Connect(&OnVmStateLoaded);
 	g_gsNewFrameConnection = g_virtualMachine->GetGSHandler()->OnNewFrame.Connect(std::bind(&CStatsManager::OnGsNewFrame, &CStatsManager::GetInstance(), std::placeholders::_1));
 
 	EMSCRIPTEN_RESULT result = EMSCRIPTEN_RESULT_SUCCESS;
@@ -344,6 +402,9 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("clearStats", &clearStats);
 	function("getProfile", &getProfile);
 	function("saveState", &saveState);
+	function("setEeBlockChaining", &setEeBlockChaining);
+	function("eeHashAfterLoad", &eeHashAfterLoad);
+	function("eeHashResult", &eeHashResult);
 	function("loadState", &loadState);
 	function("stateStatus", &stateStatus);
 	function("setFrameLimit", &setFrameLimit);

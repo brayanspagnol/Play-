@@ -108,6 +108,8 @@ public:
 	IopSubSystemPtr m_iop;
 
 	NewFrameEvent OnNewFrame;
+	//Emulation thread, right after a successful LoadState
+	Framework::CSignal<void()> OnStateLoaded;
 
 	ExecutableReloadedHandler BeforeExecutableReloaded;
 	ExecutableReloadedHandler AfterExecutableReloaded;

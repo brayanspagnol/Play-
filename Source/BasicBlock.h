@@ -101,6 +101,14 @@ public:
 
 	void CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& basicBlock);
 
+#if defined(__EMSCRIPTEN__) && !defined(AOT_USE_CACHE)
+	//Index of the compiled function in the wasm function table
+	uint32 GetFunctionIndex() const
+	{
+		return static_cast<uint32>(reinterpret_cast<uintptr_t>(m_function.GetCode()));
+	}
+#endif
+
 protected:
 	uint32 m_begin;
 	uint32 m_end;
@@ -114,6 +122,8 @@ protected:
 
 	virtual void CompileProlog(CMipsJitter*);
 	virtual void CompileEpilog(CMipsJitter*, bool);
+	//Block chaining (WebAssembly): the epilog tail calls the next block when there is no exception
+	bool UsesBlockChaining() const;
 
 private:
 	void HandleExternalFunctionReference(uintptr_t, uint32, Jitter::CCodeGen::SYMBOL_REF_TYPE);

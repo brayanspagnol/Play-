@@ -173,6 +173,9 @@ public:
 	//Page table used by JIT stores. Same as m_pageLookup unless pages are write protected in
 	//software (WebAssembly has no mprotect): a null entry sends the store through the slow path.
 	void** m_pageLookupWrite = nullptr;
+	//Block chaining (WebAssembly, EE only): two-level table (address >> 16, then (address & 0xFFFF) / 4)
+	//of the function table indexes of the compiled blocks, 0 if none. Set by the executor.
+	uint32** m_blockFnLookup = nullptr;
 
 	//Called by the slow path store proxies with the physical address and size written
 	typedef void (*WriteWatchHandler)(CMIPS*, uint32, uint32);

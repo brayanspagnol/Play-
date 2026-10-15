@@ -48,6 +48,7 @@ CEeExecutor::CEeExecutor(CMIPS& context, uint8* ram)
 	m_pageSize = MIPS_PAGE_SIZE;
 	m_protectedPages.resize(PS2::EE_RAM_SIZE / MIPS_PAGE_SIZE, 0);
 	m_context.m_writeWatchHandler = &CEeExecutor::WriteWatchHandler;
+	m_context.m_blockFnLookup = m_blockLookup.GetFnTable();
 #endif
 }
 

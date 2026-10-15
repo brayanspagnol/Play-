@@ -84,6 +84,18 @@ void CBasicBlock::SetAotBlockOutputStream(Framework::CStdStream* outputStream)
 std::atomic<uint32> g_blockCompileCount = 0;
 #endif
 
+//Block chaining switch (Module.setEeBlockChaining), read when blocks are compiled
+bool g_eeBlockChaining = true;
+
+bool CBasicBlock::UsesBlockChaining() const
+{
+#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+	return g_eeBlockChaining && (m_context.m_blockFnLookup != nullptr) && !IsEmpty();
+#else
+	return false;
+#endif
+}
+
 void CBasicBlock::Compile()
 {
 #ifdef PROFILE
@@ -112,7 +124,7 @@ void CBasicBlock::Compile()
 		cacheKey.category = m_category;
 		cacheKey.size = wordCount * 4;
 		cacheKey.hints = m_blockCompileHints;
-		cacheKey.variant = m_cacheVariant;
+		cacheKey.variant = m_cacheVariant | (UsesBlockChaining() ? 0x10000000 : 0);
 		cacheKey.hash[0] = xxHash.low64;
 		cacheKey.hash[1] = xxHash.high64;
 
@@ -392,6 +404,32 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 #endif
 	}
 	jitter->EndIf();
+
+	if(UsesBlockChaining())
+	{
+		//Same as one more iteration of the executor loop: if there is no exception (cycle quota
+		//exhausted, syscall, idle loop, ...), look up the block at nPC and tail call it. No block
+		//there (index 0): return, the executor compiles it. Blocks deleted by the software write
+		//protection have their index cleared, and nPC is the running block's address at any time.
+		jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
+		jitter->PushCst(0);
+		jitter->BeginIf(Jitter::CONDITION_EQ);
+		{
+			jitter->PushRelRef(offsetof(CMIPS, m_blockFnLookup));
+			jitter->PushRel(offsetof(CMIPS, m_State.nPC));
+			jitter->Srl(16);
+			jitter->PushCst(0x1FFF); //EE address mask (0x1FFFFFFF) >> 16
+			jitter->And();
+			jitter->LoadRefFromRefIdx();
+			jitter->PushRel(offsetof(CMIPS, m_State.nPC));
+			jitter->Srl(2);
+			jitter->PushCst(0x3FFF);
+			jitter->And();
+			jitter->LoadFromRefIdx();
+			jitter->JumpToIndirect();
+		}
+		jitter->EndIf();
+	}
 }
 
 void CBasicBlock::Execute()
