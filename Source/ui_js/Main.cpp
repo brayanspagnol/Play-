@@ -33,7 +33,6 @@ extern std::atomic<uint32> g_eeIdleSlices;
 
 CPs2VmJs* g_virtualMachine = nullptr;
 CGSHandler::NewFrameEvent::Connection g_gsNewFrameConnection;
-EMSCRIPTEN_WEBGL_CONTEXT_HANDLE g_context = 0;
 std::shared_ptr<CInputProviderEmscripten> g_inputProvider;
 Framework::CSignal<void()>::Connection g_vmNewFrameConnection;
 
@@ -296,17 +295,11 @@ EM_BOOL keyboardCallback(int eventType, const EmscriptenKeyboardEvent* keyEvent,
 
 extern "C" void initVm()
 {
-	EmscriptenWebGLContextAttributes attr;
-	emscripten_webgl_init_context_attributes(&attr);
-	attr.majorVersion = 2;
-	attr.minorVersion = 0;
-	attr.alpha = false;
-	g_context = emscripten_webgl_create_context("#outputCanvas", &attr);
-	assert(g_context >= 0);
-
+	//The GS thread renders on its own OffscreenCanvas (see GSH_OpenGLJs.h); the page shows the frames
+	//it receives through Module.onGsFrame, which must be set before this call.
 	g_virtualMachine = new CPs2VmJs();
 	g_virtualMachine->Initialize();
-	g_virtualMachine->CreateGSHandler(CGSH_OpenGLJs::GetFactoryFunction(g_context));
+	g_virtualMachine->CreateGSHandler(CGSH_OpenGLJs::GetFactoryFunction(640, 480));
 
 	{
 		//Size here needs to match the size of the canvas in HTML file.
@@ -359,6 +352,10 @@ extern "C" void initVm()
 	assert(result == EMSCRIPTEN_RESULT_SUCCESS);
 
 	emscripten_request_animation_frame_loop(&gamepadPollCallback, nullptr);
+
+	//Not waited for: the GS thread needs the main thread free to create its WebGL context.
+	auto gs = static_cast<CGSH_OpenGLJs*>(g_virtualMachine->GetGSHandler());
+	gs->SendGSCall([gs]() { gs->InitializeContext(); });
 }
 
 void bootElf(std::string path)
