@@ -2,6 +2,7 @@
 
 #include "MIPS.h"
 #include "MemoryFunction.h"
+#include "MemStream.h"
 #ifdef AOT_BUILD_CACHE
 #include "StdStream.h"
 #include <mutex>
@@ -120,6 +121,30 @@ protected:
 	//Cleared by CompileRange when the generated code depends on more than the block's own words.
 	bool m_cacheable = true;
 
+	void CompileToStream(Framework::CMemStream&, bool contextPromotion);
+	bool UsesContextPromotion() const;
+	virtual bool IsSuperBlock() const
+	{
+		return false;
+	}
+#if defined(__EMSCRIPTEN__)
+	virtual void ExecuteDiff();
+	CMemoryFunction m_refFunction;
+	bool m_diffExecute = false;
+#endif
+	//Set while compiling: true with the optimized VU codegen (context promotion and friends)
+	bool m_compileOptimized = false;
+#if defined(__EMSCRIPTEN__)
+
+public:
+	//Size of the VU data memory, saved/restored by the differential test
+	uint32 m_diffDataSize = 0;
+	//Compile with the reference (unoptimized) codegen, used by the differential test
+	bool m_forceReference = false;
+
+protected:
+#endif
+
 	virtual void CompileProlog(CMipsJitter*);
 	virtual void CompileEpilog(CMipsJitter*, bool);
 	//Block chaining (WebAssembly): the epilog tail calls the next block when there is no exception
@@ -139,11 +164,14 @@ private:
 	static std::mutex m_aotBlockOutputStreamMutex;
 #endif
 
+protected:
 #ifndef AOT_USE_CACHE
 	CMemoryFunction m_function;
 #else
 	void (*m_function)(void*);
 #endif
+
+private:
 	uint32 m_recycleCount = 0;
 	BlockOutLinkPointer m_outLinks[LINK_SLOT_MAX];
 	uint32 m_linkBlockTrampolineOffset[LINK_SLOT_MAX];

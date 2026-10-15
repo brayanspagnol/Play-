@@ -3,21 +3,157 @@
 #include "offsetof_def.h"
 #include "MemoryUtils.h"
 #include "Vpu.h"
+#include "VUShared.h"
+#include <algorithm>
+#include <cstring>
+
+#ifdef __EMSCRIPTEN__
+#include "Jitter_CodeGen_Wasm.h"
+#endif
 
 CVuBasicBlock::CVuBasicBlock(CMIPS& context, uint32 begin, uint32 end, BLOCK_CATEGORY category)
     : CBasicBlock(context, begin, end, category)
 {
+#ifdef __EMSCRIPTEN__
+	//Context arrays that VU code indexes through references: never cached in wasm locals
+	static bool arraysRegistered = [] {
+		auto registerArray = [](size_t offset, size_t size) {
+			Jitter::CCodeGen_Wasm::RegisterContextArray(static_cast<uint32>(offset), static_cast<uint32>(size));
+		};
+		registerArray(offsetof(CMIPS, m_State.nCOP2VI), sizeof(MIPSSTATE::nCOP2VI));
+		for(auto pipe : {offsetof(CMIPS, m_State.pipeMac), offsetof(CMIPS, m_State.pipeSticky), offsetof(CMIPS, m_State.pipeClip)})
+		{
+			registerArray(pipe + offsetof(FLAG_PIPELINE, values), sizeof(FLAG_PIPELINE::values));
+			registerArray(pipe + offsetof(FLAG_PIPELINE, pipeTimes), sizeof(FLAG_PIPELINE::pipeTimes));
+		}
+		return true;
+	}();
+	(void)arraysRegistered;
+#endif
 }
 
 bool CVuBasicBlock::IsLinkable() const
 {
-	return m_isLinkable;
+	return m_isLinkable && !IsSuperBlock();
+}
+
+void CVuBasicBlock::SetSuperBlockParts(std::vector<SUPERBLOCK_PART> parts)
+{
+	m_superBlockParts = std::move(parts);
+}
+
+bool CVuBasicBlock::IsSuperBlock() const
+{
+	return m_superBlockParts.size() > 1;
+}
+
+void CVuBasicBlock::SetReferenceBlockProvider(ReferenceBlockProvider provider)
+{
+	m_referenceBlockProvider = std::move(provider);
+}
+
+void CVuBasicBlock::SetNoSelfLoop()
+{
+	m_noSelfLoop = true;
+	AddCacheVariant(0x10000000);
 }
 
 void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
 {
+	if(IsSuperBlock())
+	{
+		CompileSuperBlock(jitter);
+		return;
+	}
 	CompileProlog(jitter);
 	jitter->MarkFirstBlockLabel();
+	CompileBody(jitter, !m_noSelfLoop);
+}
+
+void CVuBasicBlock::CompileSuperBlock(CMipsJitter* jitter)
+{
+	//Function layout (only uses the Jitter's structured flow: ifs and one loop):
+	//  base = nPC (the executor only enters a block at its first address)
+	//  loop:
+	//    for each part, in address order:
+	//      if((nHasException == 0) && (nPC - base == part offset))
+	//        run the part (same code as a standalone block, epilogue included)
+	//        if(nHasException == 0) and nPC is the start of this part or of an earlier one: goto loop
+	//  (a later part is reached by falling through to its test; anything else returns to the executor)
+	//Offsets are relative to the entry address, so the code is position independent like other blocks.
+	const size_t baseOffset = offsetof(CMIPS, m_jitFlagScratch[4]);
+	const size_t partCountOffset = offsetof(CMIPS, m_jitFlagScratch[3]);
+	uint32 savedBegin = m_begin;
+	uint32 savedEnd = m_end;
+
+	auto pushRelativePc = [&]() {
+		jitter->PushRel(offsetof(CMIPS, m_State.nPC));
+		jitter->PushRel(baseOffset);
+		jitter->Sub();
+	};
+
+	jitter->PushRel(offsetof(CMIPS, m_State.nPC));
+	jitter->PullRel(baseOffset);
+
+	CompileProlog(jitter);
+	jitter->MarkFirstBlockLabel();
+
+	auto parts = m_superBlockParts;
+	std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.begin < b.begin; });
+
+	for(size_t partIndex = 0; partIndex < parts.size(); partIndex++)
+	{
+		const auto& part = parts[partIndex];
+
+		jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
+		jitter->PushCst(0);
+		jitter->Cmp(Jitter::CONDITION_EQ);
+		pushRelativePc();
+		jitter->PushCst(part.begin - savedBegin);
+		jitter->Cmp(Jitter::CONDITION_EQ);
+		jitter->And();
+		jitter->PushCst(0);
+		jitter->BeginIf(Jitter::CONDITION_NE);
+		{
+			m_begin = part.begin;
+			m_end = part.end;
+
+			jitter->PushRel(partCountOffset);
+			jitter->PushCst(1);
+			jitter->Add();
+			jitter->PullRel(partCountOffset);
+
+			CompileBody(jitter, false);
+
+			//Back edges: the next part starts at or before this one
+			jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
+			jitter->PushCst(0);
+			jitter->BeginIf(Jitter::CONDITION_EQ);
+			{
+				for(size_t targetIndex = 0; targetIndex <= partIndex; targetIndex++)
+				{
+					pushRelativePc();
+					jitter->PushCst(parts[targetIndex].begin - savedBegin);
+					jitter->BeginIf(Jitter::CONDITION_EQ);
+					{
+						jitter->Goto(jitter->GetFirstBlockLabel());
+					}
+					jitter->EndIf();
+				}
+			}
+			jitter->EndIf();
+		}
+		jitter->EndIf();
+	}
+
+	m_begin = savedBegin;
+	m_end = savedEnd;
+}
+
+void CVuBasicBlock::CompileBody(CMipsJitter* jitter, bool allowSelfLoop)
+{
+	//Flag forwarding never crosses block boundaries
+	VUShared::ResetFlagForwarding(m_compileOptimized);
 
 	assert((m_begin & 0x07) == 0);
 	assert(((m_end + 4) & 0x07) == 0);
@@ -73,7 +209,7 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
 
 		bool loIsXgKick = (opcodeLo & ~(0x1F << 11)) == 0x800006FC;
 
-		if(extraPipeTimeIndex < 3)
+		if((extraPipeTimeIndex < 3) && !VUShared::IsExperiment(2))
 		{
 			uint128 stallMask = {};
 			auto setStallBits = [&stallMask](unsigned int regId, unsigned int dest) {
@@ -356,6 +492,8 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
 				//we want to execute the instruction in the E bit delay slot.
 				jitter->PushRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
 				jitter->PushCst(MIPS_INVALID_PC);
+				//Conditionally executed code: don't forward flag values into or out of it
+				VUShared::ResetFlagForwarding(false);
 				jitter->BeginIf(Jitter::CONDITION_EQ);
 				{
 					//If we haven't taken the jump, execute the instruction after the delay slot
@@ -378,6 +516,7 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
 
 	assert(!hasPendingXgKick);
 
+	if(!VUShared::IsExperiment(4))
 	//Increment pipeTime
 	{
 		jitter->PushRel(offsetof(CMIPS, m_State.pipeTime));
@@ -386,7 +525,7 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
 		jitter->PullRel(offsetof(CMIPS, m_State.pipeTime));
 	}
 
-	for(int32 i = extraPipeTimeIndex; i < 3; i++)
+	for(int32 i = extraPipeTimeIndex; (i < 3) && !VUShared::IsExperiment(4); i++)
 	{
 		//Clear unused writes
 		//TODO: Find a way to push that to the next block (would become index 0 of next block)
@@ -395,7 +534,7 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
 	}
 
 	//Dump out any register writes that will occur outside of this block
-	for(int32 extraPipeTime = 0; extraPipeTime < 3; extraPipeTime++)
+	for(int32 extraPipeTime = 0; (extraPipeTime < 3) && !VUShared::IsExperiment(4); extraPipeTime++)
 	{
 		uint32 pipeTime = relativePipeTime + extraPipeTime;
 		uint128 stall = {};
@@ -440,7 +579,7 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
 	jitter->PushCst(integerTrailingDelayInfo.regIndex);
 	jitter->PullRel(offsetof(CMIPS, m_State.savedNextBlockIntRegIdx));
 
-	CompileEpilog(jitter, loopsOnItself && m_isLinkable);
+	CompileEpilog(jitter, allowSelfLoop && loopsOnItself && m_isLinkable);
 }
 
 bool CVuBasicBlock::IsConditionalBranch(uint32 opcodeLo)
@@ -765,3 +904,47 @@ CVuBasicBlock::BlockFmacPipelineInfo CVuBasicBlock::ComputeFmacStallDelays(uint3
 	memcpy(result.regWriteTimes, writeFTime, sizeof(writeFTime));
 	return result;
 }
+
+#ifdef __EMSCRIPTEN__
+extern thread_local bool g_vuDiffSuppressKick;
+void VuDiffCompare(uint32 begin, uint32 end, const MIPSSTATE& refState, const MIPSSTATE& newState, const uint8* refMem, const uint8* newMem, uint32 dataSize);
+
+void CVuBasicBlock::ExecuteDiff()
+{
+	if(!IsSuperBlock())
+	{
+		CBasicBlock::ExecuteDiff();
+		return;
+	}
+	//The superblock runs first (no XGKICK) and counts the blocks it ran; then the same number of
+	//reference blocks run one at a time from the same state, like the executor would do.
+	uint32 dataSize = m_diffDataSize;
+	auto dataMem = reinterpret_cast<uint8*>(m_context.m_vuMem);
+	static thread_local MIPSSTATE initState, newState;
+	static thread_local std::vector<uint8> initMem, newMem;
+	initMem.resize(dataSize);
+	newMem.resize(dataSize);
+
+	memcpy(&initState, &m_context.m_State, sizeof(MIPSSTATE));
+	memcpy(initMem.data(), dataMem, dataSize);
+
+	m_context.m_jitFlagScratch[3] = 0;
+	g_vuDiffSuppressKick = true;
+	m_function(&m_context);
+	g_vuDiffSuppressKick = false;
+	uint32 partCount = m_context.m_jitFlagScratch[3];
+
+	memcpy(&newState, &m_context.m_State, sizeof(MIPSSTATE));
+	memcpy(newMem.data(), dataMem, dataSize);
+	memcpy(&m_context.m_State, &initState, sizeof(MIPSSTATE));
+	memcpy(dataMem, initMem.data(), dataSize);
+
+	for(uint32 i = 0; i < partCount; i++)
+	{
+		auto block = m_referenceBlockProvider(m_context.m_State.nPC);
+		block->Execute();
+	}
+
+	VuDiffCompare(m_begin, m_end, m_context.m_State, newState, dataMem, newMem.data(), dataSize);
+}
+#endif

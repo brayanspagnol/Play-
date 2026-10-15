@@ -12,6 +12,7 @@
 #include "AppConfig.h"
 #include "string_format.h"
 #include "BlockCache.h"
+#include "ee/Vpu.h"
 #include <future>
 #include <mutex>
 #include <map>
@@ -25,6 +26,7 @@
 extern std::atomic<uint64> g_gsThreadBusyNs;
 extern std::atomic<uint64> g_vu1ThreadBusyNs;
 extern std::atomic<uint32> g_blockCompileCount;
+extern std::atomic<uint32> g_vuBlockExecCount;
 extern std::atomic<uint32> g_eeSyscallCounts[0x100];
 extern std::atomic<uint32> g_eeInterruptCount;
 extern std::atomic<uint32> g_eeSlices;
@@ -173,8 +175,8 @@ std::string getProfile()
 		{
 			counters += string_format("%s\"%s\":%u", i ? "," : "", g_profileCounterNames[i], g_profileCounters[i].exchange(0));
 		}
-		extra = string_format(",\"counters\":{%s},\"log\":\"%s\",\"syscalls\":{%s},\"eeInts\":%u,\"eeSlices\":%u,\"eeIdleSlices\":%u",
-		                      counters.c_str(), escapedLog.c_str(), syscalls.c_str(), g_eeInterruptCount.exchange(0), g_eeSlices.exchange(0), g_eeIdleSlices.exchange(0));
+		extra = string_format(",\"counters\":{%s},\"vuBlocks\":%u,\"log\":\"%s\",\"syscalls\":{%s},\"eeInts\":%u,\"eeSlices\":%u,\"eeIdleSlices\":%u",
+		                      counters.c_str(), g_vuBlockExecCount.exchange(0), escapedLog.c_str(), syscalls.c_str(), g_eeInterruptCount.exchange(0), g_eeSlices.exchange(0), g_eeIdleSlices.exchange(0));
 	}
 #endif
 	return string_format("{\"wallMs\":%.1f,\"vblanks\":%u,\"eeTotal\":%d,\"eeIdle\":%d,\"iopTotal\":%d,\"iopIdle\":%d,"
@@ -182,6 +184,73 @@ std::string getProfile()
 	                     wallMs, profile.vblanks, profile.cpu.eeTotalTicks, profile.cpu.eeIdleTicks,
 	                     profile.cpu.iopTotalTicks, profile.cpu.iopIdleTicks, gsBusyNs / 1e6, vu1BusyNs / 1e6, compiles, BlockCache::TakeHitCount(),
 	                     zones.c_str(), profile.eePcs.c_str(), profile.iopPcs.c_str(), extra.c_str());
+}
+
+extern bool g_vuContextPromotion;
+extern bool g_vuDiffMode;
+extern std::atomic<uint32> g_vuDiffRuns;
+extern std::atomic<uint32> g_vuDiffMismatches;
+
+//VU JIT debug options (call before booting): promotion of VU context state into wasm locals,
+//and the differential test (each VU block runs with and without promotion, results compared).
+extern bool g_jitFunctionNames;
+
+void setVuJitOptions(bool promotion, bool diff, bool names)
+{
+	g_vuContextPromotion = promotion;
+	g_vuDiffMode = diff;
+	g_jitFunctionNames = names;
+}
+
+extern bool g_vuSuperBlocks;
+
+//VU superblocks (several VU blocks compiled into one function), used for new blocks from now on
+void setVuSuperBlocks(bool enabled)
+{
+	g_vuSuperBlocks = enabled;
+}
+
+extern std::mutex g_vuDiffLogMutex;
+extern std::string g_vuDiffLog;
+
+extern std::atomic<uint32> g_vuCaptureRequest;
+extern std::atomic<uint32> g_vuReplayRequest;
+extern std::mutex g_vuReplayResultMutex;
+extern std::string g_vuReplayResult;
+
+//VU1 replay benchmark (see CVpu::RunReplayBenchmark): capture the next count programs, then
+//request a replay; the result string appears once VU1 starts its next program.
+extern int g_vuReplayExperiment;
+//Debug: parts of the optimized VU codegen dropped in the promoted rounds of the next replay
+void setVuExperiment(int bits)
+{
+	g_vuReplayExperiment = bits;
+}
+
+void vuCapture(uint32 count)
+{
+	g_vuCaptureRequest = count;
+}
+
+void vuReplay(uint32 iterations)
+{
+	{
+		std::lock_guard<std::mutex> lock(g_vuReplayResultMutex);
+		g_vuReplayResult.clear();
+	}
+	g_vuReplayRequest = iterations;
+}
+
+std::string vuReplayResult()
+{
+	std::lock_guard<std::mutex> lock(g_vuReplayResultMutex);
+	return string_format("captures=%u\n%s", CVpu::GetReplayCaptureCount(), g_vuReplayResult.c_str());
+}
+
+std::string vuDiffStats()
+{
+	std::lock_guard<std::mutex> lock(g_vuDiffLogMutex);
+	return string_format("runs=%u mismatches=%u\n%s", g_vuDiffRuns.load(), g_vuDiffMismatches.load(), g_vuDiffLog.c_str());
 }
 
 //Save states run on the emulation thread; never block the main thread on them
@@ -401,6 +470,13 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("getFrames", &getFrames);
 	function("clearStats", &clearStats);
 	function("getProfile", &getProfile);
+	function("setVuJitOptions", &setVuJitOptions);
+	function("setVuSuperBlocks", &setVuSuperBlocks);
+	function("vuDiffStats", &vuDiffStats);
+	function("vuCapture", &vuCapture);
+	function("setVuExperiment", &setVuExperiment);
+	function("vuReplay", &vuReplay);
+	function("vuReplayResult", &vuReplayResult);
 	function("saveState", &saveState);
 	function("setEeBlockChaining", &setEeBlockChaining);
 	function("eeHashAfterLoad", &eeHashAfterLoad);

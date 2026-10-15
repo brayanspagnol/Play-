@@ -254,6 +254,7 @@ void VUShared::MakeComparableFromFloat(CMipsJitter* codeGen)
 
 void VUShared::TestSZFlags(CMipsJitter* codeGen, uint8 dest, size_t regOffset, uint32 relativePipeTime, uint32 compileHints)
 {
+	if(IsExperiment(1)) return;
 	codeGen->MD_PushRel(regOffset);
 	codeGen->MD_MakeSignZero();
 
@@ -269,17 +270,7 @@ void VUShared::TestSZFlags(CMipsJitter* codeGen, uint8 dest, size_t regOffset, u
 		codeGen->PushTop();
 
 		//Load previous value
-		{
-			codeGen->PushRelAddrRef(offsetof(CMIPS, m_State.pipeSticky.values));
-
-			codeGen->PushRel(offsetof(CMIPS, m_State.pipeSticky.index));
-			codeGen->PushCst(1);
-			codeGen->Sub();
-			codeGen->PushCst(FLAG_PIPELINE_SLOTS - 1);
-			codeGen->And();
-
-			codeGen->LoadFromRefIdx();
-		}
+		PushLatestFlagPipelineValue(g_pipeInfoSticky, codeGen);
 
 		codeGen->Or();
 		QueueInFlagPipeline(g_pipeInfoSticky, codeGen, LATENCY_MAC, relativePipeTime);
@@ -808,15 +799,7 @@ void VUShared::CLIP(CMipsJitter* codeGen, uint8 nFs, uint8 nFt, uint32 relativeP
 {
 	//Load previous value
 	{
-		codeGen->PushRelAddrRef(offsetof(CMIPS, m_State.pipeClip.values));
-
-		codeGen->PushRel(offsetof(CMIPS, m_State.pipeClip.index));
-		codeGen->PushCst(1);
-		codeGen->Sub();
-		codeGen->PushCst(FLAG_PIPELINE_SLOTS - 1);
-		codeGen->And();
-
-		codeGen->LoadFromRefIdx();
+		PushLatestFlagPipelineValue(g_pipeInfoClip, codeGen);
 
 		//Create some space for the new test results
 		codeGen->Shl(6);
@@ -1894,8 +1877,66 @@ void VUShared::CheckFlagPipeline(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* cod
 	}
 }
 
+int g_vuExperiment = 0; //Debug: drop parts of the optimized VU codegen to measure their cost (results become wrong)
+
+namespace
+{
+	thread_local bool g_flagForwardingEnabled = false;
+	thread_local uint32 g_flagForwardingValid = 0;
+
+	int GetFlagScratchIndex(const VUShared::FLAG_PIPEINFO& pipeInfo)
+	{
+		if(pipeInfo.valueArray == VUShared::g_pipeInfoMac.valueArray) return 0;
+		if(pipeInfo.valueArray == VUShared::g_pipeInfoSticky.valueArray) return 1;
+		if(pipeInfo.valueArray == VUShared::g_pipeInfoClip.valueArray) return 2;
+		return -1;
+	}
+
+	//Value on top of the stack becomes the latest value of the pipeline (stack is unchanged)
+	void SetFlagForwardValue(const VUShared::FLAG_PIPEINFO& pipeInfo, CMipsJitter* codeGen)
+	{
+		int index = GetFlagScratchIndex(pipeInfo);
+		if(!g_flagForwardingEnabled || (index < 0)) return;
+		codeGen->PushTop();
+		codeGen->PullRel(offsetof(CMIPS, m_jitFlagScratch[index]));
+		g_flagForwardingValid |= (1 << index);
+	}
+}
+
+bool VUShared::IsExperiment(int bit)
+{
+	return g_flagForwardingEnabled && (g_vuExperiment & bit);
+}
+
+void VUShared::ResetFlagForwarding(bool enabled)
+{
+	g_flagForwardingEnabled = enabled;
+	g_flagForwardingValid = 0;
+}
+
+void VUShared::PushLatestFlagPipelineValue(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* codeGen)
+{
+	int index = GetFlagScratchIndex(pipeInfo);
+	if(g_flagForwardingEnabled && (index >= 0) && (g_flagForwardingValid & (1 << index)))
+	{
+		codeGen->PushRel(offsetof(CMIPS, m_jitFlagScratch[index]));
+		return;
+	}
+	codeGen->PushRelAddrRef(pipeInfo.valueArray);
+
+	codeGen->PushRel(pipeInfo.index);
+	codeGen->PushCst(1);
+	codeGen->Sub();
+	codeGen->PushCst(FLAG_PIPELINE_SLOTS - 1);
+	codeGen->And();
+
+	codeGen->LoadFromRefIdx();
+}
+
 void VUShared::QueueInFlagPipeline(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* codeGen, uint32 latency, uint32 relativePipeTime)
 {
+	SetFlagForwardValue(pipeInfo, codeGen);
+
 	uint32 valueCursor = codeGen->GetTopCursor();
 
 	//Get offset
@@ -1944,6 +1985,8 @@ void VUShared::QueueInFlagPipeline(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* c
 
 void VUShared::ResetFlagPipeline(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* codeGen)
 {
+	SetFlagForwardValue(pipeInfo, codeGen);
+
 	uint32 valueCursor = codeGen->GetTopCursor();
 
 	for(uint32 i = 0; i < FLAG_PIPELINE_SLOTS; i++)

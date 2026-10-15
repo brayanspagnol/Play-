@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <unordered_set>
 #include "MIPS.h"
 #include "BasicBlock.h"
@@ -73,6 +74,16 @@ public:
 			{
 				static const auto blockZone = CProfiler::GetInstance().RegisterZone("EEBLOCK");
 				auto prevZone = CProfiler::GetInstance().SwapCurrentZone(blockZone);
+				block->Execute();
+				CProfiler::GetInstance().SwapCurrentZone(prevZone);
+				continue;
+			}
+			if(m_blockCategory == BLOCK_CATEGORY_PS2_VU)
+			{
+				static const auto vuBlockZone = CProfiler::GetInstance().RegisterZone("VUBLOCK");
+				extern std::atomic<uint32> g_vuBlockExecCount;
+				g_vuBlockExecCount.fetch_add(1, std::memory_order_relaxed);
+				auto prevZone = CProfiler::GetInstance().SwapCurrentZone(vuBlockZone);
 				block->Execute();
 				CProfiler::GetInstance().SwapCurrentZone(prevZone);
 				continue;

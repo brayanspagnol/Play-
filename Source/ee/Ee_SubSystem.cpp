@@ -11,6 +11,14 @@
 #include "Vif.h"
 #include "placeholder_def.h"
 
+#ifdef __EMSCRIPTEN__
+extern thread_local bool g_vuDiffSuppressKick;
+//VU1 replay benchmark: TOP/ITOP as they were when the program was captured
+extern bool g_vuReplayIoActive;
+extern uint32 g_vuReplayTop;
+extern uint32 g_vuReplayItop;
+#endif
+
 using namespace Ee;
 
 #define LOG_NAME ("ee_subsystem")
@@ -905,9 +913,15 @@ uint32 CSubSystem::Vu1IoPortReadHandler(uint32 address)
 	{
 	case CVpu::VU_ADDR_ITOP:
 		result = vif.GetITOP();
+#ifdef __EMSCRIPTEN__
+		if(g_vuReplayIoActive) result = g_vuReplayItop;
+#endif
 		break;
 	case CVpu::VU_ADDR_TOP:
 		result = vif.GetTOP();
+#ifdef __EMSCRIPTEN__
+		if(g_vuReplayIoActive) result = g_vuReplayTop;
+#endif
 		break;
 	default:
 		CLog::GetInstance().Warn(LOG_NAME, "Read an unhandled VU1 IO port (0x%08X).\r\n", address);
@@ -921,6 +935,10 @@ uint32 CSubSystem::Vu1IoPortWriteHandler(uint32 address, uint32 value)
 	switch(address)
 	{
 	case CVpu::VU_ADDR_XGKICK:
+#ifdef __EMSCRIPTEN__
+		//The VU differential test runs blocks twice; only the second run may kick
+		if(g_vuDiffSuppressKick) break;
+#endif
 		m_vpu1->ProcessXgKick(value);
 		break;
 	default:

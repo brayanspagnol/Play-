@@ -177,6 +177,11 @@ public:
 	//of the function table indexes of the compiled blocks, 0 if none. Set by the executor.
 	uint32** m_blockFnLookup = nullptr;
 
+	//JIT scratch values (not architectural state, never saved): [0..2] latest value queued in the
+	//MAC, sticky and clip flag pipelines by the block being executed (see VUShared flag forwarding),
+	//[3] number of blocks run by a VU superblock, [4] address a VU superblock was entered at
+	alignas(16) uint32 m_jitFlagScratch[8] = {};
+
 	//Called by the slow path store proxies with the physical address and size written
 	typedef void (*WriteWatchHandler)(CMIPS*, uint32, uint32);
 	WriteWatchHandler m_writeWatchHandler = nullptr;
