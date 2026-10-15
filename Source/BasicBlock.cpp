@@ -124,8 +124,8 @@ std::atomic<uint32> g_blockCompileCount = 0;
 std::atomic<uint32> g_vuBlockExecCount = 0;
 #endif
 
-//EE module batching (Module.setEeBatchSize): blocks per batch module, 0 = off
-uint32 g_eeBatchSize = 0;
+//EE module batching (Module.setEeBatchSize): blocks per batch module, 0 = off (one module per block)
+uint32 g_eeBatchSize = 64;
 //Block chaining switch (Module.setEeBlockChaining), read when blocks are compiled
 bool g_eeBlockChaining = false;
 //EE context promotion (Module.setEeContextPromotion), read when blocks are compiled
@@ -452,58 +452,75 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 	}
 	jitter->EndIf();
 
-	//We probably don't need to pay for this since we know in advance if there's a branch
-	jitter->PushCst(MIPS_INVALID_PC);
-	jitter->PushRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
-	jitter->BeginIf(Jitter::CONDITION_NE);
-	{
-		jitter->PushRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
-		jitter->PullRel(offsetof(CMIPS, m_State.nPC));
-
-		jitter->PushCst(MIPS_INVALID_PC);
-		jitter->PullRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
-
-		if(loopsOnItself)
-		{
-			jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
-			jitter->PushCst(0);
-			jitter->BeginIf(Jitter::CONDITION_EQ);
-			{
-				jitter->Goto(jitter->GetFirstBlockLabel());
-			}
-			jitter->EndIf();
-		}
-		else
-		{
-#if !defined(AOT_BUILD_CACHE) && !defined(__EMSCRIPTEN__)
-			jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
-			jitter->PushCst(0);
-			jitter->BeginIf(Jitter::CONDITION_EQ);
-			{
-				jitter->JumpToDynamic(reinterpret_cast<void*>(&BranchBlockTrampoline));
-			}
-			jitter->EndIf();
+#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+	//EE blocks always start with no pending delayed jump (the previous block's epilogue consumed it),
+	//so a block without branches, jumps or COP0 instructions (ERET) can only fall through
+	bool fallThroughOnly = (m_category == BLOCK_CATEGORY_PS2_EE) && !IsEmpty() && !MaySetDelayedJump();
+#else
+	bool fallThroughOnly = false;
 #endif
-		}
-	}
-	jitter->Else();
+	if(fallThroughOnly)
 	{
 		jitter->PushRel(offsetof(CMIPS, m_State.nPC));
 		jitter->PushCst(m_end - m_begin + 4);
 		jitter->Add();
 		jitter->PullRel(offsetof(CMIPS, m_State.nPC));
+	}
+	else
+	{
+		//We probably don't need to pay for this since we know in advance if there's a branch
+		jitter->PushCst(MIPS_INVALID_PC);
+		jitter->PushRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
+		jitter->BeginIf(Jitter::CONDITION_NE);
+		{
+			jitter->PushRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
+			jitter->PullRel(offsetof(CMIPS, m_State.nPC));
+
+			jitter->PushCst(MIPS_INVALID_PC);
+			jitter->PullRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
+
+			if(loopsOnItself)
+			{
+				jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
+				jitter->PushCst(0);
+				jitter->BeginIf(Jitter::CONDITION_EQ);
+				{
+					jitter->Goto(jitter->GetFirstBlockLabel());
+				}
+				jitter->EndIf();
+			}
+			else
+			{
+#if !defined(AOT_BUILD_CACHE) && !defined(__EMSCRIPTEN__)
+				jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
+				jitter->PushCst(0);
+				jitter->BeginIf(Jitter::CONDITION_EQ);
+				{
+					jitter->JumpToDynamic(reinterpret_cast<void*>(&BranchBlockTrampoline));
+				}
+				jitter->EndIf();
+#endif
+			}
+		}
+		jitter->Else();
+		{
+			jitter->PushRel(offsetof(CMIPS, m_State.nPC));
+			jitter->PushCst(m_end - m_begin + 4);
+			jitter->Add();
+			jitter->PullRel(offsetof(CMIPS, m_State.nPC));
 
 #if !defined(AOT_BUILD_CACHE) && !defined(__EMSCRIPTEN__)
-		jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
-		jitter->PushCst(0);
-		jitter->BeginIf(Jitter::CONDITION_EQ);
-		{
-			jitter->JumpToDynamic(reinterpret_cast<void*>(&NextBlockTrampoline));
+			jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
+			jitter->PushCst(0);
+			jitter->BeginIf(Jitter::CONDITION_EQ);
+			{
+				jitter->JumpToDynamic(reinterpret_cast<void*>(&NextBlockTrampoline));
+			}
+			jitter->EndIf();
+#endif
 		}
 		jitter->EndIf();
-#endif
 	}
-	jitter->EndIf();
 
 	if(UsesBlockChaining())
 	{
@@ -530,6 +547,17 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 		}
 		jitter->EndIf();
 	}
+}
+
+bool CBasicBlock::MaySetDelayedJump() const
+{
+	for(uint32 address = m_begin; address <= m_end; address += 4)
+	{
+		uint32 opcode = m_context.m_pMemoryMap->GetInstruction(address);
+		if(m_context.m_pArch->IsInstructionBranch(&m_context, address, opcode) != MIPS_BRANCH_NONE) return true;
+		if((opcode >> 26) == 0x10) return true; //COP0 (ERET writes nDelayedJumpAddr)
+	}
+	return false;
 }
 
 void CBasicBlock::CompileToStream(Framework::CMemStream& stream, bool contextPromotion)

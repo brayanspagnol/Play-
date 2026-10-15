@@ -136,6 +136,7 @@ protected:
 	std::vector<uint8> m_batchModule;
 #endif
 	bool UsesContextPromotion() const;
+	bool MaySetDelayedJump() const;
 	virtual bool IsSuperBlock() const
 	{
 		return false;

@@ -60,7 +60,30 @@ CEeExecutor::CEeExecutor(CMIPS& context, uint8* ram)
 int CEeExecutor::Execute(int cycles)
 {
 	m_executing = true;
+#if !defined(PROFILE) && !defined(DEBUGGER_INCLUDED)
+	//Same loop as CGenericMipsExecutor::Execute, but the call goes through the function index table
+	//(kept for block chaining): one dependent load less per block than going through the CBasicBlock.
+	//Index 0 (no block yet) takes the usual path, which compiles it.
+	m_context.m_State.cycleQuota = cycles;
+	uint32** fnTable = m_blockLookup.GetFnTable();
+	while(m_context.m_State.nHasException == 0)
+	{
+		uint32 address = m_context.m_State.nPC & m_addressMask;
+		uint32 fctIdx = fnTable[address >> 16][(address & 0xFFFF) / 4];
+		if(fctIdx != 0)
+		{
+			reinterpret_cast<void (*)(CMIPS*)>(static_cast<uintptr_t>(fctIdx))(&m_context);
+		}
+		else
+		{
+			m_blockLookup.FindBlockAt(address)->Execute();
+		}
+	}
+	m_context.m_State.nHasException &= ~MIPS_EXCEPTION_STATUS_QUOTADONE;
+	int result = m_context.m_State.cycleQuota;
+#else
 	int result = CGenericMipsExecutor::Execute(cycles);
+#endif
 	m_executing = false;
 	return result;
 }

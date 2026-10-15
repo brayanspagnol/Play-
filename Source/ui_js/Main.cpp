@@ -80,7 +80,7 @@ static std::string g_hashResult;
 //Benchmark over a deterministic stretch of emulated time: wall ms between vblanks [from, to) after the next state load
 static std::atomic<int> g_timeFrom = 0;
 static std::atomic<int> g_timeTo = 0;
-static int g_vblanksSinceLoad = -1;
+static std::atomic<int> g_vblanksSinceLoad = -1;
 static double g_timeStart = 0;
 static std::atomic<double> g_timeResult = -1;
 
@@ -353,6 +353,13 @@ void eeTimeAfterLoad(int from, int to)
 	g_timeTo = to;
 }
 
+//Vblanks since the state load while a timing window is armed, -1 otherwise (lets a CDP client
+//sample thread CPU time over the same window)
+int eeTimeVblank()
+{
+	return g_vblanksSinceLoad;
+}
+
 //Wall ms between the vblanks given to eeTimeAfterLoad, -1 until done
 double eeTimeResult()
 {
@@ -567,6 +574,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("eeHashAfterLoad", &eeHashAfterLoad);
 	function("eeTimeAfterLoad", &eeTimeAfterLoad);
 	function("eeTimeResult", &eeTimeResult);
+	function("eeTimeVblank", &eeTimeVblank);
 	function("setEeContextPromotion", &setEeContextPromotion);
 	function("eeHashResult", &eeHashResult);
 	function("eeDumpRequest", &eeDumpRequest);
