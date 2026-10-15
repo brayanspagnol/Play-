@@ -151,6 +151,20 @@ void CMIPSInstructionFactory::ComputeMemAccessRefIdx(uint32 accessSize, bool for
 	m_codeGen->And();
 }
 
+//Switch for A/B tests (Module.setJitPageAccess), part of the persistent block cache key
+uint32 g_jitPageAccess = ~0U;
+
+bool CMIPSInstructionFactory::UsePageAccess(uint32 kind) const
+{
+	return (g_jitPageAccess & kind) && (m_pCtx->m_pageLookup != nullptr) && m_codeGen->GetCodeGen()->SupportsPageAccess();
+}
+
+void CMIPSInstructionFactory::PushMemAccessPage(bool forWrite)
+{
+	m_codeGen->PushRelRef(forWrite ? offsetof(CMIPS, m_pageLookupWrite) : offsetof(CMIPS, m_pageLookup));
+	ComputeMemAccessAddrNoXlat();
+}
+
 void CMIPSInstructionFactory::ComputeMemAccessPageRef(bool forWrite)
 {
 	auto rs = static_cast<uint8>((m_nOpcode >> 21) & 0x001F);

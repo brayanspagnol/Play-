@@ -32,6 +32,11 @@ protected:
 	void ComputeMemAccessAddrNoXlat();
 	void ComputeMemAccessRefIdx(uint32, bool forWrite = false);
 	void ComputeMemAccessPageRef(bool forWrite = false);
+	//Single-statement page table accesses (LoadFromPage/StoreAtPage), when the code generator has them
+	//kind: debug bit for g_jitPageAccess (1 load, 2 store, 4/8 LWC1/SWC1, 16/32 LD/SD, 64/128 LQC2/SQC2, 256/512 LQ/SQ)
+	bool UsePageAccess(uint32 kind) const;
+	//Pushes the page table ref and the effective address
+	void PushMemAccessPage(bool forWrite = false);
 
 	void CheckTLBExceptions(bool);
 	void CheckTrap();

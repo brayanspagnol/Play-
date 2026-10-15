@@ -103,6 +103,16 @@ public:
 	void CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& basicBlock);
 
 #if defined(__EMSCRIPTEN__) && !defined(AOT_USE_CACHE)
+	//Module batching: wasm module bytes of the compiled function, kept until the block is batched
+	std::vector<uint8>& GetBatchModule()
+	{
+		return m_batchModule;
+	}
+	void ReplaceWasmFunction(int fctId)
+	{
+		m_function.ReplaceWasmFunction(fctId);
+		m_batchModule = std::vector<uint8>();
+	}
 	//Index of the compiled function in the wasm function table
 	uint32 GetFunctionIndex() const
 	{
@@ -122,6 +132,9 @@ protected:
 	bool m_cacheable = true;
 
 	void CompileToStream(Framework::CMemStream&, bool contextPromotion);
+#if defined(__EMSCRIPTEN__)
+	std::vector<uint8> m_batchModule;
+#endif
 	bool UsesContextPromotion() const;
 	virtual bool IsSuperBlock() const
 	{

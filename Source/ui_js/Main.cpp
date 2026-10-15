@@ -15,6 +15,7 @@
 #include "ee/Vpu.h"
 #include <future>
 #include <mutex>
+#include <set>
 #include <map>
 #include <atomic>
 #include <algorithm>
@@ -107,17 +108,22 @@ static void HashVmState()
 {
 	auto& ee = *g_virtualMachine->m_ee;
 	auto& iop = *g_virtualMachine->m_iop;
-	XXH3_state_t* state = XXH3_createState();
-	XXH3_128bits_reset(state);
-	XXH3_128bits_update(state, &ee.m_EE.m_State, sizeof(MIPSSTATE));
-	XXH3_128bits_update(state, ee.m_ram, PS2::EE_RAM_SIZE);
-	XXH3_128bits_update(state, ee.m_spr, PS2::EE_SPR_SIZE);
-	XXH3_128bits_update(state, &iop.m_cpu.m_State, sizeof(MIPSSTATE));
-	XXH3_128bits_update(state, iop.m_ram, PS2::IOP_RAM_SIZE);
-	auto hash = XXH3_128bits_digest(state);
-	XXH3_freeState(state);
+	//Component hashes: EE state, EE RAM, SPR, IOP state, IOP RAM (first differing component tells where to look)
+	auto h = [](const void* data, size_t size) { return static_cast<unsigned long long>(XXH3_64bits(data, size)) & 0xFFFF; };
 	std::lock_guard<std::mutex> lock(g_hashMutex);
-	g_hashResult += string_format("%s%08X:%016llX", g_hashResult.empty() ? "" : " ", ee.m_EE.m_State.nPC, static_cast<unsigned long long>(hash.low64 ^ hash.high64));
+	g_hashResult += string_format("%s%08X:%04llX.%04llX.%04llX.%04llX.%04llX", g_hashResult.empty() ? "" : " ", ee.m_EE.m_State.nPC,
+	                              h(&ee.m_EE.m_State, sizeof(MIPSSTATE)), h(ee.m_ram, PS2::EE_RAM_SIZE), h(ee.m_spr, PS2::EE_SPR_SIZE),
+	                              h(&iop.m_cpu.m_State, sizeof(MIPSSTATE)), h(iop.m_ram, PS2::IOP_RAM_SIZE));
+}
+
+//Debug: EE MIPSSTATE as hex words (compare two builds)
+std::string eeStateDump()
+{
+	auto& state = g_virtualMachine->m_ee->m_EE.m_State;
+	auto words = reinterpret_cast<const uint32*>(&state);
+	std::string result;
+	for(uint32 i = 0; i < sizeof(MIPSSTATE) / 4; i++) result += string_format("%08X ", words[i]);
+	return result;
 }
 
 //Runs on the emulation thread (CPS2VM::OnNewFrame, at vblank start)
@@ -287,11 +293,51 @@ void setEeBlockChaining(bool enabled)
 	g_eeBlockChaining = enabled;
 }
 
+//EE module batching: newly compiled EE blocks are moved into shared wasm modules of this many blocks (0 = off)
+extern uint32 g_jitPageAccess;
+//Guest loads/stores as single page-table statements (default) or the older if/else Jitter sequence
+void setJitPageAccess(uint32 mask)
+{
+	g_jitPageAccess = mask;
+}
+
+extern uint32 g_eeBatchSize;
+void setEeBatchSize(uint32 size)
+{
+	g_eeBatchSize = size;
+}
+
 //EE context promotion (MIPS state kept in wasm locals within a block); for blocks compiled afterwards
 extern bool g_eeContextPromotion;
 void setEeContextPromotion(bool enabled)
 {
 	g_eeContextPromotion = enabled;
+}
+
+extern std::mutex g_eeDumpMutex;
+extern std::set<uint32> g_eeDumpRequest;
+extern std::map<uint32, std::string> g_eeDumpResult;
+
+//Debug: EE block start addresses (hex, comma separated) whose wasm code is dumped when they compile
+void eeDumpRequest(std::string addresses)
+{
+	std::lock_guard<std::mutex> lock(g_eeDumpMutex);
+	size_t pos = 0;
+	while(pos < addresses.size())
+	{
+		size_t end = addresses.find(',', pos);
+		if(end == std::string::npos) end = addresses.size();
+		g_eeDumpRequest.insert(std::stoul(addresses.substr(pos, end - pos), nullptr, 16));
+		pos = end + 1;
+	}
+}
+
+std::string eeDumpResult()
+{
+	std::lock_guard<std::mutex> lock(g_eeDumpMutex);
+	std::string result;
+	for(const auto& entry : g_eeDumpResult) result += entry.second;
+	return result;
 }
 
 void eeHashAfterLoad(int vblanks)
@@ -526,6 +572,11 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("eeTimeResult", &eeTimeResult);
 	function("setEeContextPromotion", &setEeContextPromotion);
 	function("eeHashResult", &eeHashResult);
+	function("eeDumpRequest", &eeDumpRequest);
+	function("eeStateDump", &eeStateDump);
+	function("setEeBatchSize", &setEeBatchSize);
+	function("setJitPageAccess", &setJitPageAccess);
+	function("eeDumpResult", &eeDumpResult);
 	function("loadState", &loadState);
 	function("stateStatus", &stateStatus);
 	function("setFrameLimit", &setFrameLimit);

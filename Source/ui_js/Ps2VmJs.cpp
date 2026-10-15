@@ -52,6 +52,18 @@ void CPs2VmJs::CreateVM()
 	{
 		Jitter::CWasmFunctionRegistry::RegisterFunction(function.function, function.name, function.signature);
 	}
+	//Guest memory accesses: one wasm if/else per load/store with these as the slow path
+	Jitter::CCodeGen_Wasm::PAGE_ACCESS_HANDLERS pageAccessHandlers;
+	pageAccessHandlers.load8 = reinterpret_cast<uintptr_t>(&MemoryUtils_GetByteProxy);
+	pageAccessHandlers.load16 = reinterpret_cast<uintptr_t>(&MemoryUtils_GetHalfProxy);
+	pageAccessHandlers.load32 = reinterpret_cast<uintptr_t>(&MemoryUtils_GetWordProxy);
+	pageAccessHandlers.load64 = reinterpret_cast<uintptr_t>(&MemoryUtils_GetDoubleProxy);
+	pageAccessHandlers.store8 = reinterpret_cast<uintptr_t>(&MemoryUtils_SetByteProxy);
+	pageAccessHandlers.store16 = reinterpret_cast<uintptr_t>(&MemoryUtils_SetHalfProxy);
+	pageAccessHandlers.store32 = reinterpret_cast<uintptr_t>(&MemoryUtils_SetWordProxy);
+	pageAccessHandlers.store64 = reinterpret_cast<uintptr_t>(&MemoryUtils_SetDoubleProxy);
+	pageAccessHandlers.pageShift = __builtin_ctz(MIPS_PAGE_SIZE);
+	Jitter::CCodeGen_Wasm::SetPageAccessHandlers(pageAccessHandlers);
 
 	//Each wasm worker has its own JS Module: JIT code compiled on the VU1 thread needs the same
 	//import table there, built in the same order so the indexes match.

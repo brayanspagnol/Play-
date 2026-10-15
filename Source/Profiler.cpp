@@ -9,7 +9,7 @@ const char* const g_profileCounterNames[PCNT_MAX] =
     {
         "vif1Dma", "vif1DmaQw", "mscal", "unpack", "mpg", "direct", "flush", "ibit", "mskpath3",
         "vif1RegRead", "vif1FifoRead", "path3Dma", "path3DmaQw", "gifStatRead", "vu1MemEe", "vu1Cmsar",
-        "xgkick", "vu1Sync"};
+        "xgkick", "vu1Sync", "eeBlocks", "eeInsns", "eeInval", "eeJit"};
 
 CProfiler::ZoneHandle CProfiler::RegisterZone(const char* name)
 {

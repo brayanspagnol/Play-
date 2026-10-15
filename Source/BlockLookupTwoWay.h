@@ -86,6 +86,16 @@ public:
 #endif
 	}
 
+#ifdef __EMSCRIPTEN__
+	//The block's function changed (module batching): refresh its function table index
+	void UpdateFunctionIndex(BlockType block)
+	{
+		uint32 address = block->GetBeginAddress();
+		if(FindBlockAt(address) != block) return;
+		m_fnTable[address >> SUBTABLE_BITS][(address & SUBTABLE_MASK) / INSTRUCTION_SIZE] = block->GetFunctionIndex();
+	}
+#endif
+
 	void DeleteBlock(BlockType block)
 	{
 		uint32 address = block->GetBeginAddress();

@@ -12,9 +12,12 @@
 #include <string>
 #include <cstring>
 #include <vector>
+#include <set>
+#include <map>
 #include "BlockCache.h"
 #include "xxhash.h"
 #include "Jitter_CodeGen_Wasm.h"
+#include "string_format.h"
 
 //VU blocks keep context symbols (VF/VI registers, flags, pipeline state) in wasm locals.
 bool g_vuContextPromotion = true;
@@ -28,10 +31,14 @@ std::atomic<uint32> g_vuDiffRuns = 0;
 std::atomic<uint32> g_vuDiffMismatches = 0;
 std::mutex g_vuDiffLogMutex;
 std::string g_vuDiffLog;
+//Debug (Module.eeDumpRequest): wasm bytes + disassembly of chosen EE blocks, taken when they compile
+std::mutex g_eeDumpMutex;
+std::set<uint32> g_eeDumpRequest;
+std::map<uint32, std::string> g_eeDumpResult;
 
 static void VuDiffLog(const char* format, ...)
 {
-	char line[256];
+	char line[2304];
 	va_list args;
 	va_start(args, format);
 	vsnprintf(line, sizeof(line), format, args);
@@ -117,10 +124,14 @@ std::atomic<uint32> g_blockCompileCount = 0;
 std::atomic<uint32> g_vuBlockExecCount = 0;
 #endif
 
+//EE module batching (Module.setEeBatchSize): blocks per batch module, 0 = off
+uint32 g_eeBatchSize = 0;
 //Block chaining switch (Module.setEeBlockChaining), read when blocks are compiled
 bool g_eeBlockChaining = false;
 //EE context promotion (Module.setEeContextPromotion), read when blocks are compiled
 bool g_eeContextPromotion = false;
+
+extern uint32 g_jitPageAccess;
 
 bool CBasicBlock::UsesBlockChaining() const
 {
@@ -147,7 +158,13 @@ void CBasicBlock::Compile()
 	BlockCache::KEY cacheKey = {};
 	extern int g_vuExperiment;
 	//(The VU differential test always compiles, so every block gets its reference code)
-	bool useBlockCache = BlockCache::IsEnabled() && !IsEmpty() && (g_vuExperiment == 0) && !(g_vuDiffMode && (m_category == BLOCK_CATEGORY_PS2_VU));
+	bool dumpBlock = false;
+	if(m_category == BLOCK_CATEGORY_PS2_EE)
+	{
+		std::lock_guard<std::mutex> lock(g_eeDumpMutex);
+		dumpBlock = g_eeDumpRequest.count(m_begin) != 0;
+	}
+	bool useBlockCache = BlockCache::IsEnabled() && !IsEmpty() && !dumpBlock && (g_vuExperiment == 0) && !(g_vuDiffMode && (m_category == BLOCK_CATEGORY_PS2_VU));
 	if(useBlockCache)
 	{
 		uint32 wordCount = ((m_end - m_begin) / 4) + 1;
@@ -161,7 +178,7 @@ void CBasicBlock::Compile()
 		cacheKey.category = m_category;
 		cacheKey.size = wordCount * 4;
 		cacheKey.hints = m_blockCompileHints;
-		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000) | (IsSuperBlock() ? 0x20000000 : 0) | (UsesBlockChaining() ? 0x10000000 : 0);
+		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000) | (IsSuperBlock() ? 0x20000000 : 0) | (UsesBlockChaining() ? 0x10000000 : 0) | ((g_jitPageAccess != ~0U) ? (0x08000000 | (g_jitPageAccess & 0x3FF)) : 0);
 		cacheKey.hash[0] = xxHash.low64;
 		cacheKey.hash[1] = xxHash.high64;
 
@@ -173,6 +190,7 @@ void CBasicBlock::Compile()
 			CProfilerZone profilerZone(compileWasmZone);
 #endif
 			m_function = CMemoryFunction(cachedCode.data(), cachedCode.size());
+			if((m_category == BLOCK_CATEGORY_PS2_EE) && (g_eeBatchSize != 0)) m_batchModule = cachedCode;
 			return;
 		}
 	}
@@ -180,8 +198,46 @@ void CBasicBlock::Compile()
 
 	Framework::CMemStream stream;
 	CompileToStream(stream, UsesContextPromotion());
+#ifdef PROFILE
+	if(m_category == BLOCK_CATEGORY_PS2_EE)
+	{
+		//Steady-state recompile analysis: how often each start address went through the Jitter
+		static std::map<uint32, std::pair<uint32, uint32>> jitCounts; //begin -> (count, last end)
+		auto& entry = jitCounts[m_begin];
+		PROFILE_COUNT(PCNT_EE_JIT, 1);
+		CProfiler::GetInstance().Log("C %08X-%08X n=%u prevEnd=%08X\n", m_begin, m_end, entry.first, entry.second);
+		entry.first++;
+		entry.second = m_end;
+	}
+#endif
 
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+	if(dumpBlock)
+	{
+		std::vector<uint8> code(stream.GetBuffer(), stream.GetBuffer() + stream.GetSize());
+		char line[2304];
+		snprintf(line, sizeof(line), "BLOCK %08X %08X %u\n", m_begin, m_end, static_cast<uint32>(code.size()));
+		std::string text = line;
+		for(uint32 address = m_begin; address <= m_end; address += 4)
+		{
+			uint32 opcode = m_context.m_pMemoryMap->GetInstruction(address);
+			char mnemonic[1024] = {}, operands[1024] = {}; //COP disassemblers ignore the size and may pad up to 256 bytes
+			m_context.m_pArch->GetInstructionMnemonic(&m_context, address, opcode, mnemonic, sizeof(mnemonic) - 1);
+			m_context.m_pArch->GetInstructionOperands(&m_context, address, opcode, operands, sizeof(operands) - 1);
+			snprintf(line, sizeof(line), "; %08X %08X %s %s\n", address, opcode, mnemonic, operands);
+			text += line;
+		}
+		text += "HEX ";
+		static const char hexDigits[] = "0123456789ABCDEF";
+		for(uint8 byte : code)
+		{
+			text += hexDigits[byte >> 4];
+			text += hexDigits[byte & 0xF];
+		}
+		text += "\n";
+		std::lock_guard<std::mutex> lock(g_eeDumpMutex);
+		g_eeDumpResult[m_begin] = std::move(text); //latest compile wins
+	}
 	//(Not the executor's empty block: it compiles and runs the real block, which has its own test)
 	if(g_vuDiffMode && (m_category == BLOCK_CATEGORY_PS2_VU) && UsesContextPromotion() && !IsEmpty())
 	{
@@ -203,6 +259,12 @@ void CBasicBlock::Compile()
 #endif
 		m_function = CMemoryFunction(stream.GetBuffer(), stream.GetSize());
 	}
+#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+	if((m_category == BLOCK_CATEGORY_PS2_EE) && (g_eeBatchSize != 0) && !IsEmpty() && !m_diffExecute)
+	{
+		m_batchModule.assign(stream.GetBuffer(), stream.GetBuffer() + stream.GetSize());
+	}
+#endif
 
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
 	if(useBlockCache && m_cacheable)

@@ -73,6 +73,8 @@ public:
 			if(m_blockCategory == BLOCK_CATEGORY_PS2_EE)
 			{
 				static const auto blockZone = CProfiler::GetInstance().RegisterZone("EEBLOCK");
+				PROFILE_COUNT(PCNT_EE_BLOCK, 1);
+				PROFILE_COUNT(PCNT_EE_INSN, ((block->GetEndAddress() - block->GetBeginAddress()) / 4) + 1);
 				auto prevZone = CProfiler::GetInstance().SwapCurrentZone(blockZone);
 				block->Execute();
 				CProfiler::GetInstance().SwapCurrentZone(prevZone);

@@ -80,6 +80,14 @@ void CCOP_VU::LQC2()
 {
 	if(m_nFT == 0) return;
 
+	if(UsePageAccess(64))
+	{
+		PushMemAccessPage();
+		m_codeGen->LoadFromPage(0x10);
+		m_codeGen->MD_PullRel(offsetof(CMIPS, m_State.nCOP2[m_nFT]));
+		return;
+	}
+
 	ComputeMemAccessPageRef();
 
 	m_codeGen->PushCst(0);
@@ -129,6 +137,14 @@ void CCOP_VU::LQC2()
 //3E
 void CCOP_VU::SQC2()
 {
+	if(UsePageAccess(128))
+	{
+		PushMemAccessPage(true);
+		m_codeGen->MD_PushRel(offsetof(CMIPS, m_State.nCOP2[m_nFT]));
+		m_codeGen->StoreAtPage(0x10);
+		return;
+	}
+
 	ComputeMemAccessPageRef(true);
 
 	m_codeGen->PushCst(0);
