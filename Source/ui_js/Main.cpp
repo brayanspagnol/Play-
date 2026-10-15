@@ -77,9 +77,30 @@ static int g_hashRemaining = 0;
 static std::mutex g_hashMutex;
 static std::string g_hashResult;
 
+//Benchmark over a deterministic stretch of emulated time: wall ms between vblanks [from, to) after the next state load
+static std::atomic<int> g_timeFrom = 0;
+static std::atomic<int> g_timeTo = 0;
+static int g_vblanksSinceLoad = -1;
+static double g_timeStart = 0;
+static std::atomic<double> g_timeResult = -1;
+
 static void OnVmStateLoaded()
 {
 	g_hashRemaining = g_hashRequest.exchange(0);
+	g_vblanksSinceLoad = (g_timeTo > 0) ? 0 : -1;
+}
+
+static void UpdateVblankTiming()
+{
+	if(g_vblanksSinceLoad < 0) return;
+	int count = g_vblanksSinceLoad++;
+	if(count == g_timeFrom) g_timeStart = emscripten_get_now();
+	if(count == g_timeTo)
+	{
+		g_timeResult = emscripten_get_now() - g_timeStart;
+		g_vblanksSinceLoad = -1;
+		g_timeTo = 0;
+	}
 }
 
 static void HashVmState()
@@ -107,6 +128,7 @@ static void OnVmNewFrame()
 		g_hashRemaining--;
 		HashVmState();
 	}
+	UpdateVblankTiming();
 	auto cpu = g_virtualMachine->GetCpuUtilisationInfo();
 	std::lock_guard<std::mutex> lock(g_profileMutex);
 	g_profile.vblanks++;
@@ -265,11 +287,31 @@ void setEeBlockChaining(bool enabled)
 	g_eeBlockChaining = enabled;
 }
 
+//EE context promotion (MIPS state kept in wasm locals within a block); for blocks compiled afterwards
+extern bool g_eeContextPromotion;
+void setEeContextPromotion(bool enabled)
+{
+	g_eeContextPromotion = enabled;
+}
+
 void eeHashAfterLoad(int vblanks)
 {
 	std::lock_guard<std::mutex> lock(g_hashMutex);
 	g_hashResult.clear();
 	g_hashRequest = vblanks;
+}
+
+void eeTimeAfterLoad(int from, int to)
+{
+	g_timeResult = -1;
+	g_timeFrom = from;
+	g_timeTo = to;
+}
+
+//Wall ms between the vblanks given to eeTimeAfterLoad, -1 until done
+double eeTimeResult()
+{
+	return g_timeResult;
 }
 
 std::string eeHashResult()
@@ -480,6 +522,9 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("saveState", &saveState);
 	function("setEeBlockChaining", &setEeBlockChaining);
 	function("eeHashAfterLoad", &eeHashAfterLoad);
+	function("eeTimeAfterLoad", &eeTimeAfterLoad);
+	function("eeTimeResult", &eeTimeResult);
+	function("setEeContextPromotion", &setEeContextPromotion);
 	function("eeHashResult", &eeHashResult);
 	function("loadState", &loadState);
 	function("stateStatus", &stateStatus);

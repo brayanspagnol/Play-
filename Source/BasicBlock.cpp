@@ -118,7 +118,9 @@ std::atomic<uint32> g_vuBlockExecCount = 0;
 #endif
 
 //Block chaining switch (Module.setEeBlockChaining), read when blocks are compiled
-bool g_eeBlockChaining = true;
+bool g_eeBlockChaining = false;
+//EE context promotion (Module.setEeContextPromotion), read when blocks are compiled
+bool g_eeContextPromotion = false;
 
 bool CBasicBlock::UsesBlockChaining() const
 {
@@ -502,6 +504,7 @@ void CBasicBlock::CompileToStream(Framework::CMemStream& stream, bool contextPro
 bool CBasicBlock::UsesContextPromotion() const
 {
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+	if(m_category == BLOCK_CATEGORY_PS2_EE) return g_eeContextPromotion;
 	return (m_category == BLOCK_CATEGORY_PS2_VU) && g_vuContextPromotion && !m_forceReference;
 #else
 	return false;
