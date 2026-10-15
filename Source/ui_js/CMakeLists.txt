@@ -32,14 +32,6 @@ if(NOT TARGET gsh_opengl)
 endif()
 list(APPEND UI_JS_PROJECT_LIBS gsh_opengl)
 
-if(NOT TARGET sh_openal)
-	add_subdirectory(
-		${CMAKE_CURRENT_SOURCE_DIR}/../sound/SH_OpenAL
-		${CMAKE_CURRENT_BINARY_DIR}/SH_OpenAL
-	)
-endif()
-list(APPEND UI_JS_PROJECT_LIBS sh_openal)
-
 add_executable(Play
 	GSH_OpenGLJs.cpp
 	GSH_OpenGLJs.h
@@ -48,6 +40,8 @@ add_executable(Play
 	Main.cpp
 	Ps2VmJs.cpp
 	Ps2VmJs.h
+	SH_WebAudio.cpp
+	SH_WebAudio.h
 )
 target_link_libraries(Play PUBLIC ${UI_JS_PROJECT_LIBS})
 
@@ -62,7 +56,7 @@ target_link_options(Play PRIVATE "-sALLOW_TABLE_GROWTH")
 target_link_options(Play PRIVATE "-sALLOW_MEMORY_GROWTH")
 #target_link_options(Play PRIVATE "-sASSERTIONS=2")
 target_link_options(Play PRIVATE "-sEXPORT_NAME=Play")
-target_link_options(Play PRIVATE "-sPTHREAD_POOL_SIZE=4")
+target_link_options(Play PRIVATE "-sPTHREAD_POOL_SIZE=6")
 target_link_options(Play PRIVATE "-sWASM_BIGINT")
 target_link_options(Play PRIVATE "-sOFFSCREEN_FRAMEBUFFER=1")
 target_link_options(Play PRIVATE "-sENVIRONMENT=web,worker")
@@ -70,3 +64,6 @@ target_link_options(Play PRIVATE "-sUSE_WEBGL2=1")
 #Per-game settings (idle loops, FP modes, patches) read by CGameConfig from the app resources path
 target_link_options(Play PRIVATE "--embed-file=${CMAKE_CURRENT_SOURCE_DIR}/../../GameConfig.xml@/usr/local/share/GameConfig.xml")
 set_property(TARGET Play APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../../GameConfig.xml)
+#Audio output: AudioWorklet + time-stretching (see SH_WebAudio.h)
+target_link_options(Play PRIVATE "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/WebAudio.js")
+set_property(TARGET Play APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/WebAudio.js)

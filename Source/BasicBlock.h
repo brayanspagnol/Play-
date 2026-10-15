@@ -154,11 +154,14 @@ private:
 	static std::mutex m_aotBlockOutputStreamMutex;
 #endif
 
+protected:
 #ifndef AOT_USE_CACHE
 	CMemoryFunction m_function;
 #else
 	void (*m_function)(void*);
 #endif
+
+private:
 	uint32 m_recycleCount = 0;
 	BlockOutLinkPointer m_outLinks[LINK_SLOT_MAX];
 	uint32 m_linkBlockTrampolineOffset[LINK_SLOT_MAX];

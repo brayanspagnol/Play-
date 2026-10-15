@@ -9,6 +9,7 @@
 #include "../states/MemoryStateFile.h"
 #include "GIF.h"
 #include "DMAC.h"
+#include "Vu1Thread.h"
 
 #define QTEMP_INIT (0x3F800000)
 
@@ -380,7 +381,7 @@ uint32 CGIF::ProcessSinglePacket(const uint8* memory, uint32 memorySize, uint32 
 		}
 	}
 
-	if((m_activePath == 0) && (packetMetadata.pathIndex == 3))
+	if((m_activePath == 0) && (packetMetadata.pathIndex == 3) && !m_path3MaskBypass)
 	{
 		assert(m_loops == 0);
 		if(m_maskedPath3XferState == MASKED_PATH3_XFER_PROCESSING)
@@ -423,14 +424,14 @@ uint32 CGIF::ProcessMultiplePackets(const uint8* memory, uint32 memorySize, uint
 	uint32 start = address;
 	while(address < end)
 	{
-		if((m_path3Masked || (m_maskedPath3XferState == MASKED_PATH3_XFER_DONE)) &&
+		if((m_path3Masked || (m_maskedPath3XferState == MASKED_PATH3_XFER_DONE)) && !m_path3MaskBypass &&
 		   (m_activePath == 0) && (packetMetadata.pathIndex == 3))
 		{
 			//Going to do a PATH3 transfer, but PATH3 is masked or already transfered a single masked packet
 			break;
 		}
 
-		if(packetMetadata.pathIndex == 3)
+		if((packetMetadata.pathIndex == 3) && !m_path3MaskBypass)
 		{
 			//Eurocom games will check if PATH3 is outputting right after starting a DMA transfer
 			//So, this doesn't need to be a huge number
@@ -471,6 +472,8 @@ void CGIF::DrainFifo()
 uint32 CGIF::ReceiveDMA(uint32 address, uint32 qwc, uint32 unused, bool tagIncluded)
 {
 	uint32 size = qwc * 0x10;
+	PROFILE_COUNT(PCNT_PATH3_DMA, 1);
+	PROFILE_COUNT(PCNT_PATH3_DMA_QW, qwc);
 
 	uint8* memory = nullptr;
 	uint32 memorySize = 0;
@@ -495,6 +498,19 @@ uint32 CGIF::ReceiveDMA(uint32 address, uint32 qwc, uint32 unused, bool tagInclu
 	{
 		assert(qwc >= 0);
 		address += 0x10;
+	}
+
+	if(m_vu1Thread)
+	{
+		//Queued behind the VIF1 data already pushed, sent to the GS by the VU1 thread
+		uint32 accepted = AcceptPath3(memory + address, end - address);
+		if(accepted != 0)
+		{
+			m_vu1Thread->PushPath3(memory + address, accepted);
+			m_path3XferActiveTicks = 0x100;
+			address += accepted;
+		}
+		return (address - start) / 0x10;
 	}
 
 	bool canProcessPath3 = (m_activePath == 0) || (m_activePath == 3);
@@ -545,6 +561,7 @@ uint32 CGIF::GetRegister(uint32 address)
 	switch(address)
 	{
 	case GIF_STAT:
+		PROFILE_COUNT(PCNT_GIF_STAT_READ, 1);
 		if(m_path3Masked)
 		{
 			result |= GIF_STAT_M3P;
@@ -581,6 +598,8 @@ void CGIF::SetRegister(uint32 address, uint32 value)
 {
 	if(address >= GIF_FIFO_START && address < GIF_FIFO_END)
 	{
+		std::unique_lock<std::mutex> gifLock;
+		if(m_vu1Thread) gifLock = m_vu1Thread->SyncAndLockGif(CVu1Thread::SYNC_GIFFIFO);
 		ProcessFifoWrite(address, value);
 	}
 	else
@@ -605,6 +624,94 @@ CGSHandler* CGIF::GetGsHandler()
 uint32 CGIF::GetActivePath() const
 {
 	return m_activePath;
+}
+
+void CGIF::SetVu1Thread(CVu1Thread* vu1Thread)
+{
+	m_vu1Thread = vu1Thread;
+	//Packet tracking starts from the GIF's current state
+	m_path3InPacket = (m_activePath == 3);
+	m_path3TagRemain = 0;
+	m_path3Eop = m_eop;
+	if(m_path3InPacket)
+	{
+		switch(m_cmd)
+		{
+		case 0:
+			m_path3TagRemain = m_loops * m_regs - (m_regs - m_regsTemp);
+			break;
+		case 1:
+			m_path3TagRemain = (m_loops * m_regs - (m_regs - m_regsTemp) + 1) / 2;
+			break;
+		default:
+			m_path3TagRemain = m_loops;
+			break;
+		}
+	}
+}
+
+uint32 CGIF::AcceptPath3(const uint8* data, uint32 size)
+{
+	uint32 pos = 0;
+	while(pos < size)
+	{
+		if(m_path3TagRemain == 0)
+		{
+			if(m_path3InPacket && m_path3Eop)
+			{
+				m_path3InPacket = false;
+				if(m_maskedPath3XferState == MASKED_PATH3_XFER_PROCESSING)
+				{
+					m_maskedPath3XferState = MASKED_PATH3_XFER_DONE;
+				}
+			}
+			if(!m_path3InPacket && (m_path3Masked || (m_maskedPath3XferState == MASKED_PATH3_XFER_DONE)))
+			{
+				break;
+			}
+			auto tag = *reinterpret_cast<const TAG*>(data + pos);
+			pos += 0x10;
+			uint32 regs = (tag.nreg == 0) ? 0x10 : tag.nreg;
+			switch(tag.cmd)
+			{
+			case 0:
+				m_path3TagRemain = tag.loops * regs;
+				break;
+			case 1:
+				m_path3TagRemain = (tag.loops * regs + 1) / 2;
+				break;
+			default:
+				m_path3TagRemain = tag.loops;
+				break;
+			}
+			m_path3Eop = (tag.eop != 0);
+			m_path3InPacket = true;
+		}
+		else
+		{
+			uint32 amount = std::min<uint32>(m_path3TagRemain, (size - pos) / 0x10);
+			pos += amount * 0x10;
+			m_path3TagRemain -= amount;
+		}
+	}
+	if((m_path3TagRemain == 0) && m_path3InPacket && m_path3Eop)
+	{
+		m_path3InPacket = false;
+		if(m_maskedPath3XferState == MASKED_PATH3_XFER_PROCESSING)
+		{
+			m_maskedPath3XferState = MASKED_PATH3_XFER_DONE;
+		}
+	}
+	return pos;
+}
+
+uint32 CGIF::ProcessQueuedPath3(const uint8* data, uint32 size)
+{
+	if((m_activePath != 0) && (m_activePath != 3)) return 0;
+	m_path3MaskBypass = true;
+	uint32 processed = ProcessMultiplePackets(data, size, 0, size, CGsPacketMetadata(3));
+	m_path3MaskBypass = false;
+	return processed;
 }
 
 void CGIF::SetPath3Masked(bool masked)

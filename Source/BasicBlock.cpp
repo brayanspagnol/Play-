@@ -21,7 +21,7 @@ bool g_vuContextPromotion = true;
 //Differential test: every VU block also gets a reference version (no promotion); both run from
 //the same state and their results are compared. See CBasicBlock::ExecuteDiff.
 bool g_vuDiffMode = false;
-bool g_vuDiffSuppressKick = false;
+thread_local bool g_vuDiffSuppressKick = false;
 //Name every JIT function (wasm name section) so CPU profiles tell blocks apart
 bool g_jitFunctionNames = false;
 std::atomic<uint32> g_vuDiffRuns = 0;
@@ -132,7 +132,8 @@ void CBasicBlock::Compile()
 	//indexes fixed at startup), so the key is the block contents plus everything else that changes codegen.
 	BlockCache::KEY cacheKey = {};
 	extern int g_vuExperiment;
-	bool useBlockCache = BlockCache::IsEnabled() && !IsEmpty() && (g_vuExperiment == 0);
+	//(The VU differential test always compiles, so every block gets its reference code)
+	bool useBlockCache = BlockCache::IsEnabled() && !IsEmpty() && (g_vuExperiment == 0) && !(g_vuDiffMode && (m_category == BLOCK_CATEGORY_PS2_VU));
 	if(useBlockCache)
 	{
 		uint32 wordCount = ((m_end - m_begin) / 4) + 1;
@@ -167,7 +168,8 @@ void CBasicBlock::Compile()
 	CompileToStream(stream, UsesContextPromotion());
 
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
-	if(g_vuDiffMode && (m_category == BLOCK_CATEGORY_PS2_VU) && UsesContextPromotion())
+	//(Not the executor's empty block: it compiles and runs the real block, which has its own test)
+	if(g_vuDiffMode && (m_category == BLOCK_CATEGORY_PS2_VU) && UsesContextPromotion() && !IsEmpty())
 	{
 		//Superblocks are checked against the reference blocks run one by one (see CVuBasicBlock)
 		if(!IsSuperBlock())
@@ -430,11 +432,8 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 
 void CBasicBlock::CompileToStream(Framework::CMemStream& stream, bool contextPromotion)
 {
-	static
-#ifdef AOT_BUILD_CACHE
-	    thread_local
-#endif
-	    CMipsJitter* jitter = nullptr;
+	//One jitter per thread (VU1 can compile on its own thread)
+	static thread_local CMipsJitter* jitter = nullptr;
 	if(jitter == nullptr)
 	{
 		Jitter::CCodeGen* codeGen = Jitter::CreateCodeGen();
@@ -504,8 +503,8 @@ void CBasicBlock::ExecuteDiff()
 {
 	uint32 dataSize = m_diffDataSize;
 	auto dataMem = reinterpret_cast<uint8*>(m_context.m_vuMem);
-	static MIPSSTATE initState, refState;
-	static std::vector<uint8> initMem, refMem;
+	static thread_local MIPSSTATE initState, refState;
+	static thread_local std::vector<uint8> initMem, refMem;
 	initMem.resize(dataSize);
 	refMem.resize(dataSize);
 

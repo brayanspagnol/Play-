@@ -25,6 +25,8 @@ public:
 	//Differential test of superblocks: runs reference blocks one at a time
 	typedef std::function<CBasicBlock*(uint32)> ReferenceBlockProvider;
 	void SetReferenceBlockProvider(ReferenceBlockProvider);
+	//Never loop inside the function (reference blocks of the superblock differential test)
+	void SetNoSelfLoop();
 
 	//Static analysis helpers (also used by the executor to plan superblocks)
 	static bool IsConditionalBranch(uint32);
@@ -68,6 +70,7 @@ private:
 	static void EmitXgKick(CMipsJitter*);
 
 	bool m_isLinkable = true;
+	bool m_noSelfLoop = false;
 	std::vector<SUPERBLOCK_PART> m_superBlockParts;
 	ReferenceBlockProvider m_referenceBlockProvider;
 };

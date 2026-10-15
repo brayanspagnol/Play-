@@ -12,7 +12,7 @@
 #include "placeholder_def.h"
 
 #ifdef __EMSCRIPTEN__
-extern bool g_vuDiffSuppressKick;
+extern thread_local bool g_vuDiffSuppressKick;
 //VU1 replay benchmark: TOP/ITOP as they were when the program was captured
 extern bool g_vuReplayIoActive;
 extern uint32 g_vuReplayTop;
@@ -69,6 +69,7 @@ CSubSystem::CSubSystem(uint8* iopRam, CIopBios& iopBios)
 
 	m_vpu0 = std::make_shared<CVpu>(0, CVpu::VPUINIT(m_microMem0, m_vuMem0, &m_VU0), m_gif, m_intc, m_ram, m_spr);
 	m_vpu1 = std::make_shared<CVpu>(1, CVpu::VPUINIT(m_microMem1, m_vuMem1, &m_VU1), m_gif, m_intc, m_ram, m_spr);
+	m_vif1Back = std::make_unique<CVif1>(1, *m_vpu1, m_gif, m_intc, m_ram, m_spr);
 
 	//Setup link between EE's VU context and VU0's VU context
 	m_vu0StateChangedConnection = m_vpu0->VuStateChanged.Connect([this](CVpu::VU_STATE newState) { Vu0StateChanged(newState); });
@@ -83,6 +84,9 @@ CSubSystem::CSubSystem(uint8* iopRam, CIopBios& iopBios)
 	//EmotionEngine context setup
 	{
 		m_EE.m_executor = std::make_unique<CEeExecutor>(m_EE, m_ram);
+#if defined(__EMSCRIPTEN__)
+		static_cast<CEeExecutor*>(m_EE.m_executor.get())->m_ioWriteHandler = [this](uint32 address) { IoWriteHandler(address); };
+#endif
 
 		//Read map
 		m_EE.m_pMemoryMap->InsertReadMap(0x00000000, PS2::EE_RAM_SIZE - 1, m_ram, 0x00);
@@ -90,8 +94,9 @@ CSubSystem::CSubSystem(uint8* iopRam, CIopBios& iopBios)
 		m_EE.m_pMemoryMap->InsertReadMap(0x10000000, 0x10FFFFFF, std::bind(&CSubSystem::IOPortReadHandler, this, PLACEHOLDER_1), 0x02);
 		m_EE.m_pMemoryMap->InsertReadMap(PS2::MICROMEM0ADDR, PS2::MICROMEM0ADDR + PS2::MICROMEM0SIZE - 1, m_microMem0, 0x03);
 		m_EE.m_pMemoryMap->InsertReadMap(PS2::VUMEM0ADDR, PS2::VUMEM0ADDR + PS2::VUMEM0SIZE - 1, m_vuMem0, 0x04);
-		m_EE.m_pMemoryMap->InsertReadMap(PS2::MICROMEM1ADDR, PS2::MICROMEM1ADDR + PS2::MICROMEM1SIZE - 1, m_microMem1, 0x05);
-		m_EE.m_pMemoryMap->InsertReadMap(PS2::VUMEM1ADDR, PS2::VUMEM1ADDR + PS2::VUMEM1SIZE - 1, m_vuMem1, 0x06);
+		//VU1 memories go through handlers to sync with the VU1 thread (see Vu1Thread.h)
+		m_EE.m_pMemoryMap->InsertReadMap(PS2::MICROMEM1ADDR, PS2::MICROMEM1ADDR + PS2::MICROMEM1SIZE - 1, std::bind(&CSubSystem::MicroMem1ReadHandler, this, PLACEHOLDER_1), 0x05);
+		m_EE.m_pMemoryMap->InsertReadMap(PS2::VUMEM1ADDR, PS2::VUMEM1ADDR + PS2::VUMEM1SIZE - 1, std::bind(&CSubSystem::Vu1MemReadHandler, this, PLACEHOLDER_1), 0x06);
 		m_EE.m_pMemoryMap->InsertReadMap(0x12000000, 0x12FFFFFF, std::bind(&CSubSystem::IOPortReadHandler, this, PLACEHOLDER_1), 0x07);
 		m_EE.m_pMemoryMap->InsertReadMap(0x1C000000, 0x1C001000, m_fakeIopRam, 0x08);
 		m_EE.m_pMemoryMap->InsertReadMap(PS2::EE_BIOS_ADDR, PS2::EE_BIOS_ADDR + PS2::EE_BIOS_SIZE - 1, m_bios, 0x09);
@@ -168,6 +173,7 @@ CSubSystem::CSubSystem(uint8* iopRam, CIopBios& iopBios)
 	m_dmac.SetChannelTransferFunction(CDMAC::CHANNEL_ID_SIF1, std::bind(&CSIF::ReceiveDMA6, &m_sif, PLACEHOLDER_1, PLACEHOLDER_2, PLACEHOLDER_3, PLACEHOLDER_4));
 
 	m_ipu.SetDMA3ReceiveHandler(std::bind(&CDMAC::ResumeDMA3, &m_dmac, PLACEHOLDER_1, PLACEHOLDER_2));
+	m_dmac.Vu1MemoryAccessHandler = [this]() { SyncVu1(CVu1Thread::SYNC_VU1MEM); };
 
 	m_os = new CPS2OS(m_EE, m_ram, m_bios, m_spr, m_gs, m_sif, iopBios);
 	m_OnRequestInstructionCacheFlushConnection = m_os->OnRequestInstructionCacheFlush.Connect(std::bind(&CSubSystem::FlushInstructionCache, this));
@@ -177,6 +183,21 @@ CSubSystem::CSubSystem(uint8* iopRam, CIopBios& iopBios)
 
 CSubSystem::~CSubSystem()
 {
+	if(m_vu1Thread)
+	{
+		//Destroy the VU1 thread's executor on its thread
+		m_vu1Thread->RunSync([this]() {
+			if(m_vu1Threaded)
+			{
+				m_VU1.m_executor.reset();
+			}
+			else
+			{
+				m_vu1InactiveExecutor.reset();
+			}
+		});
+		m_vu1Thread.reset();
+	}
 	m_EE.m_executor->Reset();
 	delete m_os;
 	framework_aligned_free(m_ram);
@@ -201,6 +222,7 @@ void CSubSystem::SetVpu1(std::shared_ptr<CVpu> newVpu1)
 
 void CSubSystem::Reset(uint32 ramSize)
 {
+	if(m_vu1Threaded) m_vu1Thread->SyncAndDiscard();
 	m_os->Release();
 	m_EE.m_executor->Reset();
 
@@ -230,7 +252,16 @@ void CSubSystem::Reset(uint32 ramSize)
 	m_ipu.Reset();
 	m_gif.Reset();
 	m_vpu0->Reset();
-	m_vpu1->Reset();
+	if(m_vu1Threaded)
+	{
+		//VU1 JIT blocks belong to the VU1 thread
+		m_vu1Thread->RunSync([this]() { m_vpu1->Reset(); });
+		m_vif1Back->Reset();
+	}
+	else
+	{
+		m_vpu1->Reset();
+	}
 	m_dmac.Reset();
 	m_intc.Reset();
 	m_timer.Reset();
@@ -324,7 +355,7 @@ void CSubSystem::CountTicks(int ticks)
 	{
 		m_dmac.ResumeDMA0();
 	}
-	if(m_vpu1->IsVuReady() || (m_vpu1->IsVuRunning() && !m_vpu1->GetVif().IsWaitingForProgramEnd()))
+	if(m_vu1Threaded || m_vpu1->IsVuReady() || (m_vpu1->IsVuRunning() && !m_vpu1->GetVif().IsWaitingForProgramEnd()))
 	{
 		m_dmac.ResumeDMA1();
 	}
@@ -383,6 +414,12 @@ void CSubSystem::NotifyVBlankEnd()
 
 void CSubSystem::SaveState(Framework::CZipArchiveWriter& archive)
 {
+	SyncVu1();
+	if(m_vu1Threaded)
+	{
+		//The front decoder does not track ROW in difference mode
+		m_vpu1->GetVif().CopyRowFrom(*m_vif1Back);
+	}
 	archive.InsertFile(std::make_unique<CMemoryStateFile>(STATE_EE, &m_EE.m_State, sizeof(MIPSSTATE)));
 	archive.InsertFile(std::make_unique<CMemoryStateFile>(STATE_VU0, &m_VU0.m_State, sizeof(MIPSSTATE)));
 	archive.InsertFile(std::make_unique<CMemoryStateFile>(STATE_VU1, &m_VU1.m_State, sizeof(MIPSSTATE)));
@@ -406,9 +443,17 @@ void CSubSystem::SaveState(Framework::CZipArchiveWriter& archive)
 
 void CSubSystem::LoadState(Framework::CZipArchiveReader& archive)
 {
+	if(m_vu1Threaded) m_vu1Thread->SyncAndDiscard();
 	m_EE.m_executor->ClearActiveBlocksInRange(0, PS2::EE_RAM_SIZE, false);
 	m_vpu0->GetContext().m_executor->ClearActiveBlocksInRange(0, PS2::MICROMEM0SIZE, false);
-	m_vpu1->GetContext().m_executor->ClearActiveBlocksInRange(0, PS2::MICROMEM1SIZE, false);
+	if(m_vu1Threaded)
+	{
+		m_vu1Thread->RunSync([this]() { m_vpu1->GetContext().m_executor->ClearActiveBlocksInRange(0, PS2::MICROMEM1SIZE, false); });
+	}
+	else
+	{
+		m_vpu1->GetContext().m_executor->ClearActiveBlocksInRange(0, PS2::MICROMEM1SIZE, false);
+	}
 
 	archive.BeginReadFile(STATE_EE)->Read(&m_EE.m_State, sizeof(MIPSSTATE));
 	archive.BeginReadFile(STATE_VU0)->Read(&m_VU0.m_State, sizeof(MIPSSTATE));
@@ -429,6 +474,21 @@ void CSubSystem::LoadState(Framework::CZipArchiveReader& archive)
 	m_gif.LoadState(archive);
 	m_ipu.LoadState(archive);
 	m_os->GetLibMc2().LoadState(archive);
+
+	if(m_vu1Threaded)
+	{
+		m_vif1Back->CopyStateFrom(m_vpu1->GetVif());
+		if(m_vpu1->IsVuRunning())
+		{
+			//State saved in the middle of a microprogram (non threaded mode): finish it on the VU1 thread
+			m_vu1Thread->PushFunction([this]() {
+				while(m_vpu1->IsVuRunning())
+				{
+					m_vpu1->Execute(5000);
+				}
+			});
+		}
+	}
 }
 
 void CSubSystem::SetupEePageTable()
@@ -461,7 +521,17 @@ uint32 CSubSystem::IOPortReadHandler(uint32 nAddress)
 	}
 	else if(nAddress >= CVif::REGS1_START && nAddress < CVif::REGS1_END)
 	{
-		nReturn = m_vpu1->GetVif().GetRegister(nAddress);
+		PROFILE_COUNT(PCNT_VIF1_REGREAD, 1);
+		if(m_vu1Threaded && (nAddress >= CVif::VIF1_R0) && (nAddress < (CVif::VIF1_R3 + 0x10)))
+		{
+			//ROW is only tracked by the back decoder (difference mode)
+			SyncVu1(CVu1Thread::SYNC_ROW);
+			nReturn = m_vif1Back->GetRegister(nAddress);
+		}
+		else
+		{
+			nReturn = m_vpu1->GetVif().GetRegister(nAddress);
+		}
 	}
 	else if(nAddress >= 0x10008000 && nAddress <= 0x1000EFFC)
 	{
@@ -478,6 +548,8 @@ uint32 CSubSystem::IOPortReadHandler(uint32 nAddress)
 	else if(nAddress >= CVpu::EE_ADDR_VU1AREA_START && nAddress <= CVpu::EE_ADDR_VU1AREA_END)
 	{
 		uint32 offset = nAddress - CVpu::EE_ADDR_VU1AREA_START;
+		PROFILE_COUNT(PCNT_VU1_MEM_EE, 1);
+		SyncVu1(CVu1Thread::SYNC_VU1REG);
 		nReturn = HandleVu1AreaRead(offset);
 	}
 	else if(nAddress >= 0x12000000 && nAddress <= 0x1200108C)
@@ -543,6 +615,11 @@ uint32 CSubSystem::IOPortWriteHandler(uint32 nAddress, uint32 nData)
 	else if(nAddress >= CVif::REGS1_START && nAddress < CVif::REGS1_END)
 	{
 		m_vpu1->GetVif().SetRegister(nAddress, nData);
+		if(m_vu1Threaded && (nAddress == CVif::VIF1_FBRST) && (nData & 1))
+		{
+			//FBRST.RST also resets the back decoder (other bits only matter to the front)
+			m_vu1Thread->PushFunction([this]() { m_vif1Back->SetRegister(CVif::VIF1_FBRST, 1); });
+		}
 	}
 	else if(nAddress >= CVif::VIF0_FIFO_START && nAddress < CVif::VIF0_FIFO_END)
 	{
@@ -582,10 +659,12 @@ uint32 CSubSystem::IOPortWriteHandler(uint32 nAddress, uint32 nData)
 	else if(nAddress >= CVpu::EE_ADDR_VU1AREA_START && nAddress <= CVpu::EE_ADDR_VU1AREA_END)
 	{
 		uint32 offset = nAddress - CVpu::EE_ADDR_VU1AREA_START;
+		SyncVu1(CVu1Thread::SYNC_VU1REG);
 		HandleVu1AreaWrite(offset, nData);
 	}
 	else if(nAddress == CVpu::EE_ADDR_VU_FBRST)
 	{
+		SyncVu1(CVu1Thread::SYNC_VU1REG);
 		m_vpu1->SetFbrst((nData >> 8) & 0xF);
 	}
 	else if(nAddress == CVpu::EE_ADDR_VU_CMSAR1)
@@ -593,7 +672,15 @@ uint32 CSubSystem::IOPortWriteHandler(uint32 nAddress, uint32 nData)
 		bool validAddress = (nData & 0x7) == 0;
 		if(validAddress)
 		{
-			m_vpu1->ExecuteMicroProgram(nData);
+			PROFILE_COUNT(PCNT_VU1_CMSAR, 1);
+			if(m_vu1Threaded)
+			{
+				m_vu1Thread->PushStartMicroProgram(nData);
+			}
+			else
+			{
+				m_vpu1->ExecuteMicroProgram(nData);
+			}
 		}
 	}
 	else if(nAddress >= 0x12000000 && nAddress <= 0x1200108C)
@@ -684,24 +771,154 @@ void CSubSystem::Vu0StateChanged(CVpu::VU_STATE newState)
 uint32 CSubSystem::Vu1MicroMemWriteHandler(uint32 address, uint32 value)
 {
 	uint32 baseAddress = (address - PS2::MICROMEM1ADDR) & ~0x03;
+	SyncVu1(CVu1Thread::SYNC_VU1MEM);
 	*reinterpret_cast<uint32*>(m_microMem1 + baseAddress) = value;
-	m_vpu1->InvalidateMicroProgram(baseAddress, baseAddress + 4);
+	if(m_vu1Threaded)
+	{
+		m_vu1Thread->PushFunction([this, baseAddress]() { m_vpu1->InvalidateMicroProgram(baseAddress, baseAddress + 4); });
+	}
+	else
+	{
+		m_vpu1->InvalidateMicroProgram(baseAddress, baseAddress + 4);
+	}
 	return 0;
+}
+
+uint32 CSubSystem::Vu1MemReadHandler(uint32 address)
+{
+	//Returns the word holding 'address', shifted so byte/half reads get the right bits
+	PROFILE_COUNT(PCNT_VU1_MEM_EE, 1);
+	SyncVu1(CVu1Thread::SYNC_VU1MEM);
+	uint32 offset = (address - PS2::VUMEM1ADDR) & (PS2::VUMEM1SIZE - 1);
+	return *reinterpret_cast<uint32*>(m_vuMem1 + (offset & ~0x03)) >> ((offset & 0x03) * 8);
+}
+
+uint32 CSubSystem::MicroMem1ReadHandler(uint32 address)
+{
+	PROFILE_COUNT(PCNT_VU1_MEM_EE, 1);
+	SyncVu1(CVu1Thread::SYNC_VU1MEM);
+	uint32 offset = (address - PS2::MICROMEM1ADDR) & (PS2::MICROMEM1SIZE - 1);
+	return *reinterpret_cast<uint32*>(m_microMem1 + (offset & ~0x03)) >> ((offset & 0x03) * 8);
+}
+
+void CSubSystem::IoWriteHandler(uint32 address)
+{
+	//JIT store to VU1 data memory (micro memory writes have their own handler)
+	if((address >= PS2::VUMEM1ADDR) && (address < (PS2::VUMEM1ADDR + PS2::VUMEM1SIZE)))
+	{
+		PROFILE_COUNT(PCNT_VU1_MEM_EE, 1);
+		SyncVu1(CVu1Thread::SYNC_VU1MEM);
+	}
+}
+
+void CSubSystem::RunOnVu1Thread(CVu1Thread::FunctionType function)
+{
+	assert(m_vu1Threaded);
+	//Front data consumed so far goes first
+	m_vpu1->GetVif().ForwardConsumedData();
+	m_vu1Thread->PushFunction(std::move(function));
+}
+
+bool CSubSystem::IsVu1Threaded() const
+{
+	return m_vu1Threaded;
+}
+
+void CSubSystem::SyncVu1(CVu1Thread::SYNC_REASON reason)
+{
+	if(m_vu1Threaded) m_vu1Thread->Sync(reason);
+}
+
+std::unique_lock<std::mutex> CSubSystem::SyncVu1AndLockGif(CVu1Thread::SYNC_REASON reason)
+{
+	if(!m_vu1Threaded) return std::unique_lock<std::mutex>();
+	return m_vu1Thread->SyncAndLockGif(reason);
+}
+
+void CSubSystem::SwapVu1Executors()
+{
+	std::swap(m_VU1.m_executor, m_vu1InactiveExecutor);
+	std::swap(m_VU1.m_emptyBlockHandler, m_vu1InactiveEmptyBlockHandler);
+}
+
+void CSubSystem::SetVu1BlockNoClamping(const CVuExecutor::BlockNoClampingSet& blockNoClamping)
+{
+	SyncVu1();
+	static_cast<CVuExecutor*>(m_VU1.m_executor.get())->SetBlockNoClamping(blockNoClamping);
+	if(m_vu1InactiveExecutor)
+	{
+		static_cast<CVuExecutor*>(m_vu1InactiveExecutor.get())->SetBlockNoClamping(blockNoClamping);
+	}
+}
+
+bool CSubSystem::SetVu1Threaded(bool threaded)
+{
+	if(threaded == m_vu1Threaded) return true;
+	auto& frontVif = m_vpu1->GetVif();
+	if(threaded)
+	{
+		//A microprogram in progress can't be handed over, try again later
+		if(!m_vpu1->IsVuReady() || frontVif.IsWaitingForProgramEnd()) return false;
+		if(!m_vu1Thread)
+		{
+			m_vu1Thread = std::make_unique<CVu1Thread>(*m_vpu1, *m_vif1Back, m_gif);
+			m_vu1Thread->SetFlushHandler([this]() { m_vpu1->GetVif().ForwardConsumedData(); });
+			//Create the VU1 thread's executor on that thread
+			auto blockNoClamping = static_cast<CVuExecutor*>(m_VU1.m_executor.get())->GetBlockNoClamping();
+			m_vu1Thread->RunSync([this, &blockNoClamping]() {
+				auto vmEmptyBlockHandler = std::move(m_VU1.m_emptyBlockHandler);
+				m_VU1.m_emptyBlockHandler = nullptr;
+				auto executor = std::make_unique<CVuExecutor>(m_VU1, PS2::MICROMEM1SIZE);
+				executor->Reset(); //Initializes the block lookup table
+				executor->SetBlockNoClamping(blockNoClamping);
+				m_vu1InactiveExecutor = std::move(executor);
+				m_vu1InactiveEmptyBlockHandler = std::move(m_VU1.m_emptyBlockHandler);
+				m_VU1.m_emptyBlockHandler = std::move(vmEmptyBlockHandler);
+			});
+		}
+		else
+		{
+			//Micro memory may have changed since the VU1 thread last ran
+			auto executor = static_cast<CVuExecutor*>(m_vu1InactiveExecutor.get());
+			m_vu1Thread->RunSync([executor]() { executor->DropBlocks(); });
+		}
+		SwapVu1Executors();
+		m_vif1Back->SetRole(CVif::ROLE_BACK, nullptr);
+		m_vif1Back->CopyStateFrom(frontVif);
+		frontVif.SetRole(CVif::ROLE_FRONT, m_vu1Thread.get());
+		m_vpu1->SetRunToCompletion(true);
+		m_gif.SetVu1Thread(m_vu1Thread.get());
+		m_vu1Threaded = true;
+	}
+	else
+	{
+		m_vu1Thread->Sync();
+		static_cast<CVuExecutor*>(m_vu1InactiveExecutor.get())->DropBlocks();
+		SwapVu1Executors();
+		frontVif.CopyRowFrom(*m_vif1Back);
+		frontVif.SetRole(CVif::ROLE_NORMAL, nullptr);
+		m_vpu1->SetRunToCompletion(false);
+		m_gif.SetVu1Thread(nullptr);
+		m_vu1Threaded = false;
+	}
+	return true;
 }
 
 uint32 CSubSystem::Vu1IoPortReadHandler(uint32 address)
 {
 	uint32 result = 0xCCCCCCCC;
+	//Runs on the VU1 thread when it is enabled: TOP/ITOP come from the back decoder
+	auto& vif = m_vu1Threaded ? static_cast<CVif&>(*m_vif1Back) : m_vpu1->GetVif();
 	switch(address)
 	{
 	case CVpu::VU_ADDR_ITOP:
-		result = m_vpu1->GetVif().GetITOP();
+		result = vif.GetITOP();
 #ifdef __EMSCRIPTEN__
 		if(g_vuReplayIoActive) result = g_vuReplayItop;
 #endif
 		break;
 	case CVpu::VU_ADDR_TOP:
-		result = m_vpu1->GetVif().GetTOP();
+		result = vif.GetTOP();
 #ifdef __EMSCRIPTEN__
 		if(g_vuReplayIoActive) result = g_vuReplayTop;
 #endif

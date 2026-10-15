@@ -47,6 +47,8 @@ public:
 	void Reset();
 
 	void SetWorkThread();
+	//A second thread with its own zone accounting (VU1 thread), reported as "VU1:<zone>"
+	void SetSecondWorkThread();
 
 	//While the work thread is in 'zone', the sampler also records '*pc' in histogram 'slot'.
 	void SetPcSampler(unsigned int slot, ZoneHandle zone, const uint32* pc);
@@ -67,6 +69,11 @@ public:
 		return std::this_thread::get_id() == m_workThreadId;
 	}
 
+	bool IsSecondWorkThread() const
+	{
+		return std::this_thread::get_id() == m_secondWorkThreadId;
+	}
+
 private:
 	void SamplerThreadProc();
 
@@ -74,6 +81,10 @@ private:
 	std::atomic<uint64> m_zoneTimes[MAX_ZONES] = {};
 	std::stack<ZoneHandle> m_zoneStack;
 	std::atomic<int32> m_currentZone = -1;
+	std::atomic<uint64> m_secondZoneTimes[MAX_ZONES] = {};
+	std::stack<ZoneHandle> m_secondZoneStack;
+	std::atomic<int32> m_secondCurrentZone = -1;
+	std::thread::id m_secondWorkThreadId;
 
 	struct PC_SAMPLER
 	{
@@ -90,6 +101,37 @@ private:
 	std::thread::id m_workThreadId;
 	std::thread m_samplerThread;
 };
+
+//Event counters for profiling builds (any thread), reported by getProfile() as "counters".
+enum PROFILE_COUNTER
+{
+	PCNT_VIF1_DMA,
+	PCNT_VIF1_DMA_QW,
+	PCNT_VIF1_MSCAL,
+	PCNT_VIF1_UNPACK,
+	PCNT_VIF1_MPG,
+	PCNT_VIF1_DIRECT,
+	PCNT_VIF1_FLUSH,
+	PCNT_VIF1_IBIT,
+	PCNT_VIF1_MSKPATH3,
+	PCNT_VIF1_REGREAD,
+	PCNT_VIF1_FIFOREAD,
+	PCNT_PATH3_DMA,
+	PCNT_PATH3_DMA_QW,
+	PCNT_GIF_STAT_READ,
+	PCNT_VU1_MEM_EE,
+	PCNT_VU1_CMSAR,
+	PCNT_VU1_XGKICK,
+	PCNT_VU1_SYNC,
+	PCNT_MAX
+};
+extern std::atomic<uint32> g_profileCounters[PCNT_MAX];
+extern const char* const g_profileCounterNames[PCNT_MAX];
+#ifdef PROFILE
+#define PROFILE_COUNT(counter, value) g_profileCounters[counter].fetch_add(value, std::memory_order_relaxed)
+#else
+#define PROFILE_COUNT(counter, value)
+#endif
 
 class CProfilerZone
 {

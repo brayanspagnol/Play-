@@ -32,7 +32,7 @@
 //Requests come from the main thread; capture and replay run on the VM thread when VU1 starts a
 //program. XGKICKs are suppressed during replay and the live VU1 state is restored afterwards.
 extern bool g_vuContextPromotion;
-extern bool g_vuDiffSuppressKick;
+extern thread_local bool g_vuDiffSuppressKick;
 std::atomic<uint32> g_vuCaptureRequest = 0;
 std::atomic<uint32> g_vuReplayRequest = 0;
 int g_vuReplayExperiment = 0;
@@ -225,6 +225,11 @@ CVif& CVpu::GetVif()
 	return *m_vif.get();
 }
 
+void CVpu::SetRunToCompletion(bool runToCompletion)
+{
+	m_runToCompletion = runToCompletion;
+}
+
 void CVpu::SetFbrst(uint32 fbrst)
 {
 	//Only keep DE and TE bits
@@ -235,6 +240,7 @@ void CVpu::ExecuteMicroProgram(uint32 nAddress)
 {
 	CLog::GetInstance().Print(LOG_NAME, "Starting microprogram execution at 0x%08X.\r\n", nAddress);
 
+	if(m_number == 1) PROFILE_COUNT(PCNT_VIF1_MSCAL, 1);
 	m_ctx->m_State.nPC = nAddress;
 	m_ctx->m_State.pipeTime = 0;
 	m_ctx->m_State.pipeFmacWrite[0] = {};
@@ -259,8 +265,9 @@ void CVpu::ExecuteMicroProgram(uint32 nAddress)
 			g_vuCaptureRequest--;
 			VU_CAPTURE capture;
 			capture.address = nAddress;
-			capture.top = m_vif->GetTOP();
-			capture.itop = m_vif->GetITOP();
+			//Through the VU memory map: with VU1 threaded, TOP/ITOP come from the back decoder
+			capture.top = m_ctx->m_pMemoryMap->GetWord(VU_ADDR_TOP);
+			capture.itop = m_ctx->m_pMemoryMap->GetWord(VU_ADDR_ITOP);
 			memcpy(&capture.state, &m_ctx->m_State, sizeof(MIPSSTATE));
 			capture.microMem.assign(m_microMem, m_microMem + m_microMemSize);
 			capture.vuMem.assign(m_vuMem, m_vuMem + m_vuMemSize);
@@ -291,7 +298,7 @@ void CVpu::ExecuteMicroProgram(uint32 nAddress)
 	assert(m_vuState != VU_STATE_RUNNING);
 	m_vuState = VU_STATE_RUNNING;
 	VuStateChanged(m_vuState);
-	for(unsigned int i = 0; i < 100; i++)
+	for(unsigned int i = 0; m_runToCompletion || (i < 100); i++)
 	{
 		Execute(5000);
 		if(m_vuState != VU_STATE_RUNNING) break;
@@ -341,6 +348,7 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 	std::vector<uint8> liveMicroMem(m_microMem, m_microMem + m_microMemSize);
 	std::vector<uint8> liveVuMem(m_vuMem, m_vuMem + m_vuMemSize);
 	bool livePromotion = g_vuContextPromotion;
+	bool liveSuperBlocks = g_vuSuperBlocks;
 
 	//Keep captures that share a microprogram together: switching programs invalidates blocks
 	std::stable_sort(g_vuCaptures.begin(), g_vuCaptures.end(), [](const VU_CAPTURE& a, const VU_CAPTURE& b) {
@@ -379,14 +387,16 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 	g_vuDiffSuppressKick = true;
 	g_vuReplayIoActive = true;
 	int liveExperiment = g_vuExperiment;
-	//Variants alternate (reference, promoted, reference, promoted). Each starts from freshly
-	//instantiated blocks, so it first runs for a while to let the engine tier the code up.
-	for(int round = 0; round < 8; round++)
+	//Variants alternate (reference, promoted, promoted + superblocks, reference, ...). Each starts from
+	//freshly instantiated blocks, so it first runs for a while to let the engine tier the code up.
+	static const char* variantNames[3] = {"reference", "promoted", "superblocks"};
+	for(int round = 0; round < 9; round++)
 	{
-		int variant = round & 1;
-		g_vuContextPromotion = (variant == 1);
-		g_vuExperiment = (variant == 1) ? g_vuReplayExperiment : 0;
-		static_cast<CVuExecutor*>(m_ctx->m_executor.get())->ResetBlocks();
+		int variant = round % 3;
+		g_vuContextPromotion = (variant != 0);
+		g_vuSuperBlocks = (variant == 2);
+		g_vuExperiment = (variant != 0) ? g_vuReplayExperiment : 0;
+		static_cast<CVuExecutor*>(m_ctx->m_executor.get())->DropBlocks();
 		std::vector<uint64> hashes;
 		for(const auto& capture : g_vuCaptures) hashes.push_back(runCapture(capture, true));
 		double warmStart = emscripten_get_now();
@@ -417,7 +427,7 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 			for(size_t i = 0; i < hashes.size(); i++) mismatches += (hashes[i] != refHashes[i]) ? 1 : 0;
 		}
 		result += string_format("%s: %.1f us/program (%u programs x %u), mismatches %u\n",
-		                        variant ? "promoted" : "reference", elapsed * 1000.0 / (iterations * g_vuCaptures.size()),
+		                        variantNames[variant], elapsed * 1000.0 / (iterations * g_vuCaptures.size()),
 		                        static_cast<uint32>(g_vuCaptures.size()), iterations, mismatches);
 	}
 	g_vuDiffSuppressKick = false;
@@ -426,10 +436,11 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 
 	//Back to the live program
 	g_vuContextPromotion = livePromotion;
+	g_vuSuperBlocks = liveSuperBlocks;
 	memcpy(&m_ctx->m_State, &liveState, sizeof(MIPSSTATE));
 	memcpy(m_microMem, liveMicroMem.data(), m_microMemSize);
 	memcpy(m_vuMem, liveVuMem.data(), m_vuMemSize);
-	static_cast<CVuExecutor*>(m_ctx->m_executor.get())->ResetBlocks();
+	static_cast<CVuExecutor*>(m_ctx->m_executor.get())->DropBlocks();
 
 	std::lock_guard<std::mutex> lock(g_vuReplayResultMutex);
 	g_vuReplayResult = result;
@@ -448,6 +459,7 @@ void CVpu::InvalidateMicroProgram(uint32 start, uint32 end)
 
 void CVpu::ProcessXgKick(uint32 address)
 {
+	PROFILE_COUNT(PCNT_VU1_XGKICK, 1);
 	address &= 0x3FF;
 	address *= 0x10;
 

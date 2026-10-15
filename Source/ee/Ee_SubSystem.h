@@ -7,6 +7,9 @@
 #include "GIF.h"
 #include "SIF.h"
 #include "Vpu.h"
+#include "Vif1.h"
+#include "Vu1Thread.h"
+#include "VuExecutor.h"
 #include "IPU.h"
 #include "INTC.h"
 #include "Timer.h"
@@ -40,6 +43,17 @@ namespace Ee
 
 		void SetVpu0(std::shared_ptr<CVpu>);
 		void SetVpu1(std::shared_ptr<CVpu>);
+
+		//VU1 on its own thread (see Vu1Thread.h). Must be called from the VM thread.
+		bool SetVu1Threaded(bool);
+		bool IsVu1Threaded() const;
+		//Waits for the VU1 thread to be idle (no-op if VU1 is not threaded)
+		//Runs a function on the VU1 thread after the work queued so far (VU1 must be threaded)
+		void RunOnVu1Thread(CVu1Thread::FunctionType);
+		void SyncVu1(CVu1Thread::SYNC_REASON = CVu1Thread::SYNC_OTHER);
+		std::unique_lock<std::mutex> SyncVu1AndLockGif(CVu1Thread::SYNC_REASON = CVu1Thread::SYNC_OTHER);
+		//Sets the per game VU1 settings on both VU1 executors (VM thread and VU1 thread)
+		void SetVu1BlockNoClamping(const CVuExecutor::BlockNoClampingSet&);
 
 		uint8* m_ram = nullptr;
 		uint8* m_bios = nullptr;
@@ -110,8 +124,21 @@ namespace Ee
 		void LoadBIOS();
 		void FillFakeIopRam();
 
+		uint32 Vu1MemReadHandler(uint32);
+		uint32 MicroMem1ReadHandler(uint32);
+		void IoWriteHandler(uint32);
+
 		StatusRegisterCheckerMap m_statusRegisterCheckers;
 		bool m_isIdle = false;
+
+		std::unique_ptr<CVif1> m_vif1Back;
+		std::unique_ptr<CVu1Thread> m_vu1Thread;
+		bool m_vu1Threaded = false;
+		//JIT blocks only run on the thread that compiled them (per worker wasm function tables, including
+		//the executor's empty block), so each thread has its own VU1 executor. The one not in use is kept here.
+		std::unique_ptr<CMipsExecutor> m_vu1InactiveExecutor;
+		std::function<void(CMIPS*)> m_vu1InactiveEmptyBlockHandler;
+		void SwapVu1Executors();
 
 		CMA_VU m_MAVU0;
 		CMA_VU m_MAVU1;

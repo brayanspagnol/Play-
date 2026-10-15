@@ -52,16 +52,22 @@ void CVuBasicBlock::SetReferenceBlockProvider(ReferenceBlockProvider provider)
 	m_referenceBlockProvider = std::move(provider);
 }
 
+void CVuBasicBlock::SetNoSelfLoop()
+{
+	m_noSelfLoop = true;
+	AddCacheVariant(0x10000000);
+}
+
 void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
 {
-	if(IsSuperBlock() && m_compileOptimized)
+	if(IsSuperBlock())
 	{
 		CompileSuperBlock(jitter);
 		return;
 	}
 	CompileProlog(jitter);
 	jitter->MarkFirstBlockLabel();
-	CompileBody(jitter, true);
+	CompileBody(jitter, !m_noSelfLoop);
 }
 
 void CVuBasicBlock::CompileSuperBlock(CMipsJitter* jitter)
@@ -900,7 +906,7 @@ CVuBasicBlock::BlockFmacPipelineInfo CVuBasicBlock::ComputeFmacStallDelays(uint3
 }
 
 #ifdef __EMSCRIPTEN__
-extern bool g_vuDiffSuppressKick;
+extern thread_local bool g_vuDiffSuppressKick;
 void VuDiffCompare(uint32 begin, uint32 end, const MIPSSTATE& refState, const MIPSSTATE& newState, const uint8* refMem, const uint8* newMem, uint32 dataSize);
 
 void CVuBasicBlock::ExecuteDiff()
@@ -914,8 +920,8 @@ void CVuBasicBlock::ExecuteDiff()
 	//reference blocks run one at a time from the same state, like the executor would do.
 	uint32 dataSize = m_diffDataSize;
 	auto dataMem = reinterpret_cast<uint8*>(m_context.m_vuMem);
-	static MIPSSTATE initState, newState;
-	static std::vector<uint8> initMem, newMem;
+	static thread_local MIPSSTATE initState, newState;
+	static thread_local std::vector<uint8> initMem, newMem;
 	initMem.resize(dataSize);
 	newMem.resize(dataSize);
 

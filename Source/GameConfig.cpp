@@ -67,7 +67,6 @@ void CGameConfig::ApplyGameConfig(CPS2VM& virtualMachine)
 
 	const char* executableName = virtualMachine.m_ee->m_os->GetExecutableName();
 	auto eeExecutor = static_cast<CEeExecutor*>(virtualMachine.m_ee->m_EE.m_executor.get());
-	auto vu1Executor = static_cast<CVuExecutor*>(virtualMachine.m_ee->m_vpu1->GetContext().m_executor.get());
 	auto eeRam = virtualMachine.m_ee->m_ram;
 
 	for(Framework::Xml::CFilteringNodeIterator itNode(gameConfigsNode, "GameConfig");
@@ -200,7 +199,17 @@ void CGameConfig::ApplyGameConfig(CPS2VM& virtualMachine)
 		eeExecutor->SetBlockFpUseAccurateAddSub(std::move(blockFpUseAccurateAddSub));
 		eeExecutor->SetIdleLoopBlocks(std::move(idleLoopBlocks));
 
-		vu1Executor->SetBlockNoClamping(std::move(blockNoClamping));
+		virtualMachine.m_ee->SetVu1BlockNoClamping(blockNoClamping);
+
+		for(Framework::Xml::CFilteringNodeIterator itNode(gameConfigNode, "Vu1Threaded");
+		    !itNode.IsEnd(); itNode++)
+		{
+			const char* enabledString = (*itNode)->GetAttribute("Enabled");
+			if(enabledString && !strcmp(enabledString, "false"))
+			{
+				virtualMachine.SetGameAllowsVu1Threaded(false);
+			}
+		}
 
 		break;
 	}

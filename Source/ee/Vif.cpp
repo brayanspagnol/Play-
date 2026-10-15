@@ -10,6 +10,7 @@
 #include "Vpu.h"
 #include "Vif.h"
 #include "INTC.h"
+#include "Vu1Thread.h"
 
 #define LOG_NAME ("ee_vif")
 
@@ -102,7 +103,7 @@ uint32 CVif::GetRegister(uint32 address)
 			//Some games will keep reading this register in a loop to verify the state of the VEW bit.
 			//- Red Faction
 			//- RPG Maker 3
-			if(m_vpu.IsVuReady())
+			if(IsVuReadyForVif())
 			{
 				m_STAT.nVEW = 0;
 			}
@@ -353,7 +354,7 @@ uint32 CVif::GetITOP() const
 
 uint32 CVif::ReceiveDMA(uint32 address, uint32 qwc, uint32 unused, bool tagIncluded)
 {
-	if(m_STAT.nVEW && !m_vpu.IsVuReady())
+	if(m_STAT.nVEW && !IsVuReadyForVif())
 	{
 		//Is waiting for program end, don't bother
 		return 0;
@@ -368,9 +369,15 @@ uint32 CVif::ReceiveDMA(uint32 address, uint32 qwc, uint32 unused, bool tagInclu
 	                          m_number, address, qwc, static_cast<int>(tagIncluded));
 #endif
 
+	if(m_number == 1)
+	{
+		PROFILE_COUNT(PCNT_VIF1_DMA, 1);
+		PROFILE_COUNT(PCNT_VIF1_DMA_QW, qwc);
+	}
 	m_stream.SetDmaParams(address, qwc * 0x10, tagIncluded);
 
 	ProcessPacket(m_stream);
+	ForwardConsumedData();
 
 	uint32 remainingSize = m_stream.GetRemainingDmaTransferSize();
 	assert((remainingSize & 0x0F) == 0);
@@ -398,6 +405,7 @@ void CVif::ProcessFifoWrite(uint32 address, uint32 value)
 		m_fifoIndex += 0x10;
 		m_stream.SetFifoParams(m_fifoBuffer, m_fifoIndex);
 		ProcessPacket(m_stream);
+		ForwardConsumedData();
 		uint32 newIndex = m_stream.GetRemainingDmaTransferSize();
 		uint32 discardSize = m_fifoIndex - newIndex;
 		memmove(m_fifoBuffer, m_fifoBuffer + discardSize, newIndex);
@@ -426,7 +434,7 @@ void CVif::ProcessPacket(StreamType& stream)
 		}
 		if(m_STAT.nVEW == 1)
 		{
-			if(!m_vpu.IsVuReady()) break;
+			if(!IsVuReadyForVif()) break;
 			m_STAT.nVEW = 0;
 			//Command is waiting for micro-program to end.
 			ExecuteCommand(stream, m_CODE);
@@ -443,12 +451,17 @@ void CVif::ProcessPacket(StreamType& stream)
 		if(m_CODE.nI != 0)
 		{
 			//Next command will be stalled (if not MARK)
-			if(m_CODE.nCMD != CODE_CMD_MARK)
+			//(the back decoder only sees data the front already let through)
+			if((m_CODE.nCMD != CODE_CMD_MARK) && (m_role != ROLE_BACK))
 			{
 				m_STAT.nVIS = 1;
 			}
-			m_STAT.nINT = 1;
-			m_interruptDelayTicks = 0x1000;
+			if(m_role != ROLE_BACK)
+			{
+				m_STAT.nINT = 1;
+				m_interruptDelayTicks = 0x1000;
+			}
+			if(m_number == 1) PROFILE_COUNT(PCNT_VIF1_IBIT, 1);
 		}
 
 		switch(m_CODE.nCMD)
@@ -510,7 +523,8 @@ void CVif::ExecuteCommand(StreamType& stream, CODE nCommand)
 		m_STAT.nMRK = 1;
 		break;
 	case CODE_CMD_FLUSHE:
-		if(!m_vpu.IsVuReady())
+		if(m_number == 1) PROFILE_COUNT(PCNT_VIF1_FLUSH, 1);
+		if(!IsVuReadyForVif())
 		{
 			m_STAT.nVEW = 1;
 		}
@@ -547,7 +561,7 @@ void CVif::ExecuteCommand(StreamType& stream, CODE nCommand)
 			m_STAT.nVEW = 1;
 			return;
 		}
-		StartMicroProgram(m_vpu.GetContext().m_State.nPC);
+		StartMicroProgram((m_role == ROLE_FRONT) ? 0 : m_vpu.GetContext().m_State.nPC);
 		break;
 	case CODE_CMD_STMASK:
 		Cmd_STMASK(stream, nCommand);
@@ -584,14 +598,20 @@ void CVif::Cmd_MPG(StreamType& stream, CODE nCommand)
 	uint32 nDstAddr = (m_CODE.nIMM * 8) + nTransfered;
 	nDstAddr &= (m_vpu.GetMicroMemorySize() - 1);
 
+	if(m_number == 1) PROFILE_COUNT(PCNT_VIF1_MPG, 1);
 	//Check if microprogram is running
-	if(!m_vpu.IsVuReady())
+	if(!IsVuReadyForVif())
 	{
 		m_STAT.nVEW = 1;
 		return;
 	}
 
-	if(nSize != 0)
+	if((nSize != 0) && (m_role == ROLE_FRONT))
+	{
+		//Consume the data, the back decoder writes it to micro memory
+		stream.Skip(nSize);
+	}
+	else if(nSize != 0)
 	{
 		auto microMem = m_vpu.GetMicroMemory();
 		auto copyToMicroMem =
@@ -696,6 +716,12 @@ void CVif::Cmd_STMASK(StreamType& stream, CODE command)
 
 void CVif::Cmd_UNPACK(StreamType& stream, CODE nCommand, uint32 nDstAddr)
 {
+	if(m_role == ROLE_FRONT)
+	{
+		SkipUnpack(stream, nCommand);
+		return;
+	}
+
 	uint32 cl = m_CYCLE.nCL;
 	uint32 wl = m_CYCLE.nWL;
 	if(wl == 0)
@@ -724,7 +750,7 @@ void CVif::PrepareMicroProgram()
 
 void CVif::StartMicroProgram(uint32 address)
 {
-	if(!m_vpu.IsVuReady())
+	if(!IsVuReadyForVif())
 	{
 		m_STAT.nVEW = 1;
 		return;
@@ -732,7 +758,7 @@ void CVif::StartMicroProgram(uint32 address)
 
 	assert(!m_STAT.nVEW);
 	PrepareMicroProgram();
-	m_vpu.ExecuteMicroProgram(address);
+	ExecuteMicroProgram(address);
 }
 
 void CVif::StartDelayedMicroProgram(uint32 address)
@@ -740,7 +766,7 @@ void CVif::StartDelayedMicroProgram(uint32 address)
 	//Snowblind Studio games start a VU microprogram and issues an UNPACK command
 	//which has data needed by the microprogram. We simulate the microprogram
 	//starting a bit later to let the UNPACK command execute
-	if(!m_vpu.IsVuReady())
+	if(!IsVuReadyForVif())
 	{
 		m_STAT.nVEW = 1;
 		return;
@@ -756,8 +782,8 @@ bool CVif::ResumeDelayedMicroProgram()
 	if(m_pendingMicroProgram != -1)
 	{
 		assert(!IsWaitingForProgramEnd());
-		assert(m_vpu.IsVuReady());
-		m_vpu.ExecuteMicroProgram(m_pendingMicroProgram);
+		assert(IsVuReadyForVif());
+		ExecuteMicroProgram(m_pendingMicroProgram);
 		m_pendingMicroProgram = -1;
 		return true;
 	}
@@ -994,7 +1020,31 @@ void CVif::CFifoStream::SetDmaParams(uint32 address, uint32 size, bool tagInclud
 	m_nextAddress = address;
 	m_endAddress = address + size;
 	m_tagIncluded = tagIncluded;
+	m_forwardAddress = address;
+	m_initialTagIncluded = tagIncluded;
 	SyncBuffer();
+}
+
+void CVif::CFifoStream::SetRawParams(uint8* source, uint32 size, bool tagIncluded)
+{
+	m_source = source;
+	m_startAddress = 0;
+	m_nextAddress = 0;
+	m_endAddress = size;
+	m_tagIncluded = tagIncluded;
+	m_forwardAddress = 0;
+	m_initialTagIncluded = tagIncluded;
+	SyncBuffer();
+}
+
+bool CVif::CFifoStream::TakeLoaded(const uint8*& data, uint32& size, bool& tagIncluded)
+{
+	assert(m_forwardAddress <= m_nextAddress);
+	data = m_source + m_forwardAddress;
+	size = m_nextAddress - m_forwardAddress;
+	tagIncluded = m_initialTagIncluded && (m_forwardAddress == m_startAddress);
+	m_forwardAddress = m_nextAddress;
+	return size != 0;
 }
 
 void CVif::CFifoStream::SetFifoParams(uint8* source, uint32 size)
@@ -1004,6 +1054,8 @@ void CVif::CFifoStream::SetFifoParams(uint8* source, uint32 size)
 	m_nextAddress = 0;
 	m_endAddress = size;
 	m_tagIncluded = false;
+	m_forwardAddress = 0;
+	m_initialTagIncluded = false;
 	SyncBuffer();
 }
 
@@ -1069,4 +1121,164 @@ uint32 CVif::CFifoStream::GetBufferPosition() const
 void CVif::CFifoStream::SetBufferPosition(uint32 bufferPosition)
 {
 	m_bufferPosition = bufferPosition;
+}
+
+//VU1 threading
+//--------------------------------------------------
+
+void CVif::SetRole(ROLE role, CVu1Thread* vu1Thread)
+{
+	m_role = role;
+	m_vu1Thread = vu1Thread;
+}
+
+void CVif::ExecuteMicroProgram(uint32 address)
+{
+	//The front only tracks VIF state, the back runs the program
+	if(m_role == ROLE_FRONT) return;
+	m_vpu.ExecuteMicroProgram(address);
+}
+
+void CVif::ForwardConsumedData()
+{
+	if(m_role != ROLE_FRONT) return;
+	const uint8* data = nullptr;
+	uint32 size = 0;
+	bool tagIncluded = false;
+	if(m_stream.TakeLoaded(data, size, tagIncluded))
+	{
+		m_vu1Thread->PushVifData(data, size, tagIncluded);
+	}
+}
+
+void CVif::BeginForwardedData(uint8* data, uint32 size, bool tagIncluded)
+{
+	assert(m_role == ROLE_BACK);
+	m_stream.SetRawParams(data, size, tagIncluded);
+}
+
+bool CVif::ProcessForwardedData()
+{
+	ProcessPacket(m_stream);
+	return m_stream.GetRemainingDmaTransferSize() == 0;
+}
+
+void CVif::SkipUnpack(StreamType& stream, CODE nCommand)
+{
+	//Same control flow as Unpack, without reading the values or writing VU memory.
+	static const uint8 elementSizes[0x10] = {4, 2, 1, 0, 8, 4, 2, 0, 12, 6, 3, 0, 16, 8, 4, 2};
+	uint32 elementSize = elementSizes[nCommand.nCMD & 0x0F];
+	assert(elementSize != 0);
+
+	uint32 cl = m_CYCLE.nCL;
+	uint32 wl = m_CYCLE.nWL;
+	if(wl == 0)
+	{
+		wl = UINT_MAX;
+		cl = 0;
+	}
+	bool clGreaterEqualWl = (cl >= wl);
+
+	if(m_NUM == nCommand.nNUM)
+	{
+		m_readTick = 0;
+		m_writeTick = 0;
+	}
+
+	uint32 currentNum = (m_NUM == 0) ? 256 : m_NUM;
+	if(clGreaterEqualWl)
+	{
+		//Groups of cl ticks: wl vectors read, then (cl - wl) skipped without data
+		while(currentNum != 0)
+		{
+			if(m_readTick < wl)
+			{
+				uint32 count = std::min<uint32>(std::min<uint32>(wl - m_readTick, currentNum), stream.GetAvailableReadBytes() / elementSize);
+				if(count == 0) break;
+				stream.Skip(count * elementSize);
+				currentNum -= count;
+				m_readTick += count;
+				m_writeTick = std::min<uint32>(m_writeTick + count, wl);
+			}
+			else
+			{
+				m_readTick = cl;
+			}
+			if(m_readTick == cl)
+			{
+				m_writeTick = 0;
+				m_readTick = 0;
+			}
+		}
+	}
+	while(!clGreaterEqualWl && (currentNum != 0))
+	{
+		bool mustRead = clGreaterEqualWl ? (m_readTick < wl) : (m_writeTick < cl);
+		if(mustRead)
+		{
+			if(stream.GetAvailableReadBytes() < elementSize) break;
+			stream.Skip(elementSize);
+		}
+		if(mustRead || !clGreaterEqualWl)
+		{
+			currentNum--;
+		}
+
+		m_writeTick = std::min<uint32>(m_writeTick + 1, wl);
+		m_readTick = std::min<uint32>(m_readTick + 1, cl);
+		if(clGreaterEqualWl ? (m_readTick == cl) : (m_writeTick == wl))
+		{
+			m_writeTick = 0;
+			m_readTick = 0;
+		}
+	}
+
+	if(currentNum != 0)
+	{
+		m_STAT.nVPS = 1;
+	}
+	else
+	{
+		stream.Align32();
+		m_STAT.nVPS = 0;
+	}
+
+	m_NUM = static_cast<uint8>(currentNum);
+}
+
+void CVif::CopyStateFrom(const CVif& src)
+{
+	m_STAT = src.m_STAT;
+	m_ERR = src.m_ERR;
+	m_CYCLE = src.m_CYCLE;
+	m_CODE = src.m_CODE;
+	m_NUM = src.m_NUM;
+	m_MODE = src.m_MODE;
+	memcpy(m_R, src.m_R, sizeof(m_R));
+	memcpy(m_C, src.m_C, sizeof(m_C));
+	m_MASK = src.m_MASK;
+	m_MARK = src.m_MARK;
+	m_ITOP = src.m_ITOP;
+	m_ITOPS = src.m_ITOPS;
+	m_readTick = src.m_readTick;
+	m_writeTick = src.m_writeTick;
+	m_pendingMicroProgram = src.m_pendingMicroProgram;
+	m_incomingFifoDelay = src.m_incomingFifoDelay;
+	m_interruptDelayTicks = src.m_interruptDelayTicks;
+	memcpy(m_fifoBuffer, src.m_fifoBuffer, sizeof(m_fifoBuffer));
+	m_fifoIndex = src.m_fifoIndex;
+	m_stream.SetBuffer(src.m_stream.GetBuffer());
+	m_stream.SetBufferPosition(src.m_stream.GetBufferPosition());
+	if(m_role == ROLE_BACK)
+	{
+		//Interrupt stalls are handled by the front
+		m_STAT.nVIS = 0;
+		m_STAT.nINT = 0;
+		m_interruptDelayTicks = 0;
+	}
+}
+
+void CVif::CopyRowFrom(const CVif& src)
+{
+	memcpy(m_R, src.m_R, sizeof(m_R));
 }

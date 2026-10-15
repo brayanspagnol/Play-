@@ -332,6 +332,7 @@ uint32 CDMAC::ReceiveDMA9(uint32 nSrcAddress, uint32 nCount, uint32 unused, bool
 	{
 		nSrcAddress -= PS2::VUMEM1ADDR;
 		nSrcAddress &= (PS2::VUMEM1SIZE - 1);
+		if(Vu1MemoryAccessHandler) Vu1MemoryAccessHandler();
 		srcPtr = m_vuMem1;
 	}
 	else
