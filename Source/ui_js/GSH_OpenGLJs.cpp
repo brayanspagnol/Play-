@@ -9,6 +9,11 @@ EM_JS(void, GsJs_CreateCanvas, (int width, int height), {
 	specialHTMLTargets["#gsCanvas"] = new OffscreenCanvas(width, height);
 });
 
+EM_JS(void, GsJs_ResizeCanvas, (int width, int height), {
+	GLctx.canvas.width = width;
+	GLctx.canvas.height = height;
+});
+
 EM_JS(void, GsJs_Present, (), {
 	// Only complete frames ever reach the page (no cleared or half-drawn buffer can be shown).
 	var bitmap = GLctx.canvas.transferToImageBitmap();
@@ -50,6 +55,22 @@ void CGSH_OpenGLJs::InitializeContext()
 void CGSH_OpenGLJs::ReleaseImpl()
 {
 	CGSH_OpenGL::ReleaseImpl();
+}
+
+void CGSH_OpenGLJs::SetOutput(int width, int height, PRESENTATION_MODE mode)
+{
+	SendGSCall([this, width, height, mode]() {
+		m_width = width;
+		m_height = height;
+		if(m_context > 0) GsJs_ResizeCanvas(width, height);
+		PRESENTATION_PARAMS params;
+		params.mode = mode;
+		params.windowWidth = width;
+		params.windowHeight = height;
+		SetPresentationParams(params);
+		//Reloads the resolution factor/texture filtering preferences and drops the framebuffers made with the old ones
+		NotifyPreferencesChangedImpl();
+	});
 }
 
 void CGSH_OpenGLJs::PresentBackbuffer()

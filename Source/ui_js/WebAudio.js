@@ -255,6 +255,8 @@ Module["webAudioStart"] = function(ring) {
 	const stats = new SharedArrayBuffer(8 * 80);
 	const statsView = new Float64Array(stats);
 	const ctx = new AudioContext({ sampleRate: 44100, latencyHint: "interactive" });
+	const gain = ctx.createGain(); // page volume (Module.setAudioVolume)
+	gain.connect(ctx.destination);
 	let node = null;
 	const url = URL.createObjectURL(new Blob(["(" + playAudioWorkletMain.toString() + ")();"], { type: "text/javascript" }));
 	ctx.audioWorklet.addModule(url).then(() => {
@@ -262,7 +264,7 @@ Module["webAudioStart"] = function(ring) {
 			numberOfInputs: 0, outputChannelCount: [2],
 			processorOptions: { memory: HEAPU8.buffer, ring, stats },
 		});
-		node.connect(ctx.destination);
+		node.connect(gain);
 	}, (e) => console.error("Audio worklet failed to load:", e));
 
 	// Autoplay policy: the context may only start after a user gesture; hidden tab: suspend.
@@ -273,6 +275,9 @@ Module["webAudioStart"] = function(ring) {
 
 	const hdr = () => new Uint32Array(HEAPU8.buffer, ring, 4);
 	Module["audioContext"] = ctx;
+	// Output volume, 0 (mute) to 1 (unchanged); a 15 ms ramp avoids clicks.
+	Module["setAudioVolume"] = (volume) => gain.gain.setTargetAtTime(Math.max(0, Math.min(1, +volume || 0)), ctx.currentTime, 0.015);
+	Module["getAudioVolume"] = () => gain.gain.value;
 	// Output statistics: counters are cumulative since start, histograms count 128-frame render quanta.
 	Module["audioStats"] = () => {
 		const s = statsView;

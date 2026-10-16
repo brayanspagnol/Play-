@@ -406,6 +406,53 @@ void setFrameLimit(bool enabled)
 	g_virtualMachine->ReloadFrameRateLimit();
 }
 
+//Page settings: GS internal resolution (1 = native), forced bilinear texture filtering, widescreen
+//(16:9 output) and presentation mode (CGSHandler::PRESENTATION_MODE). The output canvas grows with the
+//resolution factor so the page gets the full-resolution frames (640x480 or 854x480 per unit of factor).
+void setGsOptions(int resolutionFactor, bool forceBilinear, bool widescreen, int presentationMode)
+{
+	resolutionFactor = std::clamp(resolutionFactor, 1, 4);
+	if(presentationMode < CGSHandler::PRESENTATION_MODE_FILL || presentationMode > CGSHandler::PRESENTATION_MODE_ORIGINAL)
+	{
+		presentationMode = CGSHandler::PRESENTATION_MODE_FIT;
+	}
+	auto& config = CAppConfig::GetInstance();
+	config.SetPreferenceInteger(PREF_CGSH_OPENGL_RESOLUTION_FACTOR, resolutionFactor);
+	config.SetPreferenceBoolean(PREF_CGSH_OPENGL_FORCEBILINEARTEXTURES, forceBilinear);
+	config.SetPreferenceBoolean(PREF_CGSHANDLER_WIDESCREEN, widescreen);
+	config.SetPreferenceInteger(PREF_CGSHANDLER_PRESENTATION_MODE, presentationMode);
+	auto gs = static_cast<CGSH_OpenGLJs*>(g_virtualMachine->GetGSHandler());
+	gs->SetOutput((widescreen ? 854 : 640) * resolutionFactor, 480 * resolutionFactor, static_cast<CGSHandler::PRESENTATION_MODE>(presentationMode));
+}
+
+//Replaces the keyboard/gamepad bindings: keys = [[KeyboardEvent.code, PS2 button, positive], ...]
+//(button = PS2::CControllerInfo::BUTTON, positive only matters for axes), pad = PS2 button per standard
+//gamepad button index (-1 or missing = unbound).
+void setInputBindings(emscripten::val keys, emscripten::val pad)
+{
+	std::vector<CInputProviderEmscripten::KEYBINDING> keyBindings;
+	uint32 keyCount = keys["length"].as<uint32>();
+	for(uint32 i = 0; i < keyCount; i++)
+	{
+		auto entry = keys[i];
+		int button = entry[1].as<int>();
+		if(button < 0 || button >= PS2::CControllerInfo::MAX_BUTTONS) continue;
+		keyBindings.push_back({entry[0].as<std::string>(), static_cast<PS2::CControllerInfo::BUTTON>(button), entry[2].as<bool>()});
+	}
+	int padButtons[CInputProviderEmscripten::MAX_PAD_BUTTONS];
+	uint32 padCount = pad["length"].as<uint32>();
+	for(uint32 i = 0; i < CInputProviderEmscripten::MAX_PAD_BUTTONS; i++)
+	{
+		padButtons[i] = (i < padCount) ? pad[i].as<int>() : -1;
+	}
+	g_inputProvider->SetBindings(std::move(keyBindings), padButtons);
+}
+
+void setGamepadEnabled(bool enabled)
+{
+	g_inputProvider->SetGamepadEnabled(enabled);
+}
+
 //EE underclock (numerator/denominator of the real EE clock), like PCSX2's EE cycle rate:
 //the EE gets fewer cycles per vblank while IOP, SPU and vblank timing stay real time.
 void setEeFrequencyScale(int numerator, int denominator)
@@ -585,6 +632,9 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("loadState", &loadState);
 	function("stateStatus", &stateStatus);
 	function("setFrameLimit", &setFrameLimit);
+	function("setGsOptions", &setGsOptions);
+	function("setInputBindings", &setInputBindings);
+	function("setGamepadEnabled", &setGamepadEnabled);
 	function("setVu1Threaded", &setVu1Threaded);
 	function("setEeFrequencyScale", &setEeFrequencyScale);
 	function("blockCacheEnable", &BlockCache::SetEnabled);

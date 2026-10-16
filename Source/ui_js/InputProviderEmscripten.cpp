@@ -12,15 +12,9 @@ constexpr double TRIGGER_THRESHOLD = 0.3;
 
 namespace
 {
-	struct KEYMAP
-	{
-		const char* code;
-		CControllerInfo::BUTTON button;
-		bool positive; // axes only: key pushes toward 0xFF (right/down)
-	};
-
-	// Same keys as the original Play! web build.
-	const KEYMAP g_keyMap[] =
+	// Same keys as the original Play! web build (which used "Key1" etc. for the digit keys:
+	// KeyboardEvent.code is "Digit1", so L1/L2/L3/R1/R2/R3 never worked from the keyboard).
+	const CInputProviderEmscripten::KEYBINDING g_defaultKeyMap[] =
 	    {
 	        {"Enter", CControllerInfo::START, false},
 	        {"Backspace", CControllerInfo::SELECT, false},
@@ -32,12 +26,12 @@ namespace
 	        {"KeyZ", CControllerInfo::CROSS, false},
 	        {"KeyS", CControllerInfo::TRIANGLE, false},
 	        {"KeyX", CControllerInfo::CIRCLE, false},
-	        {"Key1", CControllerInfo::L1, false},
-	        {"Key2", CControllerInfo::L2, false},
-	        {"Key3", CControllerInfo::L3, false},
-	        {"Key8", CControllerInfo::R1, false},
-	        {"Key9", CControllerInfo::R2, false},
-	        {"Key0", CControllerInfo::R3, false},
+	        {"Digit1", CControllerInfo::L1, false},
+	        {"Digit2", CControllerInfo::L2, false},
+	        {"Digit3", CControllerInfo::L3, false},
+	        {"Digit8", CControllerInfo::R1, false},
+	        {"Digit9", CControllerInfo::R2, false},
+	        {"Digit0", CControllerInfo::R3, false},
 	        {"KeyF", CControllerInfo::ANALOG_LEFT_X, false},
 	        {"KeyH", CControllerInfo::ANALOG_LEFT_X, true},
 	        {"KeyT", CControllerInfo::ANALOG_LEFT_Y, false},
@@ -48,8 +42,8 @@ namespace
 	        {"KeyK", CControllerInfo::ANALOG_RIGHT_Y, true},
 	};
 
-	// W3C "standard" gamepad button index -> PS2 button.
-	const CControllerInfo::BUTTON g_padButtonMap[] =
+	// W3C "standard" gamepad button index -> PS2 button (16, home/guide, unbound).
+	const CControllerInfo::BUTTON g_defaultPadButtonMap[] =
 	    {
 	        CControllerInfo::CROSS,      // 0  A / Cross
 	        CControllerInfo::CIRCLE,     // 1  B / Circle
@@ -90,6 +84,34 @@ namespace
 	}
 }
 
+CInputProviderEmscripten::CInputProviderEmscripten()
+    : m_keyBindings(std::begin(g_defaultKeyMap), std::end(g_defaultKeyMap))
+{
+	std::fill(std::begin(m_padButtons), std::end(m_padButtons), -1);
+	std::copy(std::begin(g_defaultPadButtonMap), std::end(g_defaultPadButtonMap), std::begin(m_padButtons));
+}
+
+void CInputProviderEmscripten::SetBindings(std::vector<KEYBINDING> keyBindings, const int (&padButtons)[MAX_PAD_BUTTONS])
+{
+	m_keyBindings = std::move(keyBindings);
+	for(int i = 0; i < MAX_PAD_BUTTONS; i++)
+	{
+		int button = padButtons[i];
+		m_padButtons[i] = (button >= 0 && button < CControllerInfo::MAX_BUTTONS && !CControllerInfo::IsAxis(static_cast<CControllerInfo::BUTTON>(button))) ? button : -1;
+	}
+	std::fill(std::begin(m_keyNeg), std::end(m_keyNeg), false);
+	std::fill(std::begin(m_keyPos), std::end(m_keyPos), false);
+	for(uint32 b = 0; b < CControllerInfo::MAX_BUTTONS; b++)
+	{
+		Publish(static_cast<CControllerInfo::BUTTON>(b));
+	}
+}
+
+void CInputProviderEmscripten::SetGamepadEnabled(bool enabled)
+{
+	m_gamepadEnabled = enabled;
+}
+
 uint32 CInputProviderEmscripten::GetId() const
 {
 	return PROVIDER_ID;
@@ -118,12 +140,12 @@ void CInputProviderEmscripten::OnKeyUp(const EM_UTF8* code)
 
 void CInputProviderEmscripten::OnKey(const EM_UTF8* code, bool pressed)
 {
-	for(const auto& key : g_keyMap)
+	// A key may drive several controls (and a control may have several keys).
+	for(const auto& key : m_keyBindings)
 	{
-		if(strcmp(code, key.code)) continue;
+		if(key.code != code) continue;
 		(key.positive ? m_keyPos : m_keyNeg)[key.button] = pressed;
 		Publish(key.button);
-		return;
 	}
 }
 
@@ -131,7 +153,7 @@ void CInputProviderEmscripten::PollGamepads()
 {
 	uint32 padValue[CControllerInfo::MAX_BUTTONS] = {0x7F, 0x7F, 0x7F, 0x7F};
 
-	if(emscripten_sample_gamepad_data() == EMSCRIPTEN_RESULT_SUCCESS)
+	if(m_gamepadEnabled && emscripten_sample_gamepad_data() == EMSCRIPTEN_RESULT_SUCCESS)
 	{
 		int count = emscripten_get_num_gamepads();
 		for(int i = 0; i < count; i++)
@@ -141,12 +163,12 @@ void CInputProviderEmscripten::PollGamepads()
 			if(!state.connected) continue;
 
 			// All connected gamepads drive pad 1 (buttons OR'ed, first moved stick wins).
-			int buttonCount = std::min<int>(state.numButtons, std::size(g_padButtonMap));
+			int buttonCount = std::min<int>(state.numButtons, MAX_PAD_BUTTONS);
 			for(int b = 0; b < buttonCount; b++)
 			{
-				if(state.digitalButton[b] || (state.analogButton[b] > TRIGGER_THRESHOLD))
+				if((m_padButtons[b] >= 0) && (state.digitalButton[b] || (state.analogButton[b] > TRIGGER_THRESHOLD)))
 				{
-					padValue[g_padButtonMap[b]] = 1;
+					padValue[m_padButtons[b]] = 1;
 				}
 			}
 			if(state.numAxes >= 4)
