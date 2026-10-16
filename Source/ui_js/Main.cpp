@@ -574,6 +574,14 @@ bool setGsHack(std::string name, bool enabled)
 	return false;
 }
 
+//WebGPU GS renderer statistics (see CGSH_WebGPU::SetDebug); false with WebGL2.
+bool setGsDebug(int debug)
+{
+	if(!g_gsWebGpu) return false;
+	static_cast<CGSH_WebGPU*>(g_virtualMachine->GetGSHandler())->SetDebug(debug);
+	return true;
+}
+
 void setVu1Threaded(bool enabled)
 {
 	g_virtualMachine->SetVu1Threaded(enabled);
@@ -846,6 +854,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("setGamepadEnabled", &setGamepadEnabled);
 	function("setVu1Threaded", &setVu1Threaded);
 	function("setGsHack", &setGsHack);
+	function("setGsDebug", &setGsDebug);
 	function("setEeFrequencyScale", &setEeFrequencyScale);
 	function("blockCacheEnable", &BlockCache::SetEnabled);
 	function("blockCacheClear", &BlockCache::Clear);

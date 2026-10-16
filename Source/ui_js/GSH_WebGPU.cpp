@@ -13,13 +13,17 @@ EM_JS(void, GsWgpu_Init, (void* gs, void* resumeFn, void* readyFn, int width, in
 	GsWgpu.init(gs, resumeFn, readyFn, width, height);
 });
 
+EM_JS(void, GsWgpu_SetDebug, (int debug), {
+	GsWgpu.debug = debug;
+});
+
 EM_JS(void, GsWgpu_Resize, (int width, int height), {
 	GsWgpu.resize(width, height);
 });
 
-EM_JS(void, GsWgpu_Execute, (const void* commands, int commandCount, const void* upload, int uploadSize,
+EM_JS(int, GsWgpu_Execute, (const void* commands, int commandCount, const void* upload, int uploadSize,
                              const void* prims, int primsSize, const void* states, int statesSize), {
-	GsWgpu.execute(commands, commandCount, upload, uploadSize, prims, primsSize, states, statesSize);
+	return GsWgpu.execute(commands, commandCount, upload, uploadSize, prims, primsSize, states, statesSize);
 });
 // clang-format on
 
@@ -109,6 +113,11 @@ void CGSH_WebGPU::ResetImpl()
 	WriteBackMemoryCache();
 }
 
+void CGSH_WebGPU::SetDebug(int debug)
+{
+	SendGSCall([debug]() { GsWgpu_SetDebug(debug); });
+}
+
 void CGSH_WebGPU::SetOutput(int width, int height, PRESENTATION_MODE mode)
 {
 	SendGSCall([this, width, height, mode]() {
@@ -158,12 +167,12 @@ void CGSH_WebGPU::Dispatch(PIPELINE pipeline, uint32 paramsOffset, uint32 groups
 	PushCommand({OP_DISPATCH, pipeline, paramsOffset, groupsX, groupsY, groupsZ});
 }
 
-void CGSH_WebGPU::Flush()
+bool CGSH_WebGPU::Flush()
 {
 	FlushBatch();
-	if(!m_deviceReady || m_commands.empty()) return;
+	if(!m_deviceReady || m_commands.empty()) return false;
 	m_upload.resize((m_upload.size() + 3) & ~3);
-	GsWgpu_Execute(m_commands.data(), m_commands.size(), m_upload.data(), m_upload.size(),
+	bool gpuBusy = GsWgpu_Execute(m_commands.data(), m_commands.size(), m_upload.data(), m_upload.size(),
 	               m_prims.data(), m_prims.size() * sizeof(uint32), m_states.data(), m_states.size() * sizeof(uint32));
 	m_commands.clear();
 	m_upload.clear();
@@ -171,6 +180,7 @@ void CGSH_WebGPU::Flush()
 	m_states.clear();
 	m_stateIndex = -1;
 	m_batch.primStart = 0;
+	return gpuBusy;
 }
 
 void CGSH_WebGPU::Readback(uint32 address, uint32 size)
@@ -296,7 +306,11 @@ void CGSH_WebGPU::FlipImpl(const DISPLAY_INFO& dispInfo)
 		layerCount++;
 	}
 	PushCommand({OP_PRESENT, firstParams, layerCount});
-	Flush();
+	if(Flush())
+	{
+		//Too many frames queued on the GPU: wait (GSH_WebGPU.js resumes the GS thread when one completes).
+		SuspendThreadProc();
+	}
 	CGSHandler::FlipImpl(dispInfo);
 }
 
@@ -1013,6 +1027,22 @@ void CGSH_WebGPU::SetRenderingContext(uint64 primReg)
 		}
 		memcpy(m_state, state, sizeof(state));
 		m_stateIndex = -1;
+		uint32 features = 0;
+		if(hasTexture)
+		{
+			features |= DRAW_FEATURE_TEXTURE;
+			if(flags0 & (1 << 5)) features |= DRAW_FEATURE_LINEAR;
+			if(flags0 & (1 << 6)) features |= DRAW_FEATURE_MIPLOD;
+			if(CGsPixelFormats::IsPsmIDTEX(tex0.nPsm)) features |= DRAW_FEATURE_CLUT;
+			if(needsTextureCopy) features |= DRAW_FEATURE_MEMCOPY;
+		}
+		if(prim.nAlpha) features |= DRAW_FEATURE_BLEND;
+		if(prim.nFog) features |= DRAW_FEATURE_FOG;
+		if(alphaTest != ALPHA_TEST_ALWAYS) features |= DRAW_FEATURE_ALPHATEST;
+		if(test.nDestAlphaEnabled) features |= DRAW_FEATURE_DATE;
+		if((depthTest == DEPTH_TEST_GEQUAL) || (depthTest == DEPTH_TEST_GREATER)) features |= DRAW_FEATURE_DEPTHTEST;
+		if(writeDepth) features |= DRAW_FEATURE_DEPTHWRITE;
+		m_stateFeatures = features;
 	}
 
 	m_fbBasePtr = frame.GetBasePtr();
@@ -1255,6 +1285,8 @@ void CGSH_WebGPU::AddPrim(PRIM_TYPE type, const VERTEX_DATA* vertices, uint32 ve
 		memcpy(&dst[6], &vertex.q, sizeof(float));
 		memcpy(&dst[7], &vertex.fog, sizeof(float));
 	}
+	static const uint32 primTypeFeatures[] = {DRAW_FEATURE_TRIANGLE, DRAW_FEATURE_SPRITE, DRAW_FEATURE_LINE, 0};
+	m_batch.features |= m_stateFeatures | primTypeFeatures[type];
 	prim[24] = type;
 	prim[25] = m_stateIndex;
 	prim[26] = minX | (minY << 16);
@@ -1271,8 +1303,50 @@ void CGSH_WebGPU::FlushBatch()
 	uint32 primEnd = m_prims.size() / PRIM_WORDS;
 	if(primEnd == m_batch.primStart) return;
 
+	//Bin the primitives per tile (in drawing order), so that each workgroup of the draw shader only walks
+	//the primitives that can touch its tile.
 	uint32 originX = m_batch.minX & ~15U;
 	uint32 originY = m_batch.minY & ~15U;
+	uint32 tilesX = (m_batch.maxX - originX) / DRAW_TILE_SIZE + 1;
+	uint32 tilesY = (m_batch.maxY - originY) / DRAW_TILE_SIZE + 1;
+	uint32 tileCount = tilesX * tilesY;
+	m_binOffsets.assign(tileCount + 1, 0);
+	for(uint32 p = m_batch.primStart; p < primEnd; p++)
+	{
+		const uint32* prim = m_prims.data() + p * PRIM_WORDS;
+		uint32 tx0 = ((prim[26] & 0xFFFF) - originX) / DRAW_TILE_SIZE, ty0 = ((prim[26] >> 16) - originY) / DRAW_TILE_SIZE;
+		uint32 tx1 = ((prim[27] & 0xFFFF) - originX) / DRAW_TILE_SIZE, ty1 = ((prim[27] >> 16) - originY) / DRAW_TILE_SIZE;
+		for(uint32 ty = ty0; ty <= ty1; ty++)
+		{
+			for(uint32 tx = tx0; tx <= tx1; tx++)
+			{
+				m_binOffsets[ty * tilesX + tx + 1]++;
+			}
+		}
+	}
+	for(uint32 t = 0; t < tileCount; t++)
+	{
+		m_binOffsets[t + 1] += m_binOffsets[t];
+	}
+	uint32 entryCount = m_binOffsets[tileCount];
+	uint32 binOffset = AllocUpload((tileCount + 1 + entryCount) * sizeof(uint32), 4);
+	auto bins = reinterpret_cast<uint32*>(m_upload.data() + binOffset);
+	memcpy(bins, m_binOffsets.data(), (tileCount + 1) * sizeof(uint32));
+	uint32* entries = bins + tileCount + 1;
+	for(uint32 p = m_batch.primStart; p < primEnd; p++)
+	{
+		const uint32* prim = m_prims.data() + p * PRIM_WORDS;
+		uint32 tx0 = ((prim[26] & 0xFFFF) - originX) / DRAW_TILE_SIZE, ty0 = ((prim[26] >> 16) - originY) / DRAW_TILE_SIZE;
+		uint32 tx1 = ((prim[27] & 0xFFFF) - originX) / DRAW_TILE_SIZE, ty1 = ((prim[27] >> 16) - originY) / DRAW_TILE_SIZE;
+		for(uint32 ty = ty0; ty <= ty1; ty++)
+		{
+			for(uint32 tx = tx0; tx <= tx1; tx++)
+			{
+				entries[m_binOffsets[ty * tilesX + tx]++] = p;
+			}
+		}
+	}
+
 	uint32 paramsOffset = 0;
 	auto params = AllocParams(paramsOffset);
 	params[0] = m_batch.fbPsm;
@@ -1280,16 +1354,20 @@ void CGSH_WebGPU::FlushBatch()
 	params[2] = m_batch.fbWidth;
 	params[3] = m_batch.zbPsm;
 	params[4] = m_batch.zbAddress;
-	params[5] = m_batch.primStart;
-	params[6] = primEnd - m_batch.primStart;
 	params[7] = originX;
 	params[8] = originY;
-	PushCommand({OP_DISPATCH, PIPELINE_DRAW, paramsOffset, (m_batch.maxX - originX) / 16 + 1, (m_batch.maxY - originY) / 16 + 1, 1});
+	params[9] = m_batch.maxX;
+	params[10] = m_batch.maxY;
+	params[11] = tilesX;
+	params[12] = binOffset / 4;
+	params[13] = binOffset / 4 + tileCount + 1;
+	PushCommand({OP_DISPATCH, PIPELINE_DRAW | (m_batch.features << 8), paramsOffset, tilesX, tilesY, 1});
 	m_drawCallCount++;
 
 	m_batch.primStart = primEnd;
 	m_batch.minX = m_batch.minY = ~0U;
 	m_batch.maxX = m_batch.maxY = 0;
+	m_batch.features = 0;
 	m_batch.writeStart = m_batch.writeEnd = m_batch.fbAddress;
 	m_batch.zbWriteStart = m_batch.zbWriteEnd = m_batch.zbAddress;
 }

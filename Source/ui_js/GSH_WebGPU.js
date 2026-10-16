@@ -20,6 +20,19 @@ var GsWgpu = {
 
 	device: null,
 	errorCount: 0,
+	debug: 0,
+	// Per-interval counters, logged every 2 s when debug is set (CGSH_WebGPU::SetDebug)
+	stats: { frames: 0, executes: 0, batches: 0, prims: 0, uploadBytes: 0, gpuNs: 0, gpuPasses: 0, gpuExecutes: 0, since: 0 },
+	MAX_TIMED_PASSES: 512,
+	MAX_FRAMES_IN_FLIGHT: 2,
+	// Draw shader variant (tuning knobs, see notes/webgpu.md): tile = workgroup side in pixels, primCache =
+	// copy the tile's primitives to workgroup memory, pixelCache = keep frame/depth values in registers.
+	// Bit i of a draw's feature mask (CGSH_WebGPU::DRAW_FEATURE_*) = override constant drawFeatures[i]
+	drawFeatures: ["F_TEXTURE", "F_LINEAR", "F_MIPLOD", "F_CLUT", "F_MEMCOPY", "F_BLEND", "F_FOG", "F_ALPHATEST",
+		"F_DATE", "F_DEPTHTEST", "F_DEPTHWRITE", "F_TRIANGLE", "F_SPRITE", "F_LINE"],
+	drawConfig: { tile: 8, primCache: true, pixelCache: true, exit: 0 }, // tile must match CGSH_WebGPU::DRAW_TILE_SIZE
+	framesInFlight: 0,
+	waitingForGpu: false,
 
 	heap() {
 		return new Uint8Array(wasmMemory.buffer);
@@ -37,7 +50,8 @@ var GsWgpu = {
 			let ok = false;
 			try {
 				const adapter = await navigator.gpu.requestAdapter();
-				this.device = await adapter.requestDevice();
+				this.timestamps = adapter.features.has("timestamp-query");
+				this.device = await adapter.requestDevice({ requiredFeatures: this.timestamps ? ["timestamp-query"] : [] });
 				this.device.lost.then((info) => console.error("GSH_WebGPU: device lost:", info.message));
 				this.device.onuncapturederror = (e) => {
 					if (this.errorCount++ < 20) console.error("GSH_WebGPU:", e.error.message);
@@ -61,9 +75,9 @@ var GsWgpu = {
 		const d = this.device;
 		const B = GPUBufferUsage;
 		this.memory = d.createBuffer({ label: "GS memory", size: this.RAMSIZE, usage: B.STORAGE | B.COPY_SRC | B.COPY_DST });
-		this.memoryCopy = d.createBuffer({ label: "GS memory copy", size: this.RAMSIZE, usage: B.STORAGE | B.COPY_DST });
-		this.clut = d.createBuffer({ label: "CLUT", size: this.CLUT_BUFFER_SIZE, usage: B.STORAGE });
-		this.swizzle = d.createBuffer({ label: "Swizzle tables", size: this.SWIZZLE_TABLES_SIZE, usage: B.STORAGE | B.COPY_DST });
+		this.memoryCopy = d.createBuffer({ label: "GS memory copy", size: this.RAMSIZE, usage: B.STORAGE | B.COPY_SRC | B.COPY_DST });
+		this.clut = d.createBuffer({ label: "CLUT", size: this.CLUT_BUFFER_SIZE, usage: B.STORAGE | B.COPY_SRC | B.COPY_DST });
+		this.swizzle = d.createBuffer({ label: "Swizzle tables", size: this.SWIZZLE_TABLES_SIZE, usage: B.STORAGE | B.COPY_SRC | B.COPY_DST });
 		this.readback = d.createBuffer({ label: "Readback", size: this.RAMSIZE, usage: B.MAP_READ | B.COPY_DST });
 
 		const S = GPUShaderStage;
@@ -87,8 +101,9 @@ var GsWgpu = {
 			],
 		});
 
-		const computeModule = d.createShaderModule({ label: "GS compute", code: this.wgslCompute() });
-		const computePipelineLayout = d.createPipelineLayout({ bindGroupLayouts: [this.computeLayout] });
+		const computeModule = this.computeModule = d.createShaderModule({ label: "GS compute", code: this.wgslCompute() });
+		const computePipelineLayout = this.computePipelineLayout = d.createPipelineLayout({ bindGroupLayouts: [this.computeLayout] });
+		this.drawPipelines = new Map();
 		// Index = CGSH_WebGPU::PIPELINE
 		this.computePipelines = ["xferHost", "xferLocal", "clutLoad", "draw"].map((entryPoint) =>
 			d.createComputePipeline({ label: entryPoint, layout: computePipelineLayout, compute: { module: computeModule, entryPoint } }));
@@ -111,11 +126,30 @@ var GsWgpu = {
 			primitive: { topology: "triangle-strip" },
 		}));
 
+		if (this.timestamps) {
+			this.querySet = d.createQuerySet({ type: "timestamp", count: this.MAX_TIMED_PASSES * 2 });
+			this.queryResolve = d.createBuffer({ size: this.MAX_TIMED_PASSES * 16, usage: B.QUERY_RESOLVE | B.COPY_SRC });
+			this.queryRead = d.createBuffer({ size: this.MAX_TIMED_PASSES * 16, usage: B.MAP_READ | B.COPY_DST });
+			this.queryReadBusy = false;
+		}
 		this.upload = this.prims = this.states = null;
 		this.ensureBuffers(16 << 20, 4 << 20, 1 << 20);
 	},
 
 	// Upload arena, primitives and states of a command list; grown (and the bind groups remade) on demand.
+	// Draw pipeline specialized for a feature mask, compiled in the background; the general one meanwhile.
+	drawPipeline(features) {
+		const pipeline = this.drawPipelines.get(features);
+		if (pipeline) return pipeline;
+		if (pipeline === undefined && this.drawConfig.specialize !== false) {
+			this.drawPipelines.set(features, null);
+			const constants = Object.fromEntries(this.drawFeatures.map((f, i) => [f, (features >> i) & 1]));
+			this.device.createComputePipelineAsync({ label: `draw ${features.toString(16)}`, layout: this.computePipelineLayout, compute: { module: this.computeModule, entryPoint: "draw", constants } })
+				.then((p) => this.drawPipelines.set(features, p), (e) => console.error("GSH_WebGPU: draw pipeline:", e));
+		}
+		return this.computePipelines[3];
+	},
+
 	ensureBuffers(uploadSize, primsSize, statesSize) {
 		const B = GPUBufferUsage;
 		const grow = (name, size, usage) => {
@@ -158,6 +192,7 @@ var GsWgpu = {
 		const d = this.device;
 		const heap = this.heap();
 		const cmds = new Uint32Array(heap.buffer, commandsPtr, commandCount);
+		this.captureExecute(heap, commandsPtr, commandCount, uploadPtr, uploadSize, primsPtr, primsSize, statesPtr, statesSize);
 		this.ensureBuffers(uploadSize, primsSize, statesSize);
 		if (uploadSize > 0) d.queue.writeBuffer(this.upload, 0, heap.buffer, uploadPtr, uploadSize);
 		if (primsSize > 0) d.queue.writeBuffer(this.prims, 0, heap.buffer, primsPtr, primsSize);
@@ -170,6 +205,16 @@ var GsWgpu = {
 		};
 		let presented = false;
 		let readback = null;
+		// GPU time of the compute passes (debug only; one readback in flight at a time)
+		const timing = (this.debug || this.drawConfig.profile) && this.timestamps && !this.queryReadBusy;
+		// drawConfig.profile (replay tool): one pass per dispatch, times in this.profile = [[pipeline, params offset, ns], ...]
+		const passPerDispatch = timing && this.drawConfig.profile;
+		const passInfo = [];
+		let timedPasses = 0;
+		const st = this.stats;
+		st.executes++;
+		st.prims += primsSize / 112;
+		st.uploadBytes += uploadSize + primsSize + statesSize;
 		for (let i = 0; i < commandCount;) {
 			switch (cmds[i]) {
 			case this.OP_UPLOAD_TO_MEMORY:
@@ -188,10 +233,18 @@ var GsWgpu = {
 				i += 3;
 				break;
 			case this.OP_DISPATCH:
+				if (passPerDispatch) endPass();
 				if (!pass) {
-					pass = enc.beginComputePass();
+					passInfo.push([cmds[i + 1], cmds[i + 2]]);
+					if (timing && timedPasses < this.MAX_TIMED_PASSES) {
+						pass = enc.beginComputePass({ timestampWrites: { querySet: this.querySet, beginningOfPassWriteIndex: timedPasses * 2, endOfPassWriteIndex: timedPasses * 2 + 1 } });
+						timedPasses++;
+					} else {
+						pass = enc.beginComputePass();
+					}
 				}
-				pass.setPipeline(this.computePipelines[cmds[i + 1]]);
+				if ((cmds[i + 1] & 0xFF) === 3) st.batches++;
+				pass.setPipeline((cmds[i + 1] & 0xFF) === 3 ? this.drawPipeline(cmds[i + 1] >>> 8) : this.computePipelines[cmds[i + 1]]);
 				pass.setBindGroup(0, this.computeBindGroup, [cmds[i + 2]]);
 				pass.dispatchWorkgroups(cmds[i + 3], cmds[i + 4], cmds[i + 5]);
 				i += 6;
@@ -234,7 +287,48 @@ var GsWgpu = {
 			}
 		}
 		endPass();
+		if (timedPasses) {
+			enc.resolveQuerySet(this.querySet, 0, timedPasses * 2, this.queryResolve, 0);
+			enc.copyBufferToBuffer(this.queryResolve, 0, this.queryRead, 0, timedPasses * 16);
+		}
 		d.queue.submit([enc.finish()]);
+		if (timedPasses) {
+			this.queryReadBusy = true;
+			this.queryRead.mapAsync(GPUMapMode.READ, 0, timedPasses * 16).then(() => {
+				const t = new BigInt64Array(this.queryRead.getMappedRange(0, timedPasses * 16));
+				for (let p = 0; p < timedPasses; p++) st.gpuNs += Number(t[p * 2 + 1] - t[p * 2]);
+				if (passPerDispatch) this.profile = passInfo.slice(0, timedPasses).map((x, p) => [...x, Number(t[p * 2 + 1] - t[p * 2])]);
+				st.gpuPasses += timedPasses;
+				st.gpuExecutes++;
+				this.queryRead.unmap();
+				this.queryReadBusy = false;
+			}, () => { this.queryReadBusy = false; });
+		}
+		let gpuBusy = 0;
+		if (presented) {
+			st.frames++;
+			// Frame pacing: the GS thread waits (suspended) while MAX_FRAMES_IN_FLIGHT frames are queued.
+			this.framesInFlight++;
+			d.queue.onSubmittedWorkDone().then(() => {
+				this.framesInFlight--;
+				if (this.waitingForGpu && this.framesInFlight < this.MAX_FRAMES_IN_FLIGHT) {
+					this.waitingForGpu = false;
+					this.callWasm(this.resumeFn, this.gs);
+				}
+			});
+			if (this.framesInFlight >= this.MAX_FRAMES_IN_FLIGHT && !readback) {
+				this.waitingForGpu = true;
+				gpuBusy = 1;
+			}
+		}
+		const now = performance.now();
+		if (this.debug && now - st.since > 2000) {
+			const f = Math.max(st.frames, 1);
+			console.log(`GSH_WebGPU: ${(st.frames * 1000 / (now - st.since)).toFixed(1)} frames/s, per frame: ${(st.executes / f).toFixed(1)} submits, ${(st.batches / f).toFixed(0)} batches, ${(st.prims / f).toFixed(0)} prims, ${(st.uploadBytes / f / 1024).toFixed(0)} KB, compute GPU ${(st.gpuNs / 1e6 / Math.max(st.gpuExecutes, 1)).toFixed(2)} ms per submit (${st.gpuExecutes} sampled)`);
+			Object.assign(st, { frames: 0, executes: 0, batches: 0, prims: 0, uploadBytes: 0, gpuNs: 0, gpuPasses: 0, gpuExecutes: 0, since: now });
+		}
+		if (presented && this.capture?.submits && !this.capture.finishing) this.finishCapture();
+		this.lastExecutePresented = presented;
 		if (presented) {
 			// Only complete frames ever reach the page (same path as GSH_OpenGLJs).
 			const bitmap = this.canvas.transferToImageBitmap();
@@ -251,6 +345,47 @@ var GsWgpu = {
 				this.callWasm(this.resumeFn, this.gs);
 			});
 		}
+		return gpuBusy;
+	},
+
+	// Frame capture (debug bit 2, see CGSH_WebGPU::SetDebug): GPU memory/CLUT/copy buffers at the start of the
+	// next frame plus every command list until its present, sent to the page as Module.onGsCapture(object)
+	// for offline replay (tools: notes/webgpu.md).
+	captureExecute(heap, commandsPtr, commandCount, uploadPtr, uploadSize, primsPtr, primsSize, statesPtr, statesSize) {
+		if (!(this.debug & 2)) return;
+		if (!this.capture) {
+			if (!this.lastExecutePresented) return;
+			const B = GPUBufferUsage;
+			const snap = (src, size) => {
+				const dst = this.device.createBuffer({ size, usage: B.MAP_READ | B.COPY_DST });
+				const enc = this.device.createCommandEncoder();
+				enc.copyBufferToBuffer(src, 0, dst, 0, size);
+				this.device.queue.submit([enc.finish()]);
+				return dst;
+			};
+			this.capture = { memory: snap(this.memory, this.RAMSIZE), memoryCopy: snap(this.memoryCopy, this.RAMSIZE), clut: snap(this.clut, this.CLUT_BUFFER_SIZE), swizzle: snap(this.swizzle, this.SWIZZLE_TABLES_SIZE), submits: [] };
+		}
+		const copy = (ptr, size) => heap.slice(ptr, ptr + size);
+		this.capture.submits.push({ commands: copy(commandsPtr, commandCount * 4), upload: copy(uploadPtr, uploadSize), prims: copy(primsPtr, primsSize), states: copy(statesPtr, statesSize) });
+	},
+
+	finishCapture() {
+		const c = this.capture;
+		const prims = c.submits.reduce((n, sub) => n + sub.prims.length / 112, 0);
+		if (prims < 1000) {
+			// Nearly empty frame (e.g. a flip without drawing): try the next one
+			for (const b of [c.memory, c.memoryCopy, c.clut, c.swizzle]) b.destroy();
+			this.capture = null;
+			return;
+		}
+		this.debug &= ~2;
+		c.finishing = true;
+		const read = async (b) => { await b.mapAsync(GPUMapMode.READ); const r = b.getMappedRange().slice(0); b.destroy(); return r; };
+		Promise.all([read(c.memory), read(c.memoryCopy), read(c.clut), read(c.swizzle)]).then(([memory, memoryCopy, clut, swizzle]) => {
+			const out = { memory, memoryCopy, clut, swizzle, submits: c.submits };
+			postMessage({ cmd: "callHandler", handler: "onGsCapture", args: [out] });
+			this.capture = null;
+		});
 	},
 
 	// GS memory access helpers, shared by the compute and present modules. load(i) reads word i.
@@ -487,7 +622,34 @@ const PRIM_SPRITE = 1u;
 const PRIM_LINE = 2u;
 const PRIM_POINT = 3u;
 
-var<workgroup> primMask : array<atomic<u32>, 8>;
+const TILE_SIZE = ${this.drawConfig.tile}u;   // tile = workgroup = TILE_SIZE x TILE_SIZE pixels
+const GROUP_SIZE = ${this.drawConfig.tile ** 2}u;
+const PRIM_CACHE = ${this.drawConfig.primCache};
+const PIXEL_CACHE = ${this.drawConfig.pixelCache};
+const EXIT = ${this.drawConfig.exit ?? 0}u; // profiling: stop shading at stage EXIT (0 = full)
+
+// Features used by a batch (CGSH_WebGPU::DRAW_FEATURE_*): pipelines are specialized per combination so that
+// the unused paths are compiled out (the shader is big; registers decide the speed). All on = any batch.
+${this.drawFeatures.map((f) => `override ${f} : bool = true;`).join("\n")}
+
+// The tile's primitives of the current chunk, copied to workgroup memory.
+var<workgroup> primCache : array<u32, ${this.drawConfig.primCache ? this.drawConfig.tile ** 2 * 28 : 1}>;
+
+// Word k of primitive p (slot of the chunk when PRIM_CACHE, primitive index otherwise)
+fn pw(p : u32, k : u32) -> u32 {
+	if(PRIM_CACHE) { return primCache[p * PRIM_WORDS + k]; }
+	return prims[p * PRIM_WORDS + k];
+}
+
+// Frame/depth buffer value of the invocation's pixel, kept for the whole batch: within a batch only this
+// invocation touches it (textures overlapping the batch's buffers end the batch, see CGSH_WebGPU).
+struct PixelCache {
+	fbAddress : u32,
+	zbAddress : u32,
+	fb : u32,
+	z : u32,
+	flags : u32,   // 1: fb loaded, 2: z loaded, 4: fb written, 8: z written
+};
 
 fn sw(s : u32, i : u32) -> u32 { return states[s + i]; }
 fn bits(v : u32, first : u32, count : u32) -> u32 { return extractBits(v, first, count); }
@@ -510,7 +672,7 @@ fn unpackColor(c : u32) -> vec4<f32> {
 }
 
 fn readTexWord(fromCopy : bool, i : u32) -> u32 {
-	if(fromCopy) { return memCopy[i & WORDMASK]; }
+	if(F_MEMCOPY && fromCopy) { return memCopy[i & WORDMASK]; }
 	return atomicLoad(&mem[i & WORDMASK]);
 }
 
@@ -553,6 +715,7 @@ fn texelColor(s : u32, raw : u32) -> vec4<f32> {
 		}
 		case 0x02u, 0x0Au, 0x32u, 0x3Au: { return expand16(raw, tcc, aem, ta0, ta1); }
 		default: {
+			if(!F_CLUT) { return vec4<f32>(0.0); }
 			// Indexed: CLUT lookup (GSH_VulkanDrawUtils GetClutColor)
 			var index = raw;
 			if((psm == PSMT4) || (psm == PSMT4HL) || (psm == PSMT4HH)) { index = raw + sw(s, 9u); }
@@ -599,7 +762,7 @@ fn sampleTexture(s : u32, st : vec2<f32>, q : f32) -> vec4<f32> {
 	var level = sw(s, 8u);
 	var bufAddress = sw(s, 4u);
 	var bufWidth = sw(s, 5u);
-	if(bits(flags0, 6u, 1u) != 0u) {
+	if(F_MIPLOD && (bits(flags0, 6u, 1u) != 0u)) {
 		// Dynamic LOD (GSH_VulkanDrawDesktop): LOD = (log2(1/|Q|) << L) + K
 		let mipL = f32(1u << sw(s, 22u));
 		let mipK = bitcast<f32>(sw(s, 23u));
@@ -611,7 +774,7 @@ fn sampleTexture(s : u32, st : vec2<f32>, q : f32) -> vec4<f32> {
 			bufWidth = sw(s, 25u + (level - 1u) * 2u);
 		}
 	}
-	if(bits(flags0, 5u, 1u) != 0u) {
+	if(F_LINEAR && (bits(flags0, 5u, 1u) != 0u)) {
 		let pos = texPos - 0.5;
 		var ab = fract(pos);
 		if(any(abs(texPos) > vec2<f32>(1e30))) { ab = vec2<f32>(0.0); }
@@ -634,25 +797,27 @@ fn readFramePixel(psm : u32, a : u32) -> u32 {
 	}
 }
 
-fn shade(p : u32, px : u32, py : u32) {
-	let b = p * PRIM_WORDS;
-	let bboxMin = prims[b + 26u];
-	let bboxMax = prims[b + 27u];
+fn shade(p : u32, px : u32, py : u32, cache : ptr<function, PixelCache>) {
+	if(!PIXEL_CACHE) { (*cache).flags = 0u; }
+	let bboxMin = pw(p, 26u);
+	let bboxMax = pw(p, 27u);
 	if((px < (bboxMin & 0xFFFFu)) || (py < (bboxMin >> 16u)) || (px > (bboxMax & 0xFFFFu)) || (py > (bboxMax >> 16u))) { return; }
-	let primType = prims[b + 24u];
+	if(EXIT == 1u) { return; }
+	let primType = pw(p, 24u);
 	let sx = i32(px) * 16;
 	let sy = i32(py) * 16;
-	let x0 = bitcast<i32>(prims[b + 0u]);
-	let y0 = bitcast<i32>(prims[b + 1u]);
-	let x1 = bitcast<i32>(prims[b + 8u]);
-	let y1 = bitcast<i32>(prims[b + 9u]);
+	let x0 = bitcast<i32>(pw(p, 0u));
+	let y0 = bitcast<i32>(pw(p, 1u));
+	let x1 = bitcast<i32>(pw(p, 8u));
+	let y1 = bitcast<i32>(pw(p, 9u));
 
 	// Weights of vertex 1 and 2 (vertex 0 gets the rest).
 	var w = vec2<f32>(0.0);
 	switch(primType) {
 		case 0u: {
-			let x2 = bitcast<i32>(prims[b + 16u]);
-			let y2 = bitcast<i32>(prims[b + 17u]);
+			if(!F_TRIANGLE) { return; }
+			let x2 = bitcast<i32>(pw(p, 16u));
+			let y2 = bitcast<i32>(pw(p, 17u));
 			let area = f32(x1 - x0) * f32(y2 - y0) - f32(y1 - y0) * f32(x2 - x0);
 			if(area == 0.0) { return; }
 			let o = select(-1, 1, area > 0.0);
@@ -666,10 +831,12 @@ fn shade(p : u32, px : u32, py : u32) {
 			w = vec2<f32>(f32(e1), f32(e2)) / absArea;
 		}
 		case 1u: {
+			if(!F_SPRITE) { return; }
 			if((sx < min(x0, x1)) || (sx >= max(x0, x1)) || (sy < min(y0, y1)) || (sy >= max(y0, y1))) { return; }
 			w = vec2<f32>(f32(sx - x0) / f32(x1 - x0), f32(sy - y0) / f32(y1 - y0));
 		}
 		case 2u: {
+			if(!F_LINE) { return; }
 			let dx = x1 - x0;
 			let dy = y1 - y0;
 			if(abs(dx) >= abs(dy)) {
@@ -689,33 +856,34 @@ fn shade(p : u32, px : u32, py : u32) {
 		default: { }
 	}
 
+	if(EXIT == 2u) { (*cache).fb = px; (*cache).flags |= 4u; return; }
 	// Attributes
-	let z0 = prims[b + 2u];
+	let z0 = pw(p, 2u);
 	var z = z0;
-	var color = unpackColor(prims[b + 3u]);
-	var st = vec2<f32>(bitcast<f32>(prims[b + 4u]), bitcast<f32>(prims[b + 5u]));
-	var q = bitcast<f32>(prims[b + 6u]);
-	var fog = bitcast<f32>(prims[b + 7u]);
+	var color = unpackColor(pw(p, 3u));
+	var st = vec2<f32>(bitcast<f32>(pw(p, 4u)), bitcast<f32>(pw(p, 5u)));
+	var q = bitcast<f32>(pw(p, 6u));
+	var fog = bitcast<f32>(pw(p, 7u));
 	if(primType == PRIM_SPRITE) {
-		let st1 = vec2<f32>(bitcast<f32>(prims[b + 12u]), bitcast<f32>(prims[b + 13u]));
+		let st1 = vec2<f32>(bitcast<f32>(pw(p, 12u)), bitcast<f32>(pw(p, 13u)));
 		st = st + (st1 - st) * w;
 	} else if(primType != PRIM_POINT) {
-		let c1 = unpackColor(prims[b + 11u]);
-		let st1 = vec2<f32>(bitcast<f32>(prims[b + 12u]), bitcast<f32>(prims[b + 13u]));
-		let q1 = bitcast<f32>(prims[b + 14u]);
-		let f1 = bitcast<f32>(prims[b + 15u]);
-		let dz1 = f32(bitcast<i32>(prims[b + 10u] - z0));
+		let c1 = unpackColor(pw(p, 11u));
+		let st1 = vec2<f32>(bitcast<f32>(pw(p, 12u)), bitcast<f32>(pw(p, 13u)));
+		let q1 = bitcast<f32>(pw(p, 14u));
+		let f1 = bitcast<f32>(pw(p, 15u));
+		let dz1 = f32(bitcast<i32>(pw(p, 10u) - z0));
 		var dz = dz1 * w.x;
 		var c = color + (c1 - color) * w.x;
 		var stv = st + (st1 - st) * w.x;
 		var qv = q + (q1 - q) * w.x;
 		var fv = fog + (f1 - fog) * w.x;
 		if(primType == PRIM_TRIANGLE) {
-			let c2 = unpackColor(prims[b + 19u]);
-			let st2 = vec2<f32>(bitcast<f32>(prims[b + 20u]), bitcast<f32>(prims[b + 21u]));
-			let q2 = bitcast<f32>(prims[b + 22u]);
-			let f2 = bitcast<f32>(prims[b + 23u]);
-			dz += f32(bitcast<i32>(prims[b + 18u] - z0)) * w.y;
+			let c2 = unpackColor(pw(p, 19u));
+			let st2 = vec2<f32>(bitcast<f32>(pw(p, 20u)), bitcast<f32>(pw(p, 21u)));
+			let q2 = bitcast<f32>(pw(p, 22u));
+			let f2 = bitcast<f32>(pw(p, 23u));
+			dz += f32(bitcast<i32>(pw(p, 18u) - z0)) * w.y;
 			c += (c2 - color) * w.y;
 			stv += (st2 - st) * w.y;
 			qv += (q2 - q) * w.y;
@@ -728,13 +896,14 @@ fn shade(p : u32, px : u32, py : u32) {
 		fog = fv;
 	}
 
-	let s = prims[b + 25u] * STATE_WORDS;
+	if(EXIT == 3u) { (*cache).fb = z ^ bitcast<u32>(st.x + q + fog + color.x); (*cache).flags |= 4u; return; }
+	let s = pw(p, 25u) * STATE_WORDS;
 	let flags0 = sw(s, 0u);
 	let flags1 = sw(s, 1u);
 
 	// Texture function (TFX), in integers like the GS: (Ct * Cf) >> 7
 	var src = vec4<i32>(clamp(color, vec4<f32>(0.0), vec4<f32>(255.0)));
-	if(bits(flags0, 0u, 1u) != 0u) {
+	if(F_TEXTURE && (bits(flags0, 0u, 1u) != 0u)) {
 		let tex = vec4<i32>(sampleTexture(s, st, q));
 		let tcc = bits(flags0, 1u, 1u) != 0u;
 		var rgb = tex.rgb;
@@ -758,21 +927,22 @@ fn shade(p : u32, px : u32, py : u32) {
 		}
 		src = vec4<i32>(rgb, a);
 	}
-	if(bits(flags0, 11u, 1u) != 0u) {
+	if(EXIT == 4u) { (*cache).fb = u32(src.x); (*cache).flags |= 4u; return; }
+	if(F_FOG && (bits(flags0, 11u, 1u) != 0u)) {
 		let f = i32(clamp(fog, 0.0, 255.0));
 		let fogColor = vec3<i32>(i32(sw(s, 20u) & 0xFFu), i32((sw(s, 20u) >> 8u) & 0xFFu), i32((sw(s, 20u) >> 16u) & 0xFFu));
 		src = vec4<i32>((src.rgb * f + fogColor * (255 - f)) >> vec3<u32>(8u), src.a);
 	}
 
 	var writeColor = true;
-	var writeDepth = bits(flags0, 12u, 1u) != 0u;
+	var writeDepth = F_DEPTHWRITE && (bits(flags0, 12u, 1u) != 0u);
 	var writeAlpha = true;
 
 	let scanMask = bits(flags0, 13u, 2u);
 	if(((scanMask == 2u) && ((py & 1u) == 0u)) || ((scanMask == 3u) && ((py & 1u) != 0u))) { return; }
 
 	// Alpha test
-	let alphaTest = bits(flags0, 28u, 3u);
+	let alphaTest = select(1u, bits(flags0, 28u, 3u), F_ALPHATEST);
 	let alphaRef = i32(sw(s, 18u));
 	var alphaPass = true;
 	switch(alphaTest) {
@@ -796,12 +966,14 @@ fn shade(p : u32, px : u32, py : u32) {
 
 	let fbPsm = param(0u);
 	let zbPsm = param(3u);
-	let fbAddress = pixelAddress(fbPsm, param(1u), param(2u), px, py);
-	let zbAddress = pixelAddress(zbPsm, param(4u), param(2u), px, py);
 
 	let is16 = (fbPsm == PSMCT16) || (fbPsm == PSMCT16S) || (fbPsm == PSMZ16S);
 	let is24 = (fbPsm == PSMCT24) || (fbPsm == PSMZ24) || (fbPsm == PSMCT24_UNK);
-	let dstPixel = readFramePixel(fbPsm, fbAddress);
+	if(((*cache).flags & 1u) == 0u) {
+		(*cache).fb = readFramePixel(fbPsm, (*cache).fbAddress);
+		(*cache).flags |= 1u;
+	}
+	let dstPixel = (*cache).fb;
 	var dst : vec4<i32>;
 	if(is16) {
 		dst = vec4<i32>(i32((dstPixel & 0x1Fu) << 3u), i32(((dstPixel >> 5u) & 0x1Fu) << 3u), i32(((dstPixel >> 10u) & 0x1Fu) << 3u), select(0, 0x80, (dstPixel & 0x8000u) != 0u));
@@ -810,8 +982,9 @@ fn shade(p : u32, px : u32, py : u32) {
 		if(is24) { dst.a = 0x80; }
 	}
 
+	if(EXIT == 5u) { (*cache).fb = dstPixel ^ u32(src.x); (*cache).flags |= 4u; return; }
 	// Destination alpha test (DATE)
-	if(bits(flags1, 2u, 1u) != 0u) {
+	if(F_DATE && (bits(flags1, 2u, 1u) != 0u)) {
 		var alphaBit = (dstPixel & 0x80000000u) != 0u;
 		if(is16) { alphaBit = (dstPixel & 0x8000u) != 0u; }
 		if(!is24 && (alphaBit != (bits(flags1, 3u, 1u) != 0u))) { return; }
@@ -826,12 +999,20 @@ fn shade(p : u32, px : u32, py : u32) {
 	}
 	let depthTest = bits(flags0, 26u, 2u);
 	if(depthTest == 0u) { return; }
-	if(depthTest >= 2u) {
-		var dstDepth = read32(zbAddress);
-		switch(zbPsm) {
-			case 0x31u: { dstDepth = dstDepth & 0xFFFFFFu; }
-			case 0x32u, 0x3Au: { dstDepth = read16(zbAddress); }
-			default: { }
+	if(F_DEPTHTEST && (depthTest >= 2u)) {
+		if(((*cache).flags & 2u) == 0u) {
+			switch(zbPsm) {
+				case 0x31u: { (*cache).z = read24((*cache).zbAddress); }
+				case 0x32u, 0x3Au: { (*cache).z = read16((*cache).zbAddress); }
+				default: { (*cache).z = read32((*cache).zbAddress); }
+			}
+			(*cache).flags |= 2u;
+		}
+		var dstDepth = (*cache).z;
+		if((param(1u) == param(4u)) && (((*cache).flags & 4u) != 0u)) {
+			// Depth buffer = frame buffer (depth writes are off then): see the colors written in this batch
+			dstDepth = (*cache).fb;
+			if(zbPsm == PSMZ24) { dstDepth &= 0xFFFFFFu; }
 		}
 		if((depthTest == 2u) && (srcDepth < dstDepth)) { return; }
 		if((depthTest == 3u) && (srcDepth <= dstDepth)) { return; }
@@ -839,7 +1020,7 @@ fn shade(p : u32, px : u32, py : u32) {
 
 	// Alpha blending: ((A - B) * C >> 7) + D
 	var outColor = src;
-	if(bits(flags0, 15u, 1u) != 0u) {
+	if(F_BLEND && (bits(flags0, 15u, 1u) != 0u)) {
 		let alphaFix = i32(sw(s, 17u));
 		var ca = src.rgb;
 		switch(bits(flags0, 16u, 2u)) { case 1u: { ca = dst.rgb; } case 2u: { ca = vec3<i32>(0); } default: { } }
@@ -869,53 +1050,72 @@ fn shade(p : u32, px : u32, py : u32) {
 		}
 		let writeMask = sw(s, 16u);
 		pixel = (pixel & writeMask) | (dstPixel & ~writeMask);
-		if(is16) { write16(fbAddress, pixel); } else if(is24) { write24(fbAddress, pixel); } else { write32(fbAddress, pixel); }
+		(*cache).fb = pixel;
+		(*cache).flags |= 4u;
 	}
 	if(writeDepth) {
-		switch(zbPsm) {
-			case 0x31u: { write24(zbAddress, srcDepth); }
-			case 0x32u, 0x3Au: { write16(zbAddress, srcDepth); }
-			default: { write32(zbAddress, srcDepth); }
-		}
+		(*cache).z = srcDepth;
+		(*cache).flags |= 10u;
 	}
+	if(!PIXEL_CACHE) { writeBackPixel(cache); }
 }
 
-// One workgroup per 16x16 tile of the batch's bounding box: test 256 primitive bounding boxes at a time
-// against the tile, then each invocation (= one pixel) shades the overlapping primitives in order.
-// P: fbPsm, fbAddress, fbWidth, zbPsm, zbAddress, primStart, primCount, originX, originY
-@compute @workgroup_size(16, 16)
+fn writeBackPixel(cache : ptr<function, PixelCache>) {
+	if(((*cache).flags & 4u) != 0u) {
+		switch(param(0u)) {
+			case 0x01u, 0x09u, 0x31u: { write24((*cache).fbAddress, (*cache).fb); }
+			case 0x02u, 0x0Au, 0x3Au: { write16((*cache).fbAddress, (*cache).fb); }
+			default: { write32((*cache).fbAddress, (*cache).fb); }
+		}
+	}
+	if(((*cache).flags & 8u) != 0u) {
+		switch(param(3u)) {
+			case 0x31u: { write24((*cache).zbAddress, (*cache).z); }
+			case 0x32u, 0x3Au: { write16((*cache).zbAddress, (*cache).z); }
+			default: { write32((*cache).zbAddress, (*cache).z); }
+		}
+	}
+	(*cache).flags &= ~12u;
+}
+
+// One workgroup per tile of the batch's bounding box. CGSH_WebGPU::FlushBatch bins the primitives: the tile's
+// list (in drawing order) is upload[binEntries + upload[binOffsets + tile] .. upload[binOffsets + tile + 1]].
+// Each invocation (= one pixel) shades the tile's primitives in order.
+// P: fbPsm, fbAddress, fbWidth, zbPsm, zbAddress, -, -, originX, originY, maxX, maxY, tilesX, binOffsets, binEntries
+@compute @workgroup_size(${this.drawConfig.tile}, ${this.drawConfig.tile})
 fn draw(@builtin(local_invocation_id) lid : vec3<u32>, @builtin(local_invocation_index) li : u32,
         @builtin(workgroup_id) wid : vec3<u32>) {
-	let tileX = param(7u) + wid.x * 16u;
-	let tileY = param(8u) + wid.y * 16u;
-	let px = tileX + lid.x;
-	let py = tileY + lid.y;
-	let primStart = param(5u);
-	let primCount = param(6u);
-	for(var chunk = 0u; chunk < primCount; chunk += 256u) {
-		if(li < 8u) { atomicStore(&primMask[li], 0u); }
-		workgroupBarrier();
-		let i = chunk + li;
-		if(i < primCount) {
-			let b = (primStart + i) * PRIM_WORDS;
-			let bboxMin = prims[b + 26u];
-			let bboxMax = prims[b + 27u];
-			if(((bboxMin & 0xFFFFu) <= tileX + 15u) && ((bboxMax & 0xFFFFu) >= tileX) &&
-			   ((bboxMin >> 16u) <= tileY + 15u) && ((bboxMax >> 16u) >= tileY)) {
-				atomicOr(&primMask[li >> 5u], 1u << (li & 31u));
+	let px = param(7u) + wid.x * TILE_SIZE + lid.x;
+	let py = param(8u) + wid.y * TILE_SIZE + lid.y;
+	let tile = wid.y * param(11u) + wid.x;
+	let begin = upload[param(12u) + tile];
+	let end = upload[param(12u) + tile + 1u];
+	let entries = param(13u);
+	let fbPsm = param(0u);
+	let zbPsm = param(3u);
+	var cache : PixelCache;
+	cache.fbAddress = pixelAddress(fbPsm, param(1u), param(2u), px, py);
+	cache.zbAddress = pixelAddress(zbPsm, param(4u), param(2u), px, py);
+	cache.flags = 0u;
+	for(var chunk = begin; chunk < end; chunk += GROUP_SIZE) {
+		let count = min(GROUP_SIZE, end - chunk);
+		if(PRIM_CACHE) {
+			if(li < count) {
+				let b = upload[entries + chunk + li] * PRIM_WORDS;
+				for(var w = 0u; w < PRIM_WORDS; w++) { primCache[li * PRIM_WORDS + w] = prims[b + w]; }
+			}
+			workgroupBarrier();
+		}
+		for(var k = 0u; k < count; k++) {
+			if(PRIM_CACHE) {
+				shade(k, px, py, &cache);
+			} else {
+				shade(upload[entries + chunk + k], px, py, &cache);
 			}
 		}
-		workgroupBarrier();
-		for(var word = 0u; word < 8u; word++) {
-			var mask = atomicLoad(&primMask[word]);
-			while(mask != 0u) {
-				let bit = firstTrailingBit(mask);
-				mask &= mask - 1u;
-				shade(primStart + chunk + word * 32u + bit, px, py);
-			}
-		}
-		workgroupBarrier();
+		if(PRIM_CACHE) { workgroupBarrier(); }
 	}
+	writeBackPixel(&cache);
 }
 `;
 	},

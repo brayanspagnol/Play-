@@ -22,6 +22,8 @@ public:
 	void InitializeContext();
 	//Output (OffscreenCanvas) size and presentation mode; queued on the GS thread.
 	void SetOutput(int width, int height, PRESENTATION_MODE);
+	//1: log per-frame statistics (batches, primitives, GPU time of the draws) every 2 s from the GS thread
+	void SetDebug(int);
 
 	void SaveState(Framework::CZipArchiveWriter&) override;
 
@@ -72,6 +74,26 @@ public:
 	{
 		PRIM_WORDS = 28,  //3 x (x, y (12.4, offset applied), z, rgba, s, t, q, fog), type, state, bbox min, bbox max
 		STATE_WORDS = 40, //see SetRenderingContext
+		DRAW_TILE_SIZE = 8, //pixels per side of a draw shader tile (workgroup), see GsWgpu.drawConfig.tile
+	};
+
+	//Features of a draw batch, the draw shader is specialized for them (GsWgpu.drawFeatures)
+	enum DRAW_FEATURE : uint32
+	{
+		DRAW_FEATURE_TEXTURE = 1 << 0,
+		DRAW_FEATURE_LINEAR = 1 << 1,
+		DRAW_FEATURE_MIPLOD = 1 << 2,
+		DRAW_FEATURE_CLUT = 1 << 3,
+		DRAW_FEATURE_MEMCOPY = 1 << 4,
+		DRAW_FEATURE_BLEND = 1 << 5,
+		DRAW_FEATURE_FOG = 1 << 6,
+		DRAW_FEATURE_ALPHATEST = 1 << 7,
+		DRAW_FEATURE_DATE = 1 << 8,
+		DRAW_FEATURE_DEPTHTEST = 1 << 9,
+		DRAW_FEATURE_DEPTHWRITE = 1 << 10,
+		DRAW_FEATURE_TRIANGLE = 1 << 11,
+		DRAW_FEATURE_SPRITE = 1 << 12,
+		DRAW_FEATURE_LINE = 1 << 13,
 	};
 
 	enum PRIM_TYPE : uint32
@@ -126,6 +148,7 @@ private:
 		uint32 zbWriteEnd = 0;
 		uint32 primStart = 0;
 		uint32 minX = ~0U, minY = ~0U, maxX = 0, maxY = 0;
+		uint32 features = 0;
 	};
 
 	void ProcessPrim(uint64);
@@ -144,7 +167,7 @@ private:
 	uint32* AllocParams(uint32& offset);
 	void PushCommand(std::initializer_list<uint32>);
 	void Dispatch(PIPELINE, uint32 paramsOffset, uint32 groupsX, uint32 groupsY = 1, uint32 groupsZ = 1);
-	void Flush();
+	bool Flush();
 	void Readback(uint32 address, uint32 size);
 
 	void UploadSwizzleTables();
@@ -195,8 +218,10 @@ private:
 	//Primitives and states of the current command list, batches of primitives (see notes/webgpu.md)
 	std::vector<uint32> m_prims;
 	std::vector<uint32> m_states;
+	std::vector<uint32> m_binOffsets;
 	uint32 m_state[STATE_WORDS] = {};
 	int32 m_stateIndex = -1; //index of m_state in m_states, -1 when not stored yet
+	uint32 m_stateFeatures = 0; //DRAW_FEATURE_* used by m_state
 	BATCH m_batch;
 	bool m_memoryCopyActive = false;
 	uint32 m_memoryCopyAddress = 0;
