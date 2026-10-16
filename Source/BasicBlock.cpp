@@ -192,7 +192,7 @@ void CBasicBlock::Compile()
 		cacheKey.hints = m_blockCompileHints;
 		//0x24000000: superblock (0x04000000: structured parts, not the earlier dispatch loop)
 		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000) | (IsSuperBlock() ? 0x24000000 : 0) | (UsesBlockChaining() ? 0x10000000 : 0) | ((g_jitPageAccess != ~0U) ? (0x08000000 | (g_jitPageAccess & 0x3FF)) : 0);
-		cacheKey.hash[0] = xxHash.low64;
+		cacheKey.hash[0] = xxHash.low64 ^ m_cacheSalt;
 		cacheKey.hash[1] = xxHash.high64 ^ BlockCache::CODEGEN_VERSION;
 
 		thread_local std::vector<uint8> cachedCode;
@@ -553,31 +553,111 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 		jitter->EndIf();
 	}
 
-	if(UsesBlockChaining())
+	if(UsesBlockChaining() && !m_compilingRegionPart)
 	{
-		//Same as one more iteration of the executor loop: if there is no exception (cycle quota
-		//exhausted, syscall, idle loop, ...), look up the block at nPC and tail call it. No block
-		//there (index 0): return, the executor compiles it. Blocks deleted by the software write
-		//protection have their index cleared, and nPC is the running block's address at any time.
-		jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
-		jitter->PushCst(0);
-		jitter->BeginIf(Jitter::CONDITION_EQ);
-		{
-			jitter->PushRelRef(offsetof(CMIPS, m_blockFnLookup));
-			jitter->PushRel(offsetof(CMIPS, m_State.nPC));
-			jitter->Srl(16);
-			jitter->PushCst(0x1FFF); //EE address mask (0x1FFFFFFF) >> 16
-			jitter->And();
-			jitter->LoadRefFromRefIdx();
-			jitter->PushRel(offsetof(CMIPS, m_State.nPC));
-			jitter->Srl(2);
-			jitter->PushCst(0x3FFF);
-			jitter->And();
-			jitter->LoadFromRefIdx();
-			jitter->JumpToIndirect();
-		}
-		jitter->EndIf();
+		CompileBlockChaining(jitter);
 	}
+}
+
+void CBasicBlock::CompileBlockChaining(CMipsJitter* jitter)
+{
+	//Same as one more iteration of the executor loop: if there is no exception (cycle quota
+	//exhausted, syscall, idle loop, ...), look up the block at nPC and tail call it. No block
+	//there (index 0): return, the executor compiles it. Blocks deleted by the software write
+	//protection have their index cleared, and nPC is the running block's address at any time.
+	jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
+	jitter->PushCst(0);
+	jitter->BeginIf(Jitter::CONDITION_EQ);
+	{
+		jitter->PushRelRef(offsetof(CMIPS, m_blockFnLookup));
+		jitter->PushRel(offsetof(CMIPS, m_State.nPC));
+		jitter->Srl(16);
+		jitter->PushCst(0x1FFF); //EE address mask (0x1FFFFFFF) >> 16
+		jitter->And();
+		jitter->LoadRefFromRefIdx();
+		jitter->PushRel(offsetof(CMIPS, m_State.nPC));
+		jitter->Srl(2);
+		jitter->PushCst(0x3FFF);
+		jitter->And();
+		jitter->LoadFromRefIdx();
+		jitter->JumpToIndirect();
+	}
+	jitter->EndIf();
+}
+
+bool CBasicBlock::IsReducible(const std::vector<SUPERBLOCK_PART>& parts)
+{
+	//Every edge to a part that comes earlier in reverse postorder must go to a part that dominates
+	//its source: the wasm backend can't structure anything else.
+	size_t partCount = parts.size();
+	auto partIndex = [&](uint32 address) -> int {
+		for(size_t i = 0; i < partCount; i++)
+		{
+			if(parts[i].begin == address) return static_cast<int>(i);
+		}
+		return -1;
+	};
+	assert(partCount <= 32);
+	std::vector<uint32> dominators(partCount, static_cast<uint32>((1ULL << partCount) - 1));
+	dominators[0] = 1;
+	for(bool changed = true; changed;)
+	{
+		changed = false;
+		for(size_t i = 1; i < partCount; i++)
+		{
+			uint32 newDominators = static_cast<uint32>((1ULL << partCount) - 1);
+			for(size_t p = 0; p < partCount; p++)
+			{
+				for(uint32 successor : parts[p].successors)
+				{
+					if(partIndex(successor) == static_cast<int>(i)) newDominators &= dominators[p];
+				}
+			}
+			newDominators |= (1U << i);
+			if(newDominators != dominators[i])
+			{
+				dominators[i] = newDominators;
+				changed = true;
+			}
+		}
+	}
+	std::vector<int> rpo(partCount, -1);
+	{
+		std::vector<int> postorder;
+		std::vector<std::pair<int, int>> stack = {{0, 0}};
+		std::vector<bool> visited(partCount, false);
+		visited[0] = true;
+		while(!stack.empty())
+		{
+			int x = stack.back().first;
+			int successorIndex = stack.back().second++;
+			if(successorIndex < 2)
+			{
+				int y = partIndex(parts[x].successors[successorIndex]);
+				if((y >= 0) && !visited[y])
+				{
+					visited[y] = true;
+					stack.push_back({y, 0});
+				}
+				continue;
+			}
+			postorder.push_back(x);
+			stack.pop_back();
+		}
+		for(size_t i = 0; i < postorder.size(); i++)
+		{
+			rpo[postorder[i]] = static_cast<int>(postorder.size() - 1 - i);
+		}
+	}
+	for(size_t x = 0; x < partCount; x++)
+	{
+		for(uint32 successor : parts[x].successors)
+		{
+			int y = partIndex(successor);
+			if((y >= 0) && (rpo[y] <= rpo[x]) && !(dominators[x] & (1U << y))) return false;
+		}
+	}
+	return true;
 }
 
 bool CBasicBlock::MaySetDelayedJump() const

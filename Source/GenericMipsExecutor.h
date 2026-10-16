@@ -244,7 +244,8 @@ protected:
 		}
 	}
 
-	virtual void PartitionFunction(uint32 startAddress)
+	//Tier-1 block boundary rule: end address of the block starting at startAddress and its branch target
+	std::pair<uint32, uint32> FindBlockEnd(uint32 startAddress) const
 	{
 		uint32 endAddress = startAddress + MAX_BLOCK_SIZE;
 		uint32 branchAddress = MIPS_INVALID_PC;
@@ -275,6 +276,12 @@ protected:
 				break;
 			}
 		}
+		return std::make_pair(endAddress, branchAddress);
+	}
+
+	virtual void PartitionFunction(uint32 startAddress)
+	{
+		auto [endAddress, branchAddress] = FindBlockEnd(startAddress);
 		assert((endAddress - startAddress) <= MAX_BLOCK_SIZE);
 		assert(endAddress <= m_maxAddress);
 		CreateBlock(startAddress, endAddress);

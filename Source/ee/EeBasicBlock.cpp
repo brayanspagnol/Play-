@@ -1,5 +1,7 @@
 #include "EeBasicBlock.h"
 #include "offsetof_def.h"
+#include <algorithm>
+#include "xxhash.h"
 
 void CEeBasicBlock::SetFpRoundingMode(Jitter::CJitter::ROUNDINGMODE fpRoundingMode)
 {
@@ -171,4 +173,125 @@ bool CEeBasicBlock::IsCodeIdleLoopBlock() const
 	assert(compareRsDefined || compareRtDefined);
 
 	return true;
+}
+
+void CEeBasicBlock::SetRegionParts(std::vector<SUPERBLOCK_PART> parts)
+{
+	m_regionParts = std::move(parts);
+	m_cacheSalt = GetRegionLayoutHash(m_regionParts, m_begin);
+}
+
+bool CEeBasicBlock::IsSuperBlock() const
+{
+	return !m_regionParts.empty();
+}
+
+uint64 CEeBasicBlock::GetRegionLayoutHash(const std::vector<SUPERBLOCK_PART>& parts, uint32 begin)
+{
+	if(parts.empty()) return 0;
+	std::vector<uint32> layout;
+	for(const auto& part : parts)
+	{
+		for(uint32 address : {part.begin, part.end, part.successors[0], part.successors[1]})
+		{
+			layout.push_back((address == MIPS_INVALID_PC) ? address : (address - begin));
+		}
+	}
+	return XXH3_64bits(layout.data(), layout.size() * sizeof(uint32));
+}
+
+void CEeBasicBlock::CompileRange(CMipsJitter* jitter)
+{
+	if(m_regionParts.empty())
+	{
+		CBasicBlock::CompileRange(jitter);
+		return;
+	}
+
+	//Function layout (a general control flow graph, structured by the wasm backend):
+	//  regionBase = nPC (the executor only enters a block at its first address)
+	//  for each part, in address order (parts[0] is the entry):
+	//    part label: the part's code and epilog, as the tier-1 block (without chaining)
+	//    if(nHasException == 0) for each static successor that is a part: if(nPC - regionBase == its offset) goto its label
+	//    goto exit
+	//  exit: block chaining, as at the end of a tier-1 block
+	//Offsets are relative to the entry, so the code is position independent like other blocks. When code is
+	//invalidated while the region runs, the executor sets regionBase to an odd value: no comparison matches
+	//anymore and the region returns after the current part, as a tier-1 block would.
+	const size_t baseOffset = offsetof(CMIPS, m_jitFlagScratch[4]);
+	uint32 savedBegin = m_begin;
+	uint32 savedEnd = m_end;
+
+	jitter->PushRel(offsetof(CMIPS, m_State.nPC));
+	jitter->PullRel(baseOffset);
+
+	CompileProlog(jitter);
+
+	auto parts = m_regionParts;
+	std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.begin < b.begin; });
+	assert(parts[0].begin == savedBegin);
+
+	std::vector<CMipsJitter::LABEL> partLabels;
+	for(size_t i = 0; i < parts.size(); i++)
+	{
+		partLabels.push_back(jitter->CreateLabel());
+	}
+	auto exitLabel = jitter->CreateLabel();
+
+	m_context.m_pArch->SetCompileHints(m_blockCompileHints);
+
+	for(size_t partIndex = 0; partIndex < parts.size(); partIndex++)
+	{
+		const auto& part = parts[partIndex];
+		jitter->MarkLabel(partLabels[partIndex]);
+
+		m_begin = part.begin;
+		m_end = part.end;
+
+		for(uint32 address = m_begin; address <= m_end; address += 4)
+		{
+			m_context.m_pArch->CompileInstruction(address, jitter, &m_context, address - m_begin);
+			assert(jitter->IsStackEmpty());
+		}
+		jitter->MarkLastBlockLabel();
+
+		m_compilingRegionPart = true;
+		CompileEpilog(jitter, false);
+		m_compilingRegionPart = false;
+
+		jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
+		jitter->PushCst(0);
+		jitter->BeginIf(Jitter::CONDITION_EQ);
+		{
+			for(size_t successorIndex = 0; successorIndex < 2; successorIndex++)
+			{
+				uint32 successor = part.successors[successorIndex];
+				if((successorIndex == 1) && (successor == part.successors[0])) continue;
+				for(size_t targetIndex = 0; targetIndex < parts.size(); targetIndex++)
+				{
+					if(parts[targetIndex].begin != successor) continue;
+					jitter->PushRel(offsetof(CMIPS, m_State.nPC));
+					jitter->PushRel(baseOffset);
+					jitter->Sub();
+					jitter->PushCst(successor - savedBegin);
+					jitter->BeginIf(Jitter::CONDITION_EQ);
+					{
+						jitter->Goto(partLabels[targetIndex]);
+					}
+					jitter->EndIf();
+				}
+			}
+		}
+		jitter->EndIf();
+		jitter->Goto(exitLabel);
+	}
+	jitter->MarkLabel(exitLabel);
+
+	m_begin = savedBegin;
+	m_end = savedEnd;
+
+	if(UsesBlockChaining())
+	{
+		CompileBlockChaining(jitter);
+	}
 }

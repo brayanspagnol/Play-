@@ -92,6 +92,7 @@ void CMipsJitter::MarkLastBlockLabel()
 	if(m_lastBlockLabel != -1)
 	{
 		MarkLabel(m_lastBlockLabel);
+		m_lastBlockLabel = -1; //(EE regions compile several blocks in one function)
 	}
 }
 

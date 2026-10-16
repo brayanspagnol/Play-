@@ -240,75 +240,7 @@ std::vector<CVuBasicBlock::SUPERBLOCK_PART> CVuExecutor::PlanSuperBlock(uint32 h
 	}
 	if(parts.size() < 2) return {};
 
-	//The part graph must be reducible (every edge to a part that comes earlier in reverse postorder
-	//goes to a part that dominates its source): the wasm backend can't structure anything else.
-	size_t partCount = parts.size();
-	auto partIndex = [&](uint32 address) -> int {
-		for(size_t i = 0; i < partCount; i++)
-		{
-			if(parts[i].begin == address) return static_cast<int>(i);
-		}
-		return -1;
-	};
-	std::vector<uint32> dominators(partCount, (1U << partCount) - 1);
-	dominators[0] = 1;
-	for(bool changed = true; changed;)
-	{
-		changed = false;
-		for(size_t i = 1; i < partCount; i++)
-		{
-			uint32 newDominators = (1U << partCount) - 1;
-			for(size_t p = 0; p < partCount; p++)
-			{
-				for(uint32 successor : parts[p].successors)
-				{
-					if(partIndex(successor) == static_cast<int>(i)) newDominators &= dominators[p];
-				}
-			}
-			newDominators |= (1U << i);
-			if(newDominators != dominators[i])
-			{
-				dominators[i] = newDominators;
-				changed = true;
-			}
-		}
-	}
-	std::vector<int> rpo(partCount, -1);
-	{
-		std::vector<int> postorder;
-		std::vector<std::pair<int, int>> stack = {{0, 0}};
-		std::vector<bool> visited(partCount, false);
-		visited[0] = true;
-		while(!stack.empty())
-		{
-			int x = stack.back().first;
-			int successorIndex = stack.back().second++;
-			if(successorIndex < 2)
-			{
-				int y = partIndex(parts[x].successors[successorIndex]);
-				if((y >= 0) && !visited[y])
-				{
-					visited[y] = true;
-					stack.push_back({y, 0});
-				}
-				continue;
-			}
-			postorder.push_back(x);
-			stack.pop_back();
-		}
-		for(size_t i = 0; i < postorder.size(); i++)
-		{
-			rpo[postorder[i]] = static_cast<int>(postorder.size() - 1 - i);
-		}
-	}
-	for(size_t x = 0; x < partCount; x++)
-	{
-		for(uint32 successor : parts[x].successors)
-		{
-			int y = partIndex(successor);
-			if((y >= 0) && (rpo[y] <= rpo[x]) && !(dominators[x] & (1U << y))) return {};
-		}
-	}
+	if(!CBasicBlock::IsReducible(parts)) return {};
 	return parts;
 }
 

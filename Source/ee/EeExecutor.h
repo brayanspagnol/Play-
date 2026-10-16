@@ -90,6 +90,20 @@ private:
 
 	std::vector<uint8> m_protectedPages;
 	bool m_executing = false;
+	//Tier-2 EE regions (g_eeRegions): plans by entry address, each with a hash of the words of its parts,
+	//so recreating a region after invalidation (same code) skips planning
+	struct REGION_PLAN
+	{
+		uint64 hash = 0;
+		std::vector<CBasicBlock::SUPERBLOCK_PART> parts;
+	};
+	void PartitionFunction(uint32) override;
+	std::vector<CBasicBlock::SUPERBLOCK_PART> PlanRegion(uint32) const;
+	uint64 HashRegionWords(const std::vector<CBasicBlock::SUPERBLOCK_PART>&) const;
+	std::unordered_map<uint32, std::vector<REGION_PLAN>> m_regionPlans;
+	std::vector<CBasicBlock::SUPERBLOCK_PART> m_pendingRegionParts;
+	//Regions removed by an invalidation while they may be running, kept alive until Execute returns
+	std::vector<BasicBlockPtr> m_retiredRegions;
 
 #ifdef PROFILE
 	void ProfileBlockExecuted(uint32) override;

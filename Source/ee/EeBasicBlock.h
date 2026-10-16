@@ -10,6 +10,14 @@ public:
 	void SetFpRoundingMode(Jitter::CJitter::ROUNDINGMODE);
 	void SetIsIdleLoopBlock();
 
+	//Tier-2 region: the tier-1 blocks in parts (parts[0] starts at this block's begin) compiled into one
+	//function with direct jumps between them (see CompileRange). Empty: an ordinary block.
+	void SetRegionParts(std::vector<SUPERBLOCK_PART>);
+	bool IsSuperBlock() const override;
+	void CompileRange(CMipsJitter*) override;
+	//Hash of the part layout (relative to begin), mixed into cache keys of region code
+	static uint64 GetRegionLayoutHash(const std::vector<SUPERBLOCK_PART>&, uint32 begin);
+
 protected:
 	void CompileProlog(CMipsJitter*) override;
 	void CompileEpilog(CMipsJitter*, bool) override;
@@ -21,4 +29,5 @@ private:
 	Jitter::CJitter::ROUNDINGMODE m_fpRoundingMode = DEFAULT_FP_ROUNDING_MODE;
 
 	bool m_isIdleLoopBlock = false;
+	std::vector<SUPERBLOCK_PART> m_regionParts;
 };

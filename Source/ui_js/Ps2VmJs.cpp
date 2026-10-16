@@ -63,6 +63,8 @@ static void RegisterVolatileContextRanges()
 	add(offsetof(CMIPS, m_State.nHasException), offsetof(CMIPS, m_State.nHasException) + 4);
 	add(offsetof(CMIPS, m_State.nCOP0), offsetof(CMIPS, m_State.nCOP1));
 	add(offsetof(CMIPS, m_State.nCOP2), sizeof(MIPSSTATE) + offsetof(CMIPS, m_State));
+	//EE region base: the write watch handler makes it odd to stop a running region
+	add(offsetof(CMIPS, m_jitFlagScratch[4]), offsetof(CMIPS, m_jitFlagScratch[5]));
 }
 
 //Defined by CodeGen (EM_JS): adds a function to this thread's Module.codeGenImportTable

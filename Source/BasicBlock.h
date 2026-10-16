@@ -73,6 +73,22 @@ class CBasicBlock : public std::enable_shared_from_this<CBasicBlock>
 public:
 	CBasicBlock(CMIPS&, uint32 = MIPS_INVALID_PC, uint32 = MIPS_INVALID_PC, BLOCK_CATEGORY = BLOCK_CATEGORY_UNKNOWN);
 	virtual ~CBasicBlock() = default;
+
+	//Part of a superblock (VU) or region (EE): one tier-1 block compiled inside a larger function
+	struct SUPERBLOCK_PART
+	{
+		uint32 begin = 0;
+		uint32 end = 0;
+		uint32 successors[2] = {MIPS_INVALID_PC, MIPS_INVALID_PC}; //Branch target, fall through
+	};
+	//True if the part graph (parts[0] = entry) is reducible, as the wasm structurer requires
+	//(at most 32 parts)
+	static bool IsReducible(const std::vector<SUPERBLOCK_PART>&);
+	//VU superblock or EE region
+	virtual bool IsSuperBlock() const
+	{
+		return false;
+	}
 	void Execute();
 	void Compile();
 	virtual void CompileRange(CMipsJitter*);
@@ -128,6 +144,8 @@ protected:
 
 	uint32 m_blockCompileHints = 0;
 	uint32 m_cacheVariant = 0;
+	//Mixed into the cache key hash (EE regions: part layout)
+	uint64 m_cacheSalt = 0;
 	//Cleared by CompileRange when the generated code depends on more than the block's own words.
 	bool m_cacheable = true;
 
@@ -137,10 +155,6 @@ protected:
 #endif
 	bool UsesContextPromotion() const;
 	bool MaySetDelayedJump() const;
-	virtual bool IsSuperBlock() const
-	{
-		return false;
-	}
 #if defined(__EMSCRIPTEN__)
 	virtual void ExecuteDiff();
 	CMemoryFunction m_refFunction;
@@ -163,6 +177,9 @@ protected:
 	virtual void CompileEpilog(CMipsJitter*, bool);
 	//Block chaining (WebAssembly): the epilog tail calls the next block when there is no exception
 	bool UsesBlockChaining() const;
+	void CompileBlockChaining(CMipsJitter*);
+	//Set while compiling one part of an EE region: the epilog doesn't chain (the region does at its exit)
+	bool m_compilingRegionPart = false;
 
 private:
 	void HandleExternalFunctionReference(uintptr_t, uint32, Jitter::CCodeGen::SYMBOL_REF_TYPE);

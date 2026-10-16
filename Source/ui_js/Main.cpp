@@ -508,6 +508,13 @@ void setEeContextPromotion(bool enabled)
 	g_eeContextPromotion = enabled;
 }
 
+//Tier-2 EE regions: up to this many tier-1 blocks per wasm function (0 = off); for blocks created afterwards
+extern uint32 g_eeRegionParts;
+void setEeRegionParts(uint32 parts)
+{
+	g_eeRegionParts = parts;
+}
+
 extern std::mutex g_eeDumpMutex;
 extern std::set<uint32> g_eeDumpRequest;
 extern std::map<uint32, std::string> g_eeDumpResult;
@@ -843,6 +850,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("eeTimeResult", &eeTimeResult);
 	function("eeTimeVblank", &eeTimeVblank);
 	function("setEeContextPromotion", &setEeContextPromotion);
+	function("setEeRegionParts", &setEeRegionParts);
 	function("eeHashResult", &eeHashResult);
 	function("eeEdgeProfile", &eeEdgeProfile);
 	function("eeDumpRequest", &eeDumpRequest);

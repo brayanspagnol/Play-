@@ -16,12 +16,7 @@ public:
 	//function (state in wasm locals). parts[0] is this block's own range, the other parts are blocks
 	//reachable from it, all inside [begin, end]. Each part ends with direct jumps to the parts among its
 	//static successors (the wasm backend structures the graph, which must be reducible).
-	struct SUPERBLOCK_PART
-	{
-		uint32 begin = 0;
-		uint32 end = 0;
-		uint32 successors[2] = {MIPS_INVALID_PC, MIPS_INVALID_PC}; //Branch target, fall through
-	};
+	//(SUPERBLOCK_PART: see CBasicBlock)
 	void SetSuperBlockParts(std::vector<SUPERBLOCK_PART>);
 	bool IsSuperBlock() const override;
 	//Differential test of superblocks: runs reference blocks one at a time
