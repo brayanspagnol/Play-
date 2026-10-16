@@ -8,6 +8,7 @@
 #include "Vpu.h"
 #include "Vif1.h"
 #include "Vu1Thread.h"
+#include "EeExecutor.h"
 
 #define STATE_PATH_FORMAT ("vpu/vif1_%d.xml")
 #define STATE_REGS_BASE ("BASE")
@@ -104,6 +105,7 @@ uint32 CVif1::ReceiveDMA(uint32 address, uint32 qwc, uint32 direction, bool tagI
 		if(m_role == ROLE_FRONT) gifLock = m_vu1Thread->SyncAndLockGif(CVu1Thread::SYNC_GSREAD);
 		auto gs = m_gif.GetGsHandler();
 		gs->ReadImageData(source + address, size);
+		if(source == m_ram) CEeExecutor::NotifyRamWritten(address, size);
 		return qwc;
 	}
 	else

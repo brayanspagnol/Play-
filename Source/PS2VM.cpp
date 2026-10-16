@@ -353,10 +353,23 @@ std::future<bool> CPS2VM::SaveState(const fs::path& statePath)
 	auto future = promise->get_future();
 	m_mailBox.SendCall(
 	    [this, promise, statePath]() {
-		    auto result = SaveVMState(statePath);
-		    promise->set_value(result);
+		    RunPendingSave(true);
+		    m_pendingSave = [this, promise, statePath]() { promise->set_value(SaveVMState(statePath)); };
+		    m_pendingSaveVblanks = 0;
+		    RunPendingSave(m_nStatus != RUNNING);
 	    });
 	return future;
+}
+
+void CPS2VM::RunPendingSave(bool force)
+{
+	//The state holds the front VIF1 decoder, which already consumed the data still queued for a stalled
+	//VU1 thread: wait (up to ~1 s, the stall needs the game to acknowledge a GS SIGNAL) until it drained
+	if(!m_pendingSave) return;
+	if(!force && (m_pendingSaveVblanks++ < 60) && !m_ee->IsVu1Drained()) return;
+	auto save = std::move(m_pendingSave);
+	m_pendingSave = nullptr;
+	save();
 }
 
 std::future<bool> CPS2VM::LoadState(const fs::path& statePath)
@@ -1026,6 +1039,7 @@ void CPS2VM::EmuThread()
 						CProfiler::GetInstance().CountCurrentZone();
 #endif
 						OnNewFrame();
+						RunPendingSave(false);
 						{
 							bool vu1Threaded = m_vu1ThreadedPreference && m_gameAllowsVu1Threaded;
 							if(vu1Threaded != m_ee->IsVu1Threaded())

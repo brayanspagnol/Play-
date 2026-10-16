@@ -598,9 +598,13 @@ void CGIF::SetRegister(uint32 address, uint32 value)
 {
 	if(address >= GIF_FIFO_START && address < GIF_FIFO_END)
 	{
-		std::unique_lock<std::mutex> gifLock;
-		if(m_vu1Thread) gifLock = m_vu1Thread->SyncAndLockGif(CVu1Thread::SYNC_GIFFIFO);
-		ProcessFifoWrite(address, value);
+		{
+			std::unique_lock<std::mutex> gifLock;
+			if(m_vu1Thread) gifLock = m_vu1Thread->SyncAndLockGif(CVu1Thread::SYNC_GIFFIFO);
+			ProcessFifoWrite(address, value);
+		}
+		//May have finished the packet a stalled VU1 thread waits for
+		if(m_vu1Thread) m_vu1Thread->Wake();
 	}
 	else
 	{
