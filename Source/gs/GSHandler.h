@@ -1037,6 +1037,9 @@ protected:
 	void WriteToDelayedRegister(uint32, uint32, DELAYED_REGISTER&);
 
 	void ThreadProc();
+#ifdef __EMSCRIPTEN__
+	static void ResumeThreadProc(void*);
+#endif
 	virtual void InitializeImpl() = 0;
 	virtual void ReleaseImpl() = 0;
 	void ResetBase();

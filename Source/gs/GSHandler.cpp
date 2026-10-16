@@ -14,6 +14,10 @@
 #include "GsPixelFormats.h"
 #include "string_format.h"
 #include "ThreadUtils.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten/em_js.h>
+#include <emscripten/eventloop.h>
+#endif
 
 //Shadow Hearts 2 looks for this specific value
 #define GS_REVISION (7)
@@ -2200,6 +2204,28 @@ void CGSHandler::WriteToDelayedRegister(uint32 address, uint32 value, DELAYED_RE
 std::atomic<uint64> g_gsThreadBusyNs = 0;
 #endif
 
+#ifdef __EMSCRIPTEN__
+// clang-format off
+EM_JS_DEPS(CGSHandler_ThreadProc, "$getWasmTableEntry,$callUserCallback");
+EM_JS(void, GsJs_ResumeSoon, (void* func, void* arg), {
+	// A task on this worker's own event loop: no setTimeout clamping, no round trip through the main thread.
+	var channel = globalThis.gsResumeChannel;
+	if(!channel)
+	{
+		channel = globalThis.gsResumeChannel = new MessageChannel();
+		channel.port1.onmessage = (e) => callUserCallback(() => getWasmTableEntry(e.data[0])(e.data[1]));
+	}
+	channel.port2.postMessage([func, arg]);
+});
+// clang-format on
+
+void CGSHandler::ResumeThreadProc(void* self)
+{
+	emscripten_runtime_keepalive_pop();
+	reinterpret_cast<CGSHandler*>(self)->ThreadProc();
+}
+#endif
+
 void CGSHandler::ThreadProc()
 {
 	while(!m_threadDone)
@@ -2211,9 +2237,26 @@ void CGSHandler::ThreadProc()
 		while(m_mailBox.IsPending())
 		{
 			m_mailBox.ReceiveCall();
+#ifdef __EMSCRIPTEN__
+			if(m_flipped) break;
+#endif
 		}
 #ifdef PROFILE
 		g_gsThreadBusyNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - busyStart).count();
+#endif
+#ifdef __EMSCRIPTEN__
+		//Browser objects made on this thread (e.g. the ImageBitmap of each presented frame, see
+		//GSH_OpenGLJs) are only released by tasks on this worker's event loop, which never runs while
+		//this loop blocks: about one frame of shared memory leaked per flip until the system ran out
+		//of memory. So after each flip, return to the event loop and resume from a task there (the
+		//keepalive keeps the worker alive; the thread exits normally once m_threadDone is set).
+		if(m_flipped)
+		{
+			m_flipped = false;
+			emscripten_runtime_keepalive_push();
+			GsJs_ResumeSoon(reinterpret_cast<void*>(&CGSHandler::ResumeThreadProc), this);
+			return;
+		}
 #endif
 	}
 }
