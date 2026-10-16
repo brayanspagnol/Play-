@@ -159,6 +159,106 @@ void CEeExecutor::InvalidateWrittenRange(uint32 address, uint32 size, bool execu
 	}
 }
 
+#ifdef PROFILE
+
+void CEeExecutor::StartEdgeProfile(uint32 traceCapacity)
+{
+	m_edges.clear();
+	m_edgeTrace.assign(traceCapacity, 0);
+	m_edgeTraceSize = 0;
+	m_edgePrev = MIPS_INVALID_PC;
+	m_edgeProfiling = true;
+}
+
+void CEeExecutor::ProfileBlockExecuted(uint32 address)
+{
+	if(!m_edgeProfiling) return;
+	uint32 exception = m_context.m_State.nHasException;
+	uint32 kind = (exception == 0) ? 0 : (exception == MIPS_EXCEPTION_STATUS_QUOTADONE) ? 1 : 2;
+	if(m_edgePrev != MIPS_INVALID_PC)
+	{
+		m_edges[(static_cast<uint64>(m_edgePrev) << 32) | address][m_edgePrevKind]++;
+	}
+	m_edgePrev = address;
+	m_edgePrevKind = kind;
+	if(m_edgeTraceSize < m_edgeTrace.size())
+	{
+		m_edgeTrace[m_edgeTraceSize++] = address | kind;
+	}
+}
+
+//Little-endian uint32 stream: magic 'E2M0', version 1,
+//  edge count, edges (src, dst, count kind 0, kind 1, kind 2),
+//  block count, blocks (start, end of the block there now, 0 if gone),
+//  trace length, trace (block start | exit kind),
+//  page count, pages (address, write protected, 1024 instruction words),
+//  branch count, branches in those pages (address, MIPS_BRANCH_TYPE, effective address).
+//Pages: every page holding the start or end of a profiled block, plus every protected page.
+std::vector<uint8> CEeExecutor::StopEdgeProfile()
+{
+	m_edgeProfiling = false;
+	std::vector<uint32> out;
+	out.push_back(0x304D3245);
+	out.push_back(1);
+	std::set<uint32> blocks;
+	out.push_back(static_cast<uint32>(m_edges.size()));
+	for(const auto& edge : m_edges)
+	{
+		uint32 src = static_cast<uint32>(edge.first >> 32);
+		uint32 dst = static_cast<uint32>(edge.first);
+		out.insert(out.end(), {src, dst, edge.second[0], edge.second[1], edge.second[2]});
+		blocks.insert(src);
+		blocks.insert(dst);
+	}
+	std::set<uint32> pages;
+	out.push_back(static_cast<uint32>(blocks.size()));
+	for(uint32 start : blocks)
+	{
+		auto block = FindBlockStartingAt(start);
+		uint32 end = block->IsEmpty() ? 0 : block->GetEndAddress();
+		out.insert(out.end(), {start, end});
+		pages.insert(start / MIPS_PAGE_SIZE);
+		if(end != 0) pages.insert(end / MIPS_PAGE_SIZE);
+	}
+	out.push_back(static_cast<uint32>(m_edgeTraceSize));
+	out.insert(out.end(), m_edgeTrace.begin(), m_edgeTrace.begin() + m_edgeTraceSize);
+	m_edgeTrace = std::vector<uint32>();
+	m_edges.clear();
+	for(uint32 page = 0; page < m_protectedPages.size(); page++)
+	{
+		if(m_protectedPages[page]) pages.insert(page);
+	}
+	std::vector<uint32> branches;
+	uint32 pageCount = 0;
+	size_t pageCountIndex = out.size();
+	out.push_back(0);
+	for(uint32 page : pages)
+	{
+		if(page >= m_protectedPages.size()) continue; //Only EE RAM
+		pageCount++;
+		out.push_back(page * MIPS_PAGE_SIZE);
+		out.push_back(m_protectedPages[page]);
+		for(uint32 address = page * MIPS_PAGE_SIZE; address < (page + 1) * MIPS_PAGE_SIZE; address += 4)
+		{
+			uint32 opcode = m_context.m_pMemoryMap->GetInstruction(address);
+			out.push_back(opcode);
+			auto branchType = m_context.m_pArch->IsInstructionBranch(&m_context, address, opcode);
+			if(branchType != MIPS_BRANCH_NONE)
+			{
+				uint32 target = m_context.m_pArch->GetInstructionEffectiveAddress(&m_context, address, opcode);
+				branches.insert(branches.end(), {address, static_cast<uint32>(branchType), target});
+			}
+		}
+	}
+	out[pageCountIndex] = pageCount;
+	out.push_back(static_cast<uint32>(branches.size() / 3));
+	out.insert(out.end(), branches.begin(), branches.end());
+	auto bytes = reinterpret_cast<const uint8*>(out.data());
+	return std::vector<uint8>(bytes, bytes + (out.size() * 4));
+}
+
+#endif
+
 #endif
 
 void CEeExecutor::SetBlockFpRoundingModes(BlockFpRoundingModeMap blockFpRoundingModes)

@@ -22,6 +22,7 @@
 #include <emscripten.h>
 #include "xxhash.h"
 #include "Ps2Const.h"
+#include "ee/EeExecutor.h"
 
 #ifdef PROFILE
 extern std::atomic<uint64> g_gsThreadBusyNs;
@@ -90,17 +91,48 @@ static void OnVmStateLoaded()
 	g_vblanksSinceLoad = (g_timeTo > 0) ? 0 : -1;
 }
 
+#ifdef PROFILE
+//Tier-2 study: EE block transitions recorded over the timing window (CEeExecutor::StartEdgeProfile),
+//read with eeEdgeProfile() once eeTimeResult() is ready
+static std::vector<uint8> g_edgeProfile;
+
+static CEeExecutor* GetEeExecutor()
+{
+	return static_cast<CEeExecutor*>(g_virtualMachine->m_ee->m_EE.m_executor.get());
+}
+#endif
+
 static void UpdateVblankTiming()
 {
 	if(g_vblanksSinceLoad < 0) return;
 	int count = g_vblanksSinceLoad++;
-	if(count == g_timeFrom) g_timeStart = emscripten_get_now();
+	if(count == g_timeFrom)
+	{
+		g_timeStart = emscripten_get_now();
+#ifdef PROFILE
+		GetEeExecutor()->StartEdgeProfile(8 * 1024 * 1024);
+#endif
+	}
 	if(count == g_timeTo)
 	{
-		g_timeResult = emscripten_get_now() - g_timeStart;
+		double elapsed = emscripten_get_now() - g_timeStart;
+#ifdef PROFILE
+		g_edgeProfile = GetEeExecutor()->StopEdgeProfile();
+#endif
+		g_timeResult = elapsed;
 		g_vblanksSinceLoad = -1;
 		g_timeTo = 0;
 	}
+}
+
+//View of the edge profile bytes (empty in non-profiling builds); copy it before the next window
+emscripten::val eeEdgeProfile()
+{
+#ifdef PROFILE
+	return emscripten::val(emscripten::typed_memory_view(g_edgeProfile.size(), g_edgeProfile.data()));
+#else
+	return emscripten::val::null();
+#endif
 }
 
 static void HashVmState()
@@ -577,6 +609,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("eeTimeVblank", &eeTimeVblank);
 	function("setEeContextPromotion", &setEeContextPromotion);
 	function("eeHashResult", &eeHashResult);
+	function("eeEdgeProfile", &eeEdgeProfile);
 	function("eeDumpRequest", &eeDumpRequest);
 	function("eeStateDump", &eeStateDump);
 	function("setEeBatchSize", &setEeBatchSize);

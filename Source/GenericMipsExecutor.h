@@ -78,6 +78,7 @@ public:
 				auto prevZone = CProfiler::GetInstance().SwapCurrentZone(blockZone);
 				block->Execute();
 				CProfiler::GetInstance().SwapCurrentZone(prevZone);
+				ProfileBlockExecuted(address);
 				continue;
 			}
 			if(m_blockCategory == BLOCK_CATEGORY_PS2_VU)
@@ -173,6 +174,13 @@ protected:
 			block->SetOutLink(static_cast<LINK_SLOT>(i), std::end(m_blockOutLinks));
 		}
 	}
+
+#ifdef PROFILE
+	//Called after each EE block run by the profiling loop (block started at 'address')
+	virtual void ProfileBlockExecuted(uint32 address)
+	{
+	}
+#endif
 
 	virtual BasicBlockPtr BlockFactory(CMIPS& context, uint32 start, uint32 end)
 	{

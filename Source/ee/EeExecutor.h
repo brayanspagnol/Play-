@@ -14,6 +14,8 @@
 #endif
 
 #include <optional>
+#include <array>
+#include <unordered_map>
 
 #include "../GenericMipsExecutor.h"
 
@@ -53,6 +55,13 @@ public:
 
 	//Called before JIT stores outside of RAM/scratchpad (used to sync with the VU1 thread)
 	std::function<void(uint32)> m_ioWriteHandler;
+
+#ifdef PROFILE
+	//Tier-2 study (notes/tier2-m0.md): counts of block -> next block transitions by exit kind, plus a
+	//trace of the first 'traceCapacity' blocks run. Stop returns them with the code pages (see the format there).
+	void StartEdgeProfile(uint32 traceCapacity);
+	std::vector<uint8> StopEdgeProfile();
+#endif
 #else
 	static void NotifyRamWritten(uint32, uint32)
 	{
@@ -81,6 +90,18 @@ private:
 
 	std::vector<uint8> m_protectedPages;
 	bool m_executing = false;
+
+#ifdef PROFILE
+	void ProfileBlockExecuted(uint32) override;
+	bool m_edgeProfiling = false;
+	uint32 m_edgePrev = MIPS_INVALID_PC;
+	uint32 m_edgePrevKind = 0;
+	//(src << 32 | dst) -> count per exit kind of src: 0 no exception, 1 cycle quota only, 2 other exception
+	std::unordered_map<uint64, std::array<uint32, 3>> m_edges;
+	//Block start | exit kind, in execution order
+	std::vector<uint32> m_edgeTrace;
+	size_t m_edgeTraceSize = 0;
+#endif
 #endif
 
 	bool HandleAccessFault(intptr_t);
