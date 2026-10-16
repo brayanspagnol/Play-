@@ -558,13 +558,23 @@ extern "C" void initVm()
 	gs->SendGSCall([gs]() { gs->InitializeContext(); });
 }
 
+//The page left the game: stop emulating until the next boot (VM thread idle, audio context suspended).
+//Booting resets the VM and resumes it.
+void pauseVm()
+{
+	g_virtualMachine->PauseAsync();
+	EM_ASM({ Module["audioSetPaused"](true); });
+}
+
 void bootElf(std::string path)
 {
+	EM_ASM({ Module["audioSetPaused"](false); });
 	g_virtualMachine->BootElf(path);
 }
 
 void bootDiscImage(std::string path)
 {
+	EM_ASM({ Module["audioSetPaused"](false); });
 	g_virtualMachine->BootDiscImage(path);
 }
 
@@ -605,6 +615,7 @@ EMSCRIPTEN_BINDINGS(Play)
 
 	function("bootElf", &bootElf);
 	function("bootDiscImage", &bootDiscImage);
+	function("pauseVm", &pauseVm);
 	function("setDiscImageUrl", &Js_SetDiscImageUrl);
 	function("getFrames", &getFrames);
 	function("clearStats", &clearStats);
