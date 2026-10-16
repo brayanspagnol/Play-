@@ -120,6 +120,8 @@ void CGSH_OpenGL::ResetImpl()
 	m_validGlState = 0;
 	m_nVtxCount = 0;
 	m_drawingToDepth = false;
+	m_channelShuffleBase = ~0U;
+	m_skipDraw = false;
 	m_primitiveType = PRIM_INVALID;
 	m_pendingPrim = false;
 	m_pendingPrimValue = 0;
@@ -624,6 +626,8 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
 	{
 		FlushVertexBuffer();
 	}
+
+	m_skipDraw = IsUnsupportedChannelShuffleWrite(prim, frameReg, tex0Reg);
 
 	//--------------------------------------------------------
 	// Apply state changes (order kept similar to original when relevant)
@@ -1371,6 +1375,38 @@ void CGSH_OpenGL::SetupTexture(uint64 primReg, uint64 tex0Reg, uint64 tex1Reg, u
 	m_validGlState &= ~GLSTATE_FRAGMENT_PARAMS;
 }
 
+//God of War builds a mask in the green channel of its 32-bit frame buffer
+//(FBMSK = 0xFFFF00FF), then moves it to alpha and restores green with 16-bit draws that
+//view the same memory as PSMCT16 (a "channel shuffle": PSMCT16 frame and texture on the
+//PSMCT32 buffer's address). This renderer keeps PSMCT16 and PSMCT32 frame buffers in
+//separate textures, so the 16-bit draws never touch the 32-bit buffer and the mask stays
+//in the image (the scene turns green). Once such a shuffle has been seen on a buffer,
+//drop the green-only writes to that buffer: the effect (shadows) is lost, colors are right.
+//ponytail: narrow heuristic; emulating the 16-bit view of the 32-bit buffer would keep the effect.
+bool CGSH_OpenGL::IsUnsupportedChannelShuffleWrite(const PRMODE& prim, uint64 frameReg, uint64 tex0Reg)
+{
+	if(!m_channelShuffleHack) return false;
+	auto frame = make_convertible<FRAME>(frameReg);
+	if((frame.nPsm == PSMCT16) && prim.nTexture)
+	{
+		auto tex0 = make_convertible<TEX0>(tex0Reg);
+		if((tex0.nPsm == PSMCT16) && (tex0.GetBufPtr() == frame.GetBasePtr()))
+		{
+			bool overColorBuffer = std::any_of(std::begin(m_framebuffers), std::end(m_framebuffers),
+			                                   [&](const FramebufferPtr& framebuffer) {
+				                                   return (framebuffer->m_psm == PSMCT32) && (framebuffer->m_basePtr == frame.GetBasePtr());
+			                                   });
+			if(overColorBuffer && (m_channelShuffleBase != frame.GetBasePtr()))
+			{
+				m_channelShuffleBase = frame.GetBasePtr();
+				fprintf(stderr, "GSH_OpenGL: 16-bit channel shuffle on the 32-bit frame buffer at 0x%08X, dropping its green-only writes.\n", m_channelShuffleBase);
+			}
+		}
+		return false;
+	}
+	return (frame.nPsm == PSMCT32) && (frame.nMask == 0xFFFF00FF) && (frame.GetBasePtr() == m_channelShuffleBase);
+}
+
 CGSH_OpenGL::FramebufferPtr CGSH_OpenGL::FindFramebuffer(const FRAME& frame) const
 {
 	auto framebufferIterator = std::find_if(std::begin(m_framebuffers), std::end(m_framebuffers),
@@ -1709,6 +1745,12 @@ void CGSH_OpenGL::Prim_Sprite()
 void CGSH_OpenGL::FlushVertexBuffer()
 {
 	if(m_vertexBuffer.empty()) return;
+
+	if(m_skipDraw)
+	{
+		m_vertexBuffer.clear();
+		return;
+	}
 
 	assert(m_renderState.isValid == true);
 
