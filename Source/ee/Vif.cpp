@@ -1189,7 +1189,16 @@ void CVif::SkipUnpack(StreamType& stream, CODE nCommand)
 	}
 
 	uint32 currentNum = (m_NUM == 0) ? 256 : m_NUM;
-	if(clGreaterEqualWl)
+	if((cl == wl) && (m_readTick == m_writeTick) && (m_readTick < wl))
+	{
+		//cl == wl (no skipped ticks): the vectors are contiguous, consume them in one step.
+		//Same result as the loop below, which goes one cycle group (often a single vector) at a time.
+		uint32 count = std::min<uint32>(currentNum, stream.GetAvailableReadBytes() / elementSize);
+		stream.Skip(count * elementSize);
+		currentNum -= count;
+		m_readTick = m_writeTick = (m_readTick + count) % wl;
+	}
+	else if(clGreaterEqualWl)
 	{
 		//Groups of cl ticks: wl vectors read, then (cl - wl) skipped without data
 		while(currentNum != 0)

@@ -379,6 +379,8 @@ std::future<bool> CPS2VM::LoadState(const fs::path& statePath)
 	m_mailBox.SendCall(
 	    [this, promise, statePath]() {
 		    auto result = LoadVMState(statePath);
+		    //The state replaced EE RAM: apply the game's RAM patches again (states saved before a patch was added)
+		    if(result) CGameConfig::ApplyGameConfig(*this);
 		    if(result) OnStateLoaded();
 		    promise->set_value(result);
 	    });
