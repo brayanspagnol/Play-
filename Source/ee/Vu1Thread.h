@@ -68,6 +68,11 @@ public:
 
 	void SetFlushHandler(FunctionType);
 
+	uint64 GetPendingBytes() const
+	{
+		return m_publishedPos - m_readPos;
+	}
+
 private:
 	enum MESSAGE_TYPE : uint32
 	{

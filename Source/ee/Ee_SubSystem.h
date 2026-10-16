@@ -47,6 +47,8 @@ namespace Ee
 		//VU1 on its own thread (see Vu1Thread.h). Must be called from the VM thread.
 		bool SetVu1Threaded(bool);
 		bool IsVu1Threaded() const;
+		//Bytes queued for the VU1 thread and not consumed yet (0 if VU1 is not threaded)
+		uint64 GetVu1PendingBytes() const;
 		//Waits for the VU1 thread to be idle (no-op if VU1 is not threaded)
 		//Runs a function on the VU1 thread after the work queued so far (VU1 must be threaded)
 		void RunOnVu1Thread(CVu1Thread::FunctionType);

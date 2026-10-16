@@ -10,9 +10,6 @@
 #include "../FpUtils.h"
 #include <cfenv>
 
-#ifdef PROFILE
-std::atomic<uint64> g_vu1ThreadBusyNs;
-#endif
 
 CVu1Thread::FunctionType CVu1Thread::ThreadInitHandler;
 
@@ -72,6 +69,10 @@ uint8* CVu1Thread::Reserve(uint32 payloadSize)
 	if((RING_SIZE - (m_writePos - m_readPos)) < needed)
 	{
 		//Ring full: wait for the consumer to free some space
+#ifdef PROFILE
+		CProfilerZone profilerZone(CProfiler::GetInstance().RegisterZone("RINGFULL"));
+#endif
+		CTimelineTimer timer(TLT_RINGFULL);
 		std::unique_lock lock(m_mutex);
 		m_producerWaiting = true;
 		m_idleCondition.wait(lock, [&]() { return (RING_SIZE - (m_writePos - m_readPos)) >= needed; });
@@ -155,6 +156,7 @@ void CVu1Thread::Sync(SYNC_REASON reason)
 	static const char* const zoneNames[SYNC_MAX] = {"SYNC_OTHER", "SYNC_VBLANK", "SYNC_GIFFIFO", "SYNC_GSREAD", "SYNC_VU1MEM", "SYNC_VU1REG", "SYNC_ROW"};
 	CProfilerZone profilerZone(CProfiler::GetInstance().RegisterZone(zoneNames[reason]));
 #endif
+	CTimelineTimer timer(TLT_VU1SYNC);
 	m_idleCondition.wait(lock, isDone);
 }
 
@@ -326,9 +328,7 @@ void CVu1Thread::ThreadProc()
 		lock.unlock();
 		bool stalled = false;
 		{
-#ifdef PROFILE
-			auto busyStart = std::chrono::steady_clock::now();
-#endif
+			CTimelineTimer busyTimer(TLT_VU1BUSY);
 			std::lock_guard gifLock(m_gifMutex);
 			uint64 readPos = m_readPos;
 			while(readPos != published)
@@ -367,9 +367,6 @@ void CVu1Thread::ThreadProc()
 			{
 				stalled = true;
 			}
-#ifdef PROFILE
-			g_vu1ThreadBusyNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - busyStart).count();
-#endif
 		}
 		lock.lock();
 		if(stalled)

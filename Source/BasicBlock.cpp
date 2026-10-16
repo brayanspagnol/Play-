@@ -120,7 +120,6 @@ void CBasicBlock::SetAotBlockOutputStream(Framework::CStdStream* outputStream)
 #endif
 
 #ifdef PROFILE
-std::atomic<uint32> g_blockCompileCount = 0;
 std::atomic<uint32> g_vuBlockExecCount = 0;
 #endif
 
@@ -147,8 +146,9 @@ void CBasicBlock::Compile()
 #ifdef PROFILE
 	static const auto compileZone = CProfiler::GetInstance().RegisterZone("COMPILE");
 	CProfilerZone profilerZone(compileZone);
-	g_blockCompileCount++;
 #endif
+	CTimelineTimer compileTimer(CProfiler::GetInstance().IsWorkThread() ? TLT_COMPILE : TLT_VU1COMPILE);
+	g_timelineCounts[TLC_COMPILES].fetch_add(1, std::memory_order_relaxed);
 #ifndef AOT_USE_CACHE
 
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
@@ -197,6 +197,7 @@ void CBasicBlock::Compile()
 #endif
 
 	Framework::CMemStream stream;
+	g_timelineCounts[TLC_JITRUNS].fetch_add(1, std::memory_order_relaxed);
 	CompileToStream(stream, UsesContextPromotion());
 #ifdef PROFILE
 	if(m_category == BLOCK_CATEGORY_PS2_EE)

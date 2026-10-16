@@ -1049,6 +1049,7 @@ void CPS2VM::EmuThread()
 #ifdef PROFILE
 							CProfilerZone profilerZone(m_limiterProfilerZone);
 #endif
+							CTimelineTimer timer(TLT_LIMITER);
 							m_frameLimiter.EndFrame();
 						}
 						m_frameLimiter.BeginFrame();

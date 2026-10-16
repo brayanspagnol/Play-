@@ -824,6 +824,11 @@ bool CSubSystem::IsVu1Threaded() const
 	return m_vu1Threaded;
 }
 
+uint64 CSubSystem::GetVu1PendingBytes() const
+{
+	return (m_vu1Threaded && m_vu1Thread) ? m_vu1Thread->GetPendingBytes() : 0;
+}
+
 void CSubSystem::SyncVu1(CVu1Thread::SYNC_REASON reason)
 {
 	if(m_vu1Threaded) m_vu1Thread->Sync(reason);
