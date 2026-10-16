@@ -395,6 +395,18 @@ int stateStatus()
 }
 
 //VU1 on its own thread (on by default), applied at the next vblank
+//GS renderer workarounds by name (bench/debug switch). "gowShuffle": see CGSH_OpenGL::IsUnsupportedChannelShuffleWrite.
+bool setGsHack(std::string name, bool enabled)
+{
+	auto gs = static_cast<CGSH_OpenGLJs*>(g_virtualMachine->GetGSHandler());
+	if(name == "gowShuffle")
+	{
+		gs->SetChannelShuffleHack(enabled);
+		return true;
+	}
+	return false;
+}
+
 void setVu1Threaded(bool enabled)
 {
 	g_virtualMachine->SetVu1Threaded(enabled);
@@ -597,6 +609,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("stateStatus", &stateStatus);
 	function("setFrameLimit", &setFrameLimit);
 	function("setVu1Threaded", &setVu1Threaded);
+	function("setGsHack", &setGsHack);
 	function("setEeFrequencyScale", &setEeFrequencyScale);
 	function("blockCacheEnable", &BlockCache::SetEnabled);
 	function("blockCacheClear", &BlockCache::Clear);

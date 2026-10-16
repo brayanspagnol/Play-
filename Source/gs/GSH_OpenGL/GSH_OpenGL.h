@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include <list>
 #include <unordered_map>
 #include "../GSHandler.h"
@@ -29,6 +31,12 @@ public:
 	static void RegisterPreferences();
 
 	void LoadState(Framework::CZipArchiveReader&) override;
+
+	//See IsUnsupportedChannelShuffleWrite. Can be called from any thread.
+	void SetChannelShuffleHack(bool enabled)
+	{
+		m_channelShuffleHack = enabled;
+	}
 
 	void ProcessHostToLocalTransfer() override;
 	void ProcessLocalToHostTransfer() override;
@@ -368,6 +376,7 @@ private:
 	static uint32 GetFramebufferBitDepth(uint32);
 	static TEXTUREFORMAT_INFO GetTextureFormatInfo(uint32);
 
+	bool IsUnsupportedChannelShuffleWrite(const PRMODE&, uint64, uint64);
 	FramebufferPtr FindFramebuffer(const FRAME&) const;
 	DepthbufferPtr FindDepthbuffer(const ZBUF&, const FRAME&) const;
 
@@ -444,6 +453,9 @@ private:
 	PRMODE m_PrimitiveMode;
 	unsigned int m_primitiveType;
 	bool m_drawingToDepth = false;
+	std::atomic<bool> m_channelShuffleHack = true;
+	uint32 m_channelShuffleBase = ~0U;
+	bool m_skipDraw = false;
 
 	static const GLenum g_nativeClampModes[CGSHandler::CLAMP_MODE_MAX];
 	static const unsigned int g_shaderClampModes[CGSHandler::CLAMP_MODE_MAX];
