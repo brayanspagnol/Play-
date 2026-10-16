@@ -142,31 +142,29 @@ void COpticalMedia::CheckDualLayerDvd(const StreamPtr& stream)
 	//- Wild Arms: Alter Code F (US) second layer starts at around 49% of the disc's size.
 	//- MGS2: Substance (US) second layer starts at around 37% of the disc's size.
 
-	//Start looking at about 35% of the disc's size
-	auto searchBlockAddress = imageBlockCount * 7 / 20;
-
-	//The second layer normally starts right after the first layer's volume (volume space size of the
-	//primary volume descriptor at LBA 16). Check there first: the scan below reads every block up to the
-	//layer break (over 1 GB for God of War, a very long stall when the image is read over the network).
+	//Fast path: the second layer's volume descriptor usually sits right after the
+	//first layer, whose size is the volume space size of the first descriptor (sector 16).
+	//Checking it first avoids scanning (reading) hundreds of MB of the image.
 	{
-		uint8 descriptor[84];
-		stream->Seek(16 * blockSize, Framework::STREAM_SEEK_SET);
+		uint8 descriptor[0x58];
+		stream->Seek(static_cast<uint64>(0x10) * blockSize, Framework::STREAM_SEEK_SET);
 		stream->Read(descriptor, sizeof(descriptor));
-		uint32 volumeBlockCount = descriptor[80] | (descriptor[81] << 8) | (descriptor[82] << 16) | (static_cast<uint32>(descriptor[83]) << 24);
-		if((descriptor[0] == 0x01) && !strncmp(reinterpret_cast<const char*>(descriptor + 1), "CD001", 5) &&
-		   (volumeBlockCount >= searchBlockAddress) && (volumeBlockCount < imageBlockCount))
+		uint32 volumeSpaceSize = descriptor[0x50] | (descriptor[0x51] << 8) | (descriptor[0x52] << 16) | (static_cast<uint32>(descriptor[0x53]) << 24);
+		if((volumeSpaceSize > 0x10) && (volumeSpaceSize < imageBlockCount))
 		{
 			char blockHeader[6];
-			stream->Seek(static_cast<uint64>(volumeBlockCount) * blockSize, Framework::STREAM_SEEK_SET);
+			stream->Seek(static_cast<uint64>(volumeSpaceSize) * blockSize, Framework::STREAM_SEEK_SET);
 			stream->Read(blockHeader, sizeof(blockHeader));
 			if((blockHeader[0] == 0x01) && !strncmp(blockHeader + 1, "CD001", 5))
 			{
-				m_dvdSecondLayerStart = volumeBlockCount;
+				m_dvdSecondLayerStart = volumeSpaceSize;
 				return;
 			}
 		}
 	}
 
+	//Start looking at about 35% of the disc's size
+	auto searchBlockAddress = imageBlockCount * 7 / 20;
 	stream->Seek(static_cast<uint64>(searchBlockAddress) * blockSize, Framework::STREAM_SEEK_SET);
 
 	//Scan all blocks from the search point, looking for a valid ISO9660 descriptor

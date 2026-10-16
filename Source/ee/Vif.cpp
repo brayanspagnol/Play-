@@ -995,6 +995,9 @@ void CVif::CFifoStream::Reset()
 	m_endAddress = 0;
 	m_tagIncluded = false;
 	m_source = nullptr;
+	//Forwarding cursor (VU1 thread): a stale one past m_nextAddress makes TakeLoaded return a huge range
+	m_forwardAddress = 0;
+	m_initialTagIncluded = false;
 }
 
 void CVif::CFifoStream::Flush()

@@ -558,6 +558,18 @@ int stateStatus()
 }
 
 //VU1 on its own thread (on by default), applied at the next vblank
+//GS renderer workarounds by name (bench/debug switch). "gowShuffle": see CGSH_OpenGL::IsUnsupportedChannelShuffleWrite.
+bool setGsHack(std::string name, bool enabled)
+{
+	auto gs = static_cast<CGSH_OpenGLJs*>(g_virtualMachine->GetGSHandler());
+	if(name == "gowShuffle")
+	{
+		gs->SetChannelShuffleHack(enabled);
+		return true;
+	}
+	return false;
+}
+
 void setVu1Threaded(bool enabled)
 {
 	g_virtualMachine->SetVu1Threaded(enabled);
@@ -674,13 +686,23 @@ extern "C" void initVm()
 	gs->SendGSCall([gs]() { gs->InitializeContext(); });
 }
 
+//The page left the game: stop emulating until the next boot (VM thread idle, audio context suspended).
+//Booting resets the VM and resumes it.
+void pauseVm()
+{
+	g_virtualMachine->PauseAsync();
+	EM_ASM({ Module["audioSetPaused"](true); });
+}
+
 void bootElf(std::string path)
 {
+	EM_ASM({ Module["audioSetPaused"](false); });
 	g_virtualMachine->BootElf(path);
 }
 
 void bootDiscImage(std::string path)
 {
+	EM_ASM({ Module["audioSetPaused"](false); });
 	g_virtualMachine->BootDiscImage(path);
 }
 
@@ -721,6 +743,7 @@ EMSCRIPTEN_BINDINGS(Play)
 
 	function("bootElf", &bootElf);
 	function("bootDiscImage", &bootDiscImage);
+	function("pauseVm", &pauseVm);
 	function("setDiscImageUrl", &Js_SetDiscImageUrl);
 	function("getFrames", &getFrames);
 	function("clearStats", &clearStats);
@@ -750,6 +773,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("stateStatus", &stateStatus);
 	function("setFrameLimit", &setFrameLimit);
 	function("setVu1Threaded", &setVu1Threaded);
+	function("setGsHack", &setGsHack);
 	function("setEeFrequencyScale", &setEeFrequencyScale);
 	function("blockCacheEnable", &BlockCache::SetEnabled);
 	function("blockCacheClear", &BlockCache::Clear);
