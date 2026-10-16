@@ -35,6 +35,7 @@ std::string g_vuDiffLog;
 std::mutex g_eeDumpMutex;
 std::set<uint32> g_eeDumpRequest;
 std::map<uint32, std::string> g_eeDumpResult;
+thread_local std::string g_superBlockPartsText;
 
 static void VuDiffLog(const char* format, ...)
 {
@@ -142,8 +143,11 @@ bool CBasicBlock::UsesBlockChaining() const
 #endif
 }
 
+std::atomic<uint32> g_vuCompileCount = 0; //VU blocks compiled (replay statistics)
+
 void CBasicBlock::Compile()
 {
+	if(m_category == BLOCK_CATEGORY_PS2_VU) g_vuCompileCount.fetch_add(1, std::memory_order_relaxed);
 #ifdef PROFILE
 	static const auto compileZone = CProfiler::GetInstance().RegisterZone("COMPILE");
 	CProfilerZone profilerZone(compileZone);
@@ -163,6 +167,14 @@ void CBasicBlock::Compile()
 	{
 		std::lock_guard<std::mutex> lock(g_eeDumpMutex);
 		dumpBlock = g_eeDumpRequest.count(m_begin) != 0;
+	}
+	//VU1 blocks: request FFFFFFFF dumps every one, keyed 0x80000000 | superblock 0x40000000 | promoted 0x20000000 | begin
+	uint32 dumpKey = m_begin;
+	if((m_category == BLOCK_CATEGORY_PS2_VU) && (m_diffDataSize > 0x1000))
+	{
+		std::lock_guard<std::mutex> lock(g_eeDumpMutex);
+		dumpBlock = g_eeDumpRequest.count(0xFFFFFFFF) != 0;
+		dumpKey = 0x80000000 | (IsSuperBlock() ? 0x40000000 : 0) | (UsesContextPromotion() ? 0x20000000 : 0) | m_begin;
 	}
 	bool useBlockCache = BlockCache::IsEnabled() && !IsEmpty() && !dumpBlock && (g_vuExperiment == 0) && !(g_vuDiffMode && (m_category == BLOCK_CATEGORY_PS2_VU));
 	if(useBlockCache)
@@ -217,7 +229,7 @@ void CBasicBlock::Compile()
 	{
 		std::vector<uint8> code(stream.GetBuffer(), stream.GetBuffer() + stream.GetSize());
 		char line[2304];
-		snprintf(line, sizeof(line), "BLOCK %08X %08X %u\n", m_begin, m_end, static_cast<uint32>(code.size()));
+		snprintf(line, sizeof(line), "BLOCK %08X %08X %u\n", dumpKey, m_end, static_cast<uint32>(code.size()));
 		std::string text = line;
 		for(uint32 address = m_begin; address <= m_end; address += 4)
 		{
@@ -228,6 +240,7 @@ void CBasicBlock::Compile()
 			snprintf(line, sizeof(line), "; %08X %08X %s %s\n", address, opcode, mnemonic, operands);
 			text += line;
 		}
+		if(IsSuperBlock()) text += g_superBlockPartsText;
 		text += "HEX ";
 		static const char hexDigits[] = "0123456789ABCDEF";
 		for(uint8 byte : code)
@@ -237,7 +250,7 @@ void CBasicBlock::Compile()
 		}
 		text += "\n";
 		std::lock_guard<std::mutex> lock(g_eeDumpMutex);
-		g_eeDumpResult[m_begin] = std::move(text); //latest compile wins
+		g_eeDumpResult[dumpKey] = std::move(text); //latest compile wins
 	}
 	//(Not the executor's empty block: it compiles and runs the real block, which has its own test)
 	if(g_vuDiffMode && (m_category == BLOCK_CATEGORY_PS2_VU) && UsesContextPromotion() && !IsEmpty())

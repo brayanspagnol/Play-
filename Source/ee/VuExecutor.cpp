@@ -33,6 +33,7 @@ void CVuExecutor::Reset()
 {
 	m_referenceBlocks.clear();
 	m_cachedBlocks.clear();
+	m_superBlockPlans.clear();
 	m_blockNoClamping.clear();
 	CGenericMipsExecutor::Reset();
 }
@@ -41,6 +42,7 @@ void CVuExecutor::DropBlocks()
 {
 	m_referenceBlocks.clear();
 	m_cachedBlocks.clear();
+	m_superBlockPlans.clear();
 	CGenericMipsExecutor::Reset();
 }
 
@@ -209,7 +211,11 @@ std::vector<CVuBasicBlock::SUPERBLOCK_PART> CVuExecutor::PlanSuperBlock(uint32 h
 	std::vector<CVuBasicBlock::SUPERBLOCK_PART> parts;
 	uint32 limit = std::min<uint32>(head + MAX_BLOCK_SIZE, m_maxAddress);
 	std::vector<uint32> queue = {head};
-	for(size_t i = 0; (i < queue.size()) && (parts.size() < MAX_PARTS); i++)
+	//Replay experiment bits 0xC00: part cap 2 / 4 / 8
+	extern int g_vuExperiment;
+	static const size_t experimentCaps[4] = {MAX_PARTS, 2, 4, 8};
+	size_t maxParts = experimentCaps[(g_vuExperiment >> 10) & 3];
+	for(size_t i = 0; (i < queue.size()) && (parts.size() < maxParts); i++)
 	{
 		uint32 begin = queue[i];
 		auto endInfo = FindBlockEnd(begin);
@@ -331,7 +337,14 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
 	uint32 endAddress = endInfo.end;
 	if(g_vuSuperBlocks && g_vuContextPromotion)
 	{
-		m_pendingSuperBlockParts = PlanSuperBlock(startAddress);
+		uint32 limit = std::min<uint32>(startAddress + MAX_BLOCK_SIZE, m_maxAddress);
+		auto planKey = std::make_pair(startAddress, ComputeBlockKey(startAddress, limit - 4));
+		auto planIterator = m_superBlockPlans.find(planKey);
+		if(planIterator == std::end(m_superBlockPlans))
+		{
+			planIterator = m_superBlockPlans.emplace(planKey, PlanSuperBlock(startAddress)).first;
+		}
+		m_pendingSuperBlockParts = planIterator->second;
 		for(const auto& part : m_pendingSuperBlockParts)
 		{
 			endAddress = std::max(endAddress, part.end);

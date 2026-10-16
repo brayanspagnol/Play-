@@ -393,6 +393,8 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 	for(int round = 0; round < 9; round++)
 	{
 		int variant = round % 3;
+		//(Experiment bits 0x10000 / 0x20000: every round runs the promoted / superblock variant, for profiling)
+		if(g_vuReplayExperiment & 0x30000) variant = (g_vuReplayExperiment & 0x10000) ? 1 : 2;
 		g_vuContextPromotion = (variant != 0);
 		g_vuSuperBlocks = (variant == 2);
 		g_vuExperiment = (variant != 0) ? g_vuReplayExperiment : 0;
@@ -410,6 +412,8 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 #endif
 		m_ctx->m_jitFlagScratch[3] = 0;
 		m_ctx->m_jitFlagScratch[5] = 0;
+		extern std::atomic<uint32> g_vuCompileCount;
+		uint32 compilesBefore = g_vuCompileCount;
 		double start = emscripten_get_now();
 		for(uint32 i = 0; i < iterations; i++)
 		{
@@ -434,6 +438,7 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 		{
 			for(size_t i = 0; i < hashes.size(); i++) mismatches += (hashes[i] != refHashes[i]) ? 1 : 0;
 		}
+		result += string_format("compiles in timed window %u\n", static_cast<uint32>(g_vuCompileCount - compilesBefore));
 		result += string_format("%s: %.1f us/program (%u programs x %u), mismatches %u\n",
 		                        variantNames[variant], elapsed * 1000.0 / (iterations * g_vuCaptures.size()),
 		                        static_cast<uint32>(g_vuCaptures.size()), iterations, mismatches);

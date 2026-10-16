@@ -101,6 +101,17 @@ void CVuBasicBlock::CompileSuperBlock(CMipsJitter* jitter)
 	std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.begin < b.begin; });
 	assert(parts[0].begin == savedBegin);
 
+	//(Debug dump: part ranges of the superblock compiled last on this thread)
+	extern thread_local std::string g_superBlockPartsText;
+	g_superBlockPartsText = "PARTS";
+	for(const auto& part : parts)
+	{
+		char text[32];
+		snprintf(text, sizeof(text), " %04X-%04X", part.begin, part.end);
+		g_superBlockPartsText += text;
+	}
+	g_superBlockPartsText += "\n";
+
 	std::vector<CMipsJitter::LABEL> partLabels;
 	for(size_t i = 0; i < parts.size(); i++)
 	{
@@ -158,7 +169,9 @@ void CVuBasicBlock::CompileSuperBlock(CMipsJitter* jitter)
 void CVuBasicBlock::CompileBody(CMipsJitter* jitter, bool allowSelfLoop)
 {
 	//Flag forwarding never crosses block boundaries
-	VUShared::ResetFlagForwarding(m_compileOptimized);
+	//(Replay experiment 0x1000: superblocks without flag forwarding)
+	extern int g_vuExperiment;
+	VUShared::ResetFlagForwarding(m_compileOptimized && !(IsSuperBlock() && (g_vuExperiment & 0x1000)));
 
 	assert((m_begin & 0x07) == 0);
 	assert(((m_end + 4) & 0x07) == 0);

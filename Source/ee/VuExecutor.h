@@ -58,6 +58,9 @@ protected:
 
 	//Parts of the superblock being created (consumed by BlockFactory)
 	std::vector<CVuBasicBlock::SUPERBLOCK_PART> m_pendingSuperBlockParts;
+	//PlanSuperBlock results by (head, key of the code in [head, head + MAX_BLOCK_SIZE)): microprogram uploads
+	//invalidate every block, and planning again on each re-creation costs more than the superblock saves
+	std::map<std::pair<uint32, CachedBlockKey>, std::vector<CVuBasicBlock::SUPERBLOCK_PART>> m_superBlockPlans;
 	//Differential test: standalone reference blocks the superblocks are compared against
 	std::map<uint32, BasicBlockPtr> m_referenceBlocks;
 };
