@@ -12,13 +12,15 @@ public:
 
 	bool IsLinkable() const;
 
-	//Superblock: several VU blocks compiled into one function with a dispatch loop on nPC, so
-	//block transitions stay inside the function (state in wasm locals). parts[0] is this block's
-	//own range, the other parts are blocks reachable from it, all inside [begin, end].
+	//Superblock: several VU blocks compiled into one function, so block transitions stay inside the
+	//function (state in wasm locals). parts[0] is this block's own range, the other parts are blocks
+	//reachable from it, all inside [begin, end]. Each part ends with direct jumps to the parts among its
+	//static successors (the wasm backend structures the graph, which must be reducible).
 	struct SUPERBLOCK_PART
 	{
 		uint32 begin = 0;
 		uint32 end = 0;
+		uint32 successors[2] = {MIPS_INVALID_PC, MIPS_INVALID_PC}; //Branch target, fall through
 	};
 	void SetSuperBlockParts(std::vector<SUPERBLOCK_PART>);
 	bool IsSuperBlock() const override;

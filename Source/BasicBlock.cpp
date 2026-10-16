@@ -178,7 +178,8 @@ void CBasicBlock::Compile()
 		cacheKey.category = m_category;
 		cacheKey.size = wordCount * 4;
 		cacheKey.hints = m_blockCompileHints;
-		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000) | (IsSuperBlock() ? 0x20000000 : 0) | (UsesBlockChaining() ? 0x10000000 : 0) | ((g_jitPageAccess != ~0U) ? (0x08000000 | (g_jitPageAccess & 0x3FF)) : 0);
+		//0x24000000: superblock (0x04000000: structured parts, not the earlier dispatch loop)
+		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000) | (IsSuperBlock() ? 0x24000000 : 0) | (UsesBlockChaining() ? 0x10000000 : 0) | ((g_jitPageAccess != ~0U) ? (0x08000000 | (g_jitPageAccess & 0x3FF)) : 0);
 		cacheKey.hash[0] = xxHash.low64;
 		cacheKey.hash[1] = xxHash.high64;
 
@@ -571,8 +572,15 @@ void CBasicBlock::CompileToStream(Framework::CMemStream& stream, bool contextPro
 	}
 
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+	{
+		//Replay experiment 0x100: superblocks without context promotion
+		extern int g_vuExperiment;
+		if(IsSuperBlock() && (g_vuExperiment & 0x100)) contextPromotion = false;
+	}
 	auto wasmCodeGen = static_cast<Jitter::CCodeGen_Wasm*>(jitter->GetCodeGen());
 	wasmCodeGen->SetContextPromotion(contextPromotion);
+	//Superblocks jump between their parts freely: general control flow structuring
+	wasmCodeGen->SetStructuredControlFlow(IsSuperBlock());
 	if(g_jitFunctionNames)
 	{
 		const char* prefix = (m_category == BLOCK_CATEGORY_PS2_VU) ? (m_diffDataSize > 0x1000 ? "vu1" : "vu0") : (m_category == BLOCK_CATEGORY_PS2_EE) ? "ee" : "iop";

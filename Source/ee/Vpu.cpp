@@ -408,6 +408,8 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 		extern std::atomic<uint32> g_vuBlockExecCount;
 		uint32 blocksBefore = g_vuBlockExecCount;
 #endif
+		m_ctx->m_jitFlagScratch[3] = 0;
+		m_ctx->m_jitFlagScratch[5] = 0;
 		double start = emscripten_get_now();
 		for(uint32 i = 0; i < iterations; i++)
 		{
@@ -417,6 +419,12 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 #ifdef PROFILE
 		result += string_format("blocks/program %.1f\n", static_cast<double>(g_vuBlockExecCount - blocksBefore) / (iterations * g_vuCaptures.size()));
 #endif
+		if(variant == 2)
+		{
+			double programs = static_cast<double>(iterations) * g_vuCaptures.size();
+			result += string_format("superblock entries/program %.1f, parts/entry %.2f\n", m_ctx->m_jitFlagScratch[5] / programs,
+			                        m_ctx->m_jitFlagScratch[5] ? static_cast<double>(m_ctx->m_jitFlagScratch[3]) / m_ctx->m_jitFlagScratch[5] : 0.0);
+		}
 		uint32 mismatches = 0;
 		if(round == 0)
 		{

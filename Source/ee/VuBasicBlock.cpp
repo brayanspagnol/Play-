@@ -72,79 +72,84 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
 
 void CVuBasicBlock::CompileSuperBlock(CMipsJitter* jitter)
 {
-	//Function layout (only uses the Jitter's structured flow: ifs and one loop):
+	//Function layout (a general control flow graph, structured by the wasm backend):
 	//  base = nPC (the executor only enters a block at its first address)
-	//  loop:
-	//    for each part, in address order:
-	//      if((nHasException == 0) && (nPC - base == part offset))
-	//        run the part (same code as a standalone block, epilogue included)
-	//        if(nHasException == 0) and nPC is the start of this part or of an earlier one: goto loop
-	//  (a later part is reached by falling through to its test; anything else returns to the executor)
+	//  for each part, in address order (parts[0] is the entry):
+	//    part label:
+	//      run the part (same code as a standalone block, epilogue included)
+	//      if(nHasException == 0) for each static successor that is a part: if(nPC - base == its offset) goto its label
+	//      goto exit
+	//  exit: (back to the executor)
 	//Offsets are relative to the entry address, so the code is position independent like other blocks.
 	const size_t baseOffset = offsetof(CMIPS, m_jitFlagScratch[4]);
 	const size_t partCountOffset = offsetof(CMIPS, m_jitFlagScratch[3]);
 	uint32 savedBegin = m_begin;
 	uint32 savedEnd = m_end;
 
-	auto pushRelativePc = [&]() {
-		jitter->PushRel(offsetof(CMIPS, m_State.nPC));
-		jitter->PushRel(baseOffset);
-		jitter->Sub();
-	};
-
 	jitter->PushRel(offsetof(CMIPS, m_State.nPC));
 	jitter->PullRel(baseOffset);
 
+	//Entry counter (replay benchmark statistics, with the part counter)
+	jitter->PushRel(offsetof(CMIPS, m_jitFlagScratch[5]));
+	jitter->PushCst(1);
+	jitter->Add();
+	jitter->PullRel(offsetof(CMIPS, m_jitFlagScratch[5]));
+
 	CompileProlog(jitter);
-	jitter->MarkFirstBlockLabel();
 
 	auto parts = m_superBlockParts;
 	std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.begin < b.begin; });
+	assert(parts[0].begin == savedBegin);
+
+	std::vector<CMipsJitter::LABEL> partLabels;
+	for(size_t i = 0; i < parts.size(); i++)
+	{
+		partLabels.push_back(jitter->CreateLabel());
+	}
+	auto exitLabel = jitter->CreateLabel();
 
 	for(size_t partIndex = 0; partIndex < parts.size(); partIndex++)
 	{
 		const auto& part = parts[partIndex];
+		jitter->MarkLabel(partLabels[partIndex]);
+
+		m_begin = part.begin;
+		m_end = part.end;
+
+		jitter->PushRel(partCountOffset);
+		jitter->PushCst(1);
+		jitter->Add();
+		jitter->PullRel(partCountOffset);
+
+		CompileBody(jitter, false);
 
 		jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
 		jitter->PushCst(0);
-		jitter->Cmp(Jitter::CONDITION_EQ);
-		pushRelativePc();
-		jitter->PushCst(part.begin - savedBegin);
-		jitter->Cmp(Jitter::CONDITION_EQ);
-		jitter->And();
-		jitter->PushCst(0);
-		jitter->BeginIf(Jitter::CONDITION_NE);
+		jitter->BeginIf(Jitter::CONDITION_EQ);
 		{
-			m_begin = part.begin;
-			m_end = part.end;
-
-			jitter->PushRel(partCountOffset);
-			jitter->PushCst(1);
-			jitter->Add();
-			jitter->PullRel(partCountOffset);
-
-			CompileBody(jitter, false);
-
-			//Back edges: the next part starts at or before this one
-			jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
-			jitter->PushCst(0);
-			jitter->BeginIf(Jitter::CONDITION_EQ);
+			for(size_t successorIndex = 0; successorIndex < 2; successorIndex++)
 			{
-				for(size_t targetIndex = 0; targetIndex <= partIndex; targetIndex++)
+				uint32 successor = part.successors[successorIndex];
+				if((successorIndex == 1) && (successor == part.successors[0])) continue;
+				for(size_t targetIndex = 0; targetIndex < parts.size(); targetIndex++)
 				{
-					pushRelativePc();
-					jitter->PushCst(parts[targetIndex].begin - savedBegin);
+					if(parts[targetIndex].begin != successor) continue;
+					jitter->PushRel(offsetof(CMIPS, m_State.nPC));
+					jitter->PushRel(baseOffset);
+					jitter->Sub();
+					jitter->PushCst(successor - savedBegin);
 					jitter->BeginIf(Jitter::CONDITION_EQ);
 					{
-						jitter->Goto(jitter->GetFirstBlockLabel());
+						jitter->Goto(partLabels[targetIndex]);
 					}
 					jitter->EndIf();
 				}
 			}
-			jitter->EndIf();
 		}
 		jitter->EndIf();
+		jitter->Goto(exitLabel);
 	}
+	jitter->MarkLabel(exitLabel);
 
 	m_begin = savedBegin;
 	m_end = savedEnd;
