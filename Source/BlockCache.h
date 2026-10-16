@@ -10,6 +10,10 @@
 //with TakePending(). All functions are thread safe.
 namespace BlockCache
 {
+	//Mixed into every key: bump when the JIT output changes (CodeGen or block compilers), so
+	//entries from older code generators are never reused.
+	constexpr uint64 CODEGEN_VERSION = 1; //1: context fields as memarg offsets
+
 #pragma pack(push, 1)
 	struct KEY
 	{

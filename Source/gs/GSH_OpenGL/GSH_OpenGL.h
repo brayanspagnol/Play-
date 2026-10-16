@@ -32,10 +32,10 @@ public:
 
 	void LoadState(Framework::CZipArchiveReader&) override;
 
-	//See IsUnsupportedChannelShuffleWrite. Can be called from any thread.
-	void SetChannelShuffleHack(bool enabled)
+	//See SyncFramebufferAlias. Can be called from any thread, applied at the next frame.
+	void SetFramebufferAliasing(bool enabled)
 	{
-		m_channelShuffleHack = enabled;
+		m_fbAliasEnabled = enabled;
 	}
 
 	void ProcessHostToLocalTransfer() override;
@@ -106,6 +106,12 @@ private:
 		unsigned int alphaFailMethod : 2;
 		unsigned int alphaTestDepthTest_DepthFetch : 1;
 		unsigned int alphaTestDepthTestEqual_DepthFetch : 1;
+
+		//Pass of an additive blend without color clamping (see FlushVertexBuffer)
+		unsigned int colorWrapPass : 2;
+
+		//PSMCT16 frame buffer mask applied in the shader, from a copy of the frame buffer (see DoRenderPassWithCopies)
+		unsigned int ct16MaskFromCopy : 1;
 
 		bool isIndexedTextureSource() const
 		{
@@ -180,7 +186,7 @@ private:
 		uint32 alphaRef;
 		float alphaFix;
 		float fogColor[3];
-		float padding2;
+		uint32 ct16Mask;
 	};
 	static_assert(sizeof(FRAGMENTPARAMS) == 0x40, "Size of FRAGMENTPARAMS must be 64 bytes.");
 
@@ -255,6 +261,13 @@ private:
 		Framework::OpenGl::CRenderbuffer m_colorBufferMs;
 
 		CGsCachedArea m_cachedArea;
+
+		//Copies of m_texture taken before and after a draw (see DoRenderPassWithCopies)
+		Framework::OpenGl::CTexture m_copies[2];
+
+		//PSMCT32 buffer whose memory is also drawn as PSMCT16 (see SyncFramebufferAlias)
+		uint32 m_aliasStaleMask = 0;   //Bytes written here and not yet in the PSMCT16 view
+		bool m_aliasViewNewer = false; //The PSMCT16 view has writes not yet in this buffer
 	};
 	typedef std::shared_ptr<CFramebuffer> FramebufferPtr;
 	typedef std::vector<FramebufferPtr> FramebufferList;
@@ -342,6 +355,7 @@ private:
 	Framework::OpenGl::CVertexArray GeneratePresentVertexArray();
 
 	Framework::OpenGl::ProgramPtr GenerateCopyToFbProgram();
+	Framework::OpenGl::ProgramPtr GenerateAliasProgram();
 	Framework::OpenGl::CBuffer GenerateCopyToFbVertexBuffer();
 	Framework::OpenGl::CVertexArray GenerateCopyToFbVertexArray();
 
@@ -376,7 +390,13 @@ private:
 	static uint32 GetFramebufferBitDepth(uint32);
 	static TEXTUREFORMAT_INFO GetTextureFormatInfo(uint32);
 
-	bool IsUnsupportedChannelShuffleWrite(const PRMODE&, uint64, uint64);
+	FramebufferPtr FindAliasFramebuffer(const FramebufferPtr&) const;
+	void InitFramebufferAlias(const FramebufferPtr&);
+	void SyncFramebufferAlias(const FramebufferPtr&);
+	void ApplyFramebufferAliasSetting();
+	GLuint CopyFramebuffer(const FramebufferPtr&, unsigned int, int, int, int, int);
+	void RunAliasPass(int, const FramebufferPtr&, GLuint, GLuint, uint32, int, int, int, int);
+	void DoRenderPassWithCopies(SHADERCAPS);
 	FramebufferPtr FindFramebuffer(const FRAME&) const;
 	DepthbufferPtr FindDepthbuffer(const ZBUF&, const FRAME&) const;
 
@@ -437,6 +457,11 @@ private:
 	GLint m_copyToFbSrcPositionUniform = -1;
 	GLint m_copyToFbSrcSizeUniform = -1;
 
+	Framework::OpenGl::ProgramPtr m_aliasProgram;
+	GLint m_aliasModeUniform = -1;
+	GLint m_aliasMaskUniform = -1;
+	GLint m_aliasScaleUniform = -1;
+
 	TextureCache m_textureCache;
 	PaletteList m_paletteCache;
 	FramebufferList m_framebuffers;
@@ -453,9 +478,14 @@ private:
 	PRMODE m_PrimitiveMode;
 	unsigned int m_primitiveType;
 	bool m_drawingToDepth = false;
-	std::atomic<bool> m_channelShuffleHack = true;
-	uint32 m_channelShuffleBase = ~0U;
-	bool m_skipDraw = false;
+	std::atomic<bool> m_fbAliasEnabled = true;
+	bool m_fbAliasActive = true;
+	FramebufferPtr m_currentFramebuffer;
+	FramebufferPtr m_currentAliasFramebuffer;
+	uint32 m_ct16DrawMask = 0;
+	bool m_ct16DrawPartialMask = false;
+	bool m_colorWrapAdd = false;
+	bool m_vertexBufferUploaded = false; //Second pass of a draw: primitive buffer already holds m_vertexBuffer
 
 	static const GLenum g_nativeClampModes[CGSHandler::CLAMP_MODE_MAX];
 	static const unsigned int g_shaderClampModes[CGSHandler::CLAMP_MODE_MAX];

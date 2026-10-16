@@ -126,6 +126,7 @@ private:
 	void ResetVM();
 	void DestroyVM();
 	bool SaveVMState(const fs::path&);
+	void RunPendingSave(bool);
 	bool LoadVMState(const fs::path&);
 
 	void SaveVmTimingState(Framework::CZipArchiveWriter&);
@@ -184,6 +185,9 @@ private:
 	CPU_UTILISATION_INFO m_cpuUtilisation;
 
 	std::atomic<bool> m_vu1ThreadedPreference = false;
+	//Save requested while VU1 still had stalled data queued, retried every vblank
+	std::function<void()> m_pendingSave;
+	unsigned int m_pendingSaveVblanks = 0;
 	bool m_gameAllowsVu1Threaded = true;
 	std::atomic<uint32> m_vu1PendingFlips = 0;
 	bool m_singleStepEe = false;

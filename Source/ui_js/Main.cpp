@@ -20,14 +20,13 @@
 #include <atomic>
 #include <algorithm>
 #include <emscripten.h>
+#include <emscripten/html5.h>
+#include <cstring>
 #include "xxhash.h"
 #include "Ps2Const.h"
 #include "ee/EeExecutor.h"
 
 #ifdef PROFILE
-extern std::atomic<uint64> g_gsThreadBusyNs;
-extern std::atomic<uint64> g_vu1ThreadBusyNs;
-extern std::atomic<uint32> g_blockCompileCount;
 extern std::atomic<uint32> g_vuBlockExecCount;
 extern std::atomic<uint32> g_eeSyscallCounts[0x100];
 extern std::atomic<uint32> g_eeInterruptCount;
@@ -53,6 +52,164 @@ struct PROFILE_ACCUM
 static std::mutex g_profileMutex;
 static PROFILE_ACCUM g_profile;
 static double g_profileLastTime = 0;
+
+//Increase of a cumulative counter since the previous call with the same 'last'
+template <typename T>
+static T TakeDelta(const std::atomic<T>& counter, T& last)
+{
+	T value = counter.load(std::memory_order_relaxed);
+	T delta = value - last;
+	last = value;
+	return delta;
+}
+
+//Per-vblank timeline: one row per emulated vblank (wall time, waits, compiles, disc reads, other threads'
+//busy time; zone times in profiling builds), kept in a ring and read with getTimeline(from).
+namespace Timeline
+{
+	enum
+	{
+		RING_SIZE = 16384, //~5 min at 50-60 vblanks/s
+	};
+	//Base columns (all builds)
+	static const char* const g_baseColumns[] = {
+	    "t", "wall", "limiter", "vu1sync", "ringfull", "gswait", "vu1gswait", "disc", "compile", "vu1compile",
+	    "gsbusy", "vu1busy", "compiles", "jitruns", "discKB", "discxhr", "ringKB", "eeBusy"};
+	enum
+	{
+		BASE_COLUMNS = sizeof(g_baseColumns) / sizeof(g_baseColumns[0]),
+#ifdef PROFILE
+		ZONE_COLUMNS = CProfiler::MAX_ZONES,
+		COUNTER_COLUMNS = PCNT_MAX,
+#else
+		ZONE_COLUMNS = 0,
+		COUNTER_COLUMNS = 0,
+#endif
+		COLUMNS = BASE_COLUMNS + COUNTER_COLUMNS + (2 * ZONE_COLUMNS),
+	};
+	static std::mutex g_mutex;
+	static std::vector<float> g_rows; //RING_SIZE * COLUMNS
+	static uint64 g_count = 0;        //rows written so far
+	static double g_start = 0;        //emscripten_get_now() at the first row
+	static double g_startDate = 0;    //Date.now() at the first row
+	static double g_lastTime = 0;
+	static uint64 g_lastNs[TLT_MAX] = {};
+	static uint32 g_lastCounts[TLC_MAX] = {};
+#ifdef PROFILE
+	static uint32 g_lastProfileCounters[PCNT_MAX] = {};
+#endif
+
+	//VM thread, at every vblank (before the profiler's zone times are reset)
+	static void Record(const CPS2VM::CPU_UTILISATION_INFO& cpu)
+	{
+		double now = emscripten_get_now();
+		float row[COLUMNS] = {};
+		if(g_start == 0)
+		{
+			g_start = now;
+			g_startDate = emscripten_date_now();
+			g_lastTime = now;
+		}
+		row[0] = static_cast<float>(now - g_start);
+		row[1] = static_cast<float>(now - g_lastTime);
+		g_lastTime = now;
+		static const TIMELINE_TIMER timers[] = {TLT_LIMITER, TLT_VU1SYNC, TLT_RINGFULL, TLT_GSWAIT, TLT_VU1GSWAIT, TLT_DISC, TLT_COMPILE, TLT_VU1COMPILE, TLT_GSBUSY, TLT_VU1BUSY};
+		unsigned int column = 2;
+		for(auto timer : timers)
+		{
+			row[column++] = static_cast<float>(TakeDelta(g_timelineNs[timer], g_lastNs[timer]) / 1e6);
+		}
+		row[column++] = static_cast<float>(TakeDelta(g_timelineCounts[TLC_COMPILES], g_lastCounts[TLC_COMPILES]));
+		row[column++] = static_cast<float>(TakeDelta(g_timelineCounts[TLC_JITRUNS], g_lastCounts[TLC_JITRUNS]));
+		row[column++] = static_cast<float>(TakeDelta(g_timelineCounts[TLC_DISCBYTES], g_lastCounts[TLC_DISCBYTES]) / 1024.0);
+		row[column++] = static_cast<float>(TakeDelta(g_timelineCounts[TLC_DISCXHR], g_lastCounts[TLC_DISCXHR]));
+		row[column++] = static_cast<float>(g_virtualMachine->m_ee->GetVu1PendingBytes() / 1024.0);
+		row[column++] = cpu.eeTotalTicks ? static_cast<float>(100.0 * (cpu.eeTotalTicks - cpu.eeIdleTicks) / cpu.eeTotalTicks) : 0;
+		assert(column == BASE_COLUMNS);
+#ifdef PROFILE
+		for(uint32 i = 0; i < PCNT_MAX; i++)
+		{
+			row[column++] = static_cast<float>(TakeDelta(g_profileCounters[i], g_lastProfileCounters[i]));
+		}
+		uint64 zoneNs[CProfiler::MAX_ZONES] = {};
+		uint64 secondZoneNs[CProfiler::MAX_ZONES] = {};
+		CProfiler::GetInstance().GetZoneTimes(zoneNs, secondZoneNs, CProfiler::MAX_ZONES);
+		for(uint32 i = 0; i < CProfiler::MAX_ZONES; i++)
+		{
+			row[column + i] = static_cast<float>(zoneNs[i] / 1e6);
+			row[column + CProfiler::MAX_ZONES + i] = static_cast<float>(secondZoneNs[i] / 1e6);
+		}
+#endif
+		std::lock_guard<std::mutex> lock(g_mutex);
+		if(g_rows.empty()) g_rows.resize(RING_SIZE * COLUMNS);
+		memcpy(g_rows.data() + (g_count % RING_SIZE) * COLUMNS, row, sizeof(row));
+		g_count++;
+	}
+
+	//JSON: {"cols":[...],"next":<index after the last row>,"t0":<Date.now() of row t=0>,"rows":[[...],...]}
+	//with the rows of index >= from that are still in the ring.
+	static std::string Get(double fromValue)
+	{
+		std::vector<float> rows;
+		uint64 first = 0, next = 0;
+		double startDate = 0;
+		{
+			std::lock_guard<std::mutex> lock(g_mutex);
+			next = g_count;
+			first = std::max<uint64>(static_cast<uint64>(std::max(fromValue, 0.0)), (g_count > RING_SIZE) ? (g_count - RING_SIZE) : 0);
+			first = std::min(first, next);
+			rows.reserve((next - first) * COLUMNS);
+			for(uint64 i = first; i < next; i++)
+			{
+				const float* row = g_rows.data() + (i % RING_SIZE) * COLUMNS;
+				rows.insert(rows.end(), row, row + COLUMNS);
+			}
+			startDate = g_startDate;
+		}
+		std::vector<std::string> columns(g_baseColumns, g_baseColumns + BASE_COLUMNS);
+		unsigned int usedColumns = BASE_COLUMNS;
+#ifdef PROFILE
+		for(uint32 i = 0; i < PCNT_MAX; i++) columns.push_back(std::string("n:") + g_profileCounterNames[i]);
+		//Every zone slot, so that rows fetched at different times line up (zones registered later are "#<slot>" until then)
+		auto zoneNames = CProfiler::GetInstance().GetZoneNames();
+		for(const char* prefix : {"z:", "v:"})
+		{
+			for(uint32 i = 0; i < CProfiler::MAX_ZONES; i++)
+			{
+				columns.push_back(prefix + ((i < zoneNames.size()) ? zoneNames[i] : string_format("#%u", i)));
+			}
+		}
+		usedColumns = COLUMNS;
+#endif
+		std::string result = "{\"cols\":[";
+		for(size_t i = 0; i < columns.size(); i++)
+		{
+			result += string_format("%s\"%s\"", i ? "," : "", columns[i].c_str());
+		}
+		result += string_format("],\"first\":%llu,\"next\":%llu,\"t0\":%.0f,\"rows\":[", static_cast<unsigned long long>(first), static_cast<unsigned long long>(next), startDate);
+		auto appendValue = [&](float value, bool comma) {
+			if(comma) result += ',';
+			if(value == 0)
+				result += '0';
+			else
+				result += string_format("%.2f", value);
+		};
+		for(uint64 r = 0; r < (next - first); r++)
+		{
+			const float* row = rows.data() + r * COLUMNS;
+			result += r ? ",[" : "[";
+			for(unsigned int c = 0; c < usedColumns; c++) appendValue(row[c], c != 0);
+			result += ']';
+		}
+		result += "]}";
+		return result;
+	}
+}
+
+std::string getTimeline(double from)
+{
+	return Timeline::Get(from);
+}
 
 #ifdef PROFILE
 static std::string TopPcs(CProfiler::PcHistogram histogram)
@@ -167,6 +324,7 @@ static void OnVmNewFrame()
 	}
 	UpdateVblankTiming();
 	auto cpu = g_virtualMachine->GetCpuUtilisationInfo();
+	Timeline::Record(cpu);
 	std::lock_guard<std::mutex> lock(g_profileMutex);
 	g_profile.vblanks++;
 	g_profile.cpu.eeTotalTicks += cpu.eeTotalTicks;
@@ -210,10 +368,14 @@ std::string getProfile()
 	uint64 vu1BusyNs = 0;
 	uint32 compiles = 0;
 	std::string extra;
+	{
+		static uint64 lastGsBusy = 0, lastVu1Busy = 0;
+		static uint32 lastCompiles = 0;
+		gsBusyNs = TakeDelta(g_timelineNs[TLT_GSBUSY], lastGsBusy);
+		vu1BusyNs = TakeDelta(g_timelineNs[TLT_VU1BUSY], lastVu1Busy);
+		compiles = TakeDelta(g_timelineCounts[TLC_COMPILES], lastCompiles);
+	}
 #ifdef PROFILE
-	gsBusyNs = g_gsThreadBusyNs.exchange(0);
-	vu1BusyNs = g_vu1ThreadBusyNs.exchange(0);
-	compiles = g_blockCompileCount.exchange(0);
 	{
 		std::string syscalls;
 		for(uint32 i = 0; i < 0x100; i++)
@@ -230,9 +392,10 @@ std::string getProfile()
 			if(static_cast<unsigned char>(c) >= 0x20) escapedLog += c;
 		}
 		std::string counters;
+		static uint32 lastCounters[PCNT_MAX] = {};
 		for(uint32 i = 0; i < PCNT_MAX; i++)
 		{
-			counters += string_format("%s\"%s\":%u", i ? "," : "", g_profileCounterNames[i], g_profileCounters[i].exchange(0));
+			counters += string_format("%s\"%s\":%u", i ? "," : "", g_profileCounterNames[i], TakeDelta(g_profileCounters[i], lastCounters[i]));
 		}
 		extra = string_format(",\"counters\":{%s},\"vuBlocks\":%u,\"log\":\"%s\",\"syscalls\":{%s},\"eeInts\":%u,\"eeSlices\":%u,\"eeIdleSlices\":%u",
 		                      counters.c_str(), g_vuBlockExecCount.exchange(0), escapedLog.c_str(), syscalls.c_str(), g_eeInterruptCount.exchange(0), g_eeSlices.exchange(0), g_eeIdleSlices.exchange(0));
@@ -427,13 +590,14 @@ int stateStatus()
 }
 
 //VU1 on its own thread (on by default), applied at the next vblank
-//GS renderer workarounds by name (bench/debug switch). "gowShuffle": see CGSH_OpenGL::IsUnsupportedChannelShuffleWrite.
+//GS renderer options by name (bench/debug switch). "fbAlias" (on by default): PSMCT16 draws over
+//PSMCT32 frame buffers, destination alpha test and unclamped additive blend, see CGSH_OpenGL::SyncFramebufferAlias.
 bool setGsHack(std::string name, bool enabled)
 {
 	auto gs = static_cast<CGSH_OpenGLJs*>(g_virtualMachine->GetGSHandler());
-	if(name == "gowShuffle")
+	if(name == "fbAlias")
 	{
-		gs->SetChannelShuffleHack(enabled);
+		gs->SetFramebufferAliasing(enabled);
 		return true;
 	}
 	return false;
@@ -448,6 +612,53 @@ void setFrameLimit(bool enabled)
 {
 	CAppConfig::GetInstance().SetPreferenceBoolean(PREF_PS2_LIMIT_FRAMERATE, enabled);
 	g_virtualMachine->ReloadFrameRateLimit();
+}
+
+//Page settings: GS internal resolution (1 = native), forced bilinear texture filtering, widescreen
+//(16:9 output) and presentation mode (CGSHandler::PRESENTATION_MODE). The output canvas grows with the
+//resolution factor so the page gets the full-resolution frames (640x480 or 854x480 per unit of factor).
+void setGsOptions(int resolutionFactor, bool forceBilinear, bool widescreen, int presentationMode)
+{
+	resolutionFactor = std::clamp(resolutionFactor, 1, 4);
+	if(presentationMode < CGSHandler::PRESENTATION_MODE_FILL || presentationMode > CGSHandler::PRESENTATION_MODE_ORIGINAL)
+	{
+		presentationMode = CGSHandler::PRESENTATION_MODE_FIT;
+	}
+	auto& config = CAppConfig::GetInstance();
+	config.SetPreferenceInteger(PREF_CGSH_OPENGL_RESOLUTION_FACTOR, resolutionFactor);
+	config.SetPreferenceBoolean(PREF_CGSH_OPENGL_FORCEBILINEARTEXTURES, forceBilinear);
+	config.SetPreferenceBoolean(PREF_CGSHANDLER_WIDESCREEN, widescreen);
+	config.SetPreferenceInteger(PREF_CGSHANDLER_PRESENTATION_MODE, presentationMode);
+	auto gs = static_cast<CGSH_OpenGLJs*>(g_virtualMachine->GetGSHandler());
+	gs->SetOutput((widescreen ? 854 : 640) * resolutionFactor, 480 * resolutionFactor, static_cast<CGSHandler::PRESENTATION_MODE>(presentationMode));
+}
+
+//Replaces the keyboard/gamepad bindings: keys = [[KeyboardEvent.code, PS2 button, positive], ...]
+//(button = PS2::CControllerInfo::BUTTON, positive only matters for axes), pad = PS2 button per standard
+//gamepad button index (-1 or missing = unbound).
+void setInputBindings(emscripten::val keys, emscripten::val pad)
+{
+	std::vector<CInputProviderEmscripten::KEYBINDING> keyBindings;
+	uint32 keyCount = keys["length"].as<uint32>();
+	for(uint32 i = 0; i < keyCount; i++)
+	{
+		auto entry = keys[i];
+		int button = entry[1].as<int>();
+		if(button < 0 || button >= PS2::CControllerInfo::MAX_BUTTONS) continue;
+		keyBindings.push_back({entry[0].as<std::string>(), static_cast<PS2::CControllerInfo::BUTTON>(button), entry[2].as<bool>()});
+	}
+	int padButtons[CInputProviderEmscripten::MAX_PAD_BUTTONS];
+	uint32 padCount = pad["length"].as<uint32>();
+	for(uint32 i = 0; i < CInputProviderEmscripten::MAX_PAD_BUTTONS; i++)
+	{
+		padButtons[i] = (i < padCount) ? pad[i].as<int>() : -1;
+	}
+	g_inputProvider->SetBindings(std::move(keyBindings), padButtons);
+}
+
+void setGamepadEnabled(bool enabled)
+{
+	g_inputProvider->SetGamepadEnabled(enabled);
 }
 
 //EE underclock (numerator/denominator of the real EE clock), like PCSX2's EE cycle rate:
@@ -617,6 +828,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("getFrames", &getFrames);
 	function("clearStats", &clearStats);
 	function("getProfile", &getProfile);
+	function("getTimeline", &getTimeline);
 	function("setVuJitOptions", &setVuJitOptions);
 	function("setVuSuperBlocks", &setVuSuperBlocks);
 	function("vuDiffStats", &vuDiffStats);
@@ -641,6 +853,9 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("loadState", &loadState);
 	function("stateStatus", &stateStatus);
 	function("setFrameLimit", &setFrameLimit);
+	function("setGsOptions", &setGsOptions);
+	function("setInputBindings", &setInputBindings);
+	function("setGamepadEnabled", &setGamepadEnabled);
 	function("setVu1Threaded", &setVu1Threaded);
 	function("setGsHack", &setGsHack);
 	function("setEeFrequencyScale", &setEeFrequencyScale);

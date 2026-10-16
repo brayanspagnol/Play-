@@ -19,6 +19,9 @@ public:
 
 	void InitializeImpl() override;
 	void InitializeContext();
+	//Output (OffscreenCanvas) size and presentation mode, plus a reload of the GS preferences
+	//(resolution factor, bilinear filtering, widescreen); queued on the GS thread.
+	void SetOutput(int width, int height, PRESENTATION_MODE);
 	void ReleaseImpl() override;
 	void PresentBackbuffer() override;
 

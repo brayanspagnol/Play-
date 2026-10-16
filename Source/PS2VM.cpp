@@ -353,10 +353,23 @@ std::future<bool> CPS2VM::SaveState(const fs::path& statePath)
 	auto future = promise->get_future();
 	m_mailBox.SendCall(
 	    [this, promise, statePath]() {
-		    auto result = SaveVMState(statePath);
-		    promise->set_value(result);
+		    RunPendingSave(true);
+		    m_pendingSave = [this, promise, statePath]() { promise->set_value(SaveVMState(statePath)); };
+		    m_pendingSaveVblanks = 0;
+		    RunPendingSave(m_nStatus != RUNNING);
 	    });
 	return future;
+}
+
+void CPS2VM::RunPendingSave(bool force)
+{
+	//The state holds the front VIF1 decoder, which already consumed the data still queued for a stalled
+	//VU1 thread: wait (up to ~1 s, the stall needs the game to acknowledge a GS SIGNAL) until it drained
+	if(!m_pendingSave) return;
+	if(!force && (m_pendingSaveVblanks++ < 60) && !m_ee->IsVu1Drained()) return;
+	auto save = std::move(m_pendingSave);
+	m_pendingSave = nullptr;
+	save();
 }
 
 std::future<bool> CPS2VM::LoadState(const fs::path& statePath)
@@ -996,10 +1009,12 @@ void CPS2VM::EmuThread()
 							if(m_ee->IsVu1Threaded())
 							{
 								//The VU1 thread may still be sending this frame to the GS: flip in order with it.
-								//Don't let the VM thread get more than a frame ahead (input latency, ring size).
+								//Don't let the VM thread get more than two vblanks ahead (input latency, ring size):
+								//wait for the older pending flip only. Draining the whole queue here left the VU1
+								//thread idle while the VM thread started the next frame (lost overlap in VU1-bound scenes).
 								if(m_vu1PendingFlips >= 2)
 								{
-									m_ee->SyncVu1(CVu1Thread::SYNC_VBLANK);
+									m_ee->WaitVu1([this]() { return m_vu1PendingFlips < 2; }, CVu1Thread::SYNC_VBLANK);
 								}
 								auto gs = m_ee->m_gs;
 								m_vu1PendingFlips++;
@@ -1024,6 +1039,7 @@ void CPS2VM::EmuThread()
 						CProfiler::GetInstance().CountCurrentZone();
 #endif
 						OnNewFrame();
+						RunPendingSave(false);
 						{
 							bool vu1Threaded = m_vu1ThreadedPreference && m_gameAllowsVu1Threaded;
 							if(vu1Threaded != m_ee->IsVu1Threaded())
@@ -1049,6 +1065,7 @@ void CPS2VM::EmuThread()
 #ifdef PROFILE
 							CProfilerZone profilerZone(m_limiterProfilerZone);
 #endif
+							CTimelineTimer timer(TLT_LIMITER);
 							m_frameLimiter.EndFrame();
 						}
 						m_frameLimiter.BeginFrame();

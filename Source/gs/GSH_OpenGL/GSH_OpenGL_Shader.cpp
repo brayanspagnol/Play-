@@ -177,6 +177,14 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
 	shaderBuilder << "uniform sampler2D g_texture;" << std::endl;
 	shaderBuilder << "uniform sampler2D g_palette;" << std::endl;
 
+	//Without framebuffer fetch, the destination alpha test reads a copy of the frame buffer
+	//taken before the draw (see DoRenderPassWithCopies). Alpha is stored doubled (0x80 -> 1.0).
+	bool emulateDestAlphaTest = caps.hasDestAlphaTest && !useFramebufferFetch && m_fbAliasActive;
+	if(emulateDestAlphaTest || caps.ct16MaskFromCopy)
+	{
+		shaderBuilder << "uniform highp sampler2D g_destCopy;" << std::endl;
+	}
+
 	shaderBuilder << "layout(std140) uniform FragmentParams" << std::endl;
 	shaderBuilder << "{" << std::endl;
 	shaderBuilder << "	vec2 g_textureSize;" << std::endl;
@@ -188,6 +196,7 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
 	shaderBuilder << "	uint g_alphaRef;" << std::endl;
 	shaderBuilder << "	float g_alphaFix;" << std::endl;
 	shaderBuilder << "	vec3 g_fogColor;" << std::endl;
+	shaderBuilder << "	highp uint g_ct16Mask;" << std::endl;
 	shaderBuilder << "};" << std::endl;
 
 	if(caps.texClampS == TEXTURE_CLAMP_MODE_REGION_REPEAT || caps.texClampT == TEXTURE_CLAMP_MODE_REGION_REPEAT)
@@ -236,6 +245,12 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
 			shaderBuilder << "	if(fragColor.a < 0.5) discard;" << std::endl;
 			break;
 		}
+	}
+
+	if(emulateDestAlphaTest)
+	{
+		shaderBuilder << "	bool destAlphaBit = texelFetch(g_destCopy, ivec2(gl_FragCoord.xy), 0).a > (254.5 / 255.0);" << std::endl;
+		shaderBuilder << "	if(destAlphaBit != " << (caps.destAlphaTestRef ? "true" : "false") << ") discard;" << std::endl;
 	}
 
 	shaderBuilder << "	highp vec3 texCoord = v_texCoord;" << std::endl;
@@ -382,6 +397,17 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
 		shaderBuilder << "	vec3 finalColor = textureColor.xyz;" << std::endl;
 	}
 
+	//Additive blend without color clamping, values from 0x80 count as negative (mod 256):
+	//pass 1 adds the positive ones, pass 2 subtracts the others (reverse subtract blend)
+	if(caps.colorWrapPass == 1)
+	{
+		shaderBuilder << "	finalColor = mix(finalColor, vec3(0.0), step(vec3(0.5), finalColor));" << std::endl;
+	}
+	else if(caps.colorWrapPass == 2)
+	{
+		shaderBuilder << "	finalColor = mix(vec3(0.0), vec3(256.0 / 255.0) - finalColor, step(vec3(0.5), finalColor));" << std::endl;
+	}
+
 	//For proper alpha blending, alpha has to be multiplied by 2 (0x80 -> 1.0)
 #ifdef USE_DUALSOURCE_BLENDING
 	shaderBuilder << "	float finalAlpha = textureColor.a;" << std::endl;
@@ -425,6 +451,22 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
 		if(caps.colorOutputWhite)
 		{
 			shaderBuilder << "	fragColor.xyz = vec3(1, 1, 1);" << std::endl;
+		}
+
+		if(caps.ct16MaskFromCopy)
+		{
+			//16-bit pixel: masked bits from the frame buffer copy, others from this fragment
+			shaderBuilder << R"(
+	{
+		highp uvec4 cur = uvec4(fragColor * 255.0 + 0.5);
+		highp uvec4 prev = uvec4(texelFetch(g_destCopy, ivec2(gl_FragCoord.xy), 0) * 255.0 + 0.5);
+		highp uint c = (cur.r >> 3) | ((cur.g >> 3) << 5) | ((cur.b >> 3) << 10) | ((cur.a == 255u) ? 0x8000u : 0u);
+		highp uint p = (prev.r >> 3) | ((prev.g >> 3) << 5) | ((prev.b >> 3) << 10) | ((prev.a == 255u) ? 0x8000u : 0u);
+		highp uint v = (p & g_ct16Mask) | (c & ~g_ct16Mask);
+		highp uvec3 ch = uvec3(v, v >> 5, v >> 10) & 0x1Fu;
+		fragColor = vec4(vec3((ch << 3) | (ch >> 2)) / 255.0, float(v >> 15));
+	}
+)";
 		}
 	}
 
@@ -755,6 +797,121 @@ Framework::OpenGl::ProgramPtr CGSH_OpenGL::GenerateCopyToFbProgram()
 
 		glBindAttribLocation(*program, static_cast<GLuint>(PRIM_VERTEX_ATTRIB::POSITION), "a_position");
 		glBindAttribLocation(*program, static_cast<GLuint>(PRIM_VERTEX_ATTRIB::TEXCOORD), "a_texCoord");
+
+		FRAMEWORK_MAYBE_UNUSED bool result = program->Link();
+		assert(result);
+	}
+
+	return program;
+}
+
+//Moves data between a PSMCT32 frame buffer and the PSMCT16 view of the same memory, using the GS
+//memory layout. Both formats have 8 KB pages and the same page order (PSMCT32 page: 64x32 pixels,
+//PSMCT16 page: 64x64). Inside a page, the PSMCT16 pixel (x, y) is the half (x & 8) of the PSMCT32
+//pixel ((y / 8) * 8 + x % 8, (x / 16) * 8 + y % 8): 16x8 blocks map to 8x8 blocks with the block
+//grid transposed, the 8 left pixels of a 16-bit block row being the low halves (R, G) and the 8
+//right ones the high halves (B, A) (see the swizzle tables in GsPixelFormats.cpp).
+//PSMCT32 alpha is stored doubled (0x80 -> 255), as the draw shaders write it.
+//Modes: 0 = PSMCT32 (g_srcA) -> PSMCT16 view, keeping the bytes not in g_mask from g_srcB
+//       1 = PSMCT16 view (g_srcA) -> PSMCT32
+//       2 = PSMCT16 frame buffer mask: bits in g_mask from g_srcA (before draw), others from g_srcB (after)
+Framework::OpenGl::ProgramPtr CGSH_OpenGL::GenerateAliasProgram()
+{
+	Framework::OpenGl::CShader vertexShader(GL_VERTEX_SHADER);
+	Framework::OpenGl::CShader pixelShader(GL_FRAGMENT_SHADER);
+
+	{
+		std::stringstream shaderBuilder;
+		shaderBuilder << GLSL_VERSION << std::endl;
+		shaderBuilder << "in vec2 a_position;" << std::endl;
+		shaderBuilder << "void main()" << std::endl;
+		shaderBuilder << "{" << std::endl;
+		shaderBuilder << "	gl_Position = vec4(a_position, 0, 1);" << std::endl;
+		shaderBuilder << "}" << std::endl;
+
+		vertexShader.SetSource(shaderBuilder.str().c_str());
+		FRAMEWORK_MAYBE_UNUSED bool result = vertexShader.Compile();
+		assert(result);
+	}
+
+	{
+		std::stringstream shaderBuilder;
+		shaderBuilder << GLSL_VERSION << std::endl;
+		shaderBuilder << R"(
+precision highp float;
+precision highp int;
+uniform highp sampler2D g_srcA;
+uniform highp sampler2D g_srcB;
+uniform int g_mode;
+uniform uint g_mask;
+uniform int g_scale;
+out vec4 fragColor;
+uint decode32(vec4 c)
+{
+	uvec4 b = uvec4(c * 255.0 + 0.5);
+	return b.r | (b.g << 8) | (b.b << 16) | (((b.a + 1u) >> 1) << 24);
+}
+vec4 encode32(uint w)
+{
+	uvec4 b = (uvec4(w, w >> 8, w >> 16, w >> 24) & 0xFFu);
+	b.a = min(b.a * 2u, 255u);
+	return vec4(b) / 255.0;
+}
+uint decode16(vec4 c)
+{
+	uvec4 b = uvec4(c * 255.0 + 0.5);
+	return (b.r >> 3) | ((b.g >> 3) << 5) | ((b.b >> 3) << 10) | ((b.a == 255u) ? 0x8000u : 0u);
+}
+vec4 encode16(uint v)
+{
+	uvec3 c = (uvec3(v, v >> 5, v >> 10) & 0x1Fu);
+	return vec4(vec3((c << 3) | (c >> 2)) / 255.0, float(v >> 15));
+}
+void main()
+{
+	ivec2 t = ivec2(gl_FragCoord.xy);
+	ivec2 p = t / g_scale;
+	ivec2 sub = t - p * g_scale;
+	if(g_mode == 0)
+	{
+		ivec2 q = p % 64;
+		ivec2 p32 = ivec2((p.x / 64) * 64 + (q.y / 8) * 8 + (q.x % 8), (p.y / 64) * 32 + (q.x / 16) * 8 + (q.y % 8));
+		uint w = decode32(texelFetch(g_srcA, p32 * g_scale + sub, 0));
+		bool high = (q.x & 8) != 0;
+		uint v = high ? (w >> 16) : (w & 0xFFFFu);
+		uint m = high ? (g_mask >> 16) : (g_mask & 0xFFFFu);
+		uint old = (m == 0xFFFFu) ? 0u : decode16(texelFetch(g_srcB, t, 0));
+		fragColor = encode16((old & ~m) | (v & m));
+	}
+	else if(g_mode == 1)
+	{
+		ivec2 q = ivec2(p.x % 64, p.y % 32);
+		ivec2 p16 = ivec2((p.x / 64) * 64 + (q.y / 8) * 16 + (q.x % 8), (p.y / 32) * 64 + (q.x / 8) * 8 + (q.y % 8));
+		uint lo = decode16(texelFetch(g_srcA, p16 * g_scale + sub, 0));
+		uint hi = decode16(texelFetch(g_srcA, (p16 + ivec2(8, 0)) * g_scale + sub, 0));
+		fragColor = encode32(lo | (hi << 16));
+	}
+	else
+	{
+		uint before = decode16(texelFetch(g_srcA, t, 0));
+		uint after = decode16(texelFetch(g_srcB, t, 0));
+		fragColor = encode16((before & g_mask) | (after & ~g_mask));
+	}
+}
+)";
+
+		pixelShader.SetSource(shaderBuilder.str().c_str());
+		FRAMEWORK_MAYBE_UNUSED bool result = pixelShader.Compile();
+		assert(result);
+	}
+
+	auto program = std::make_shared<Framework::OpenGl::CProgram>();
+
+	{
+		program->AttachShader(vertexShader);
+		program->AttachShader(pixelShader);
+
+		glBindAttribLocation(*program, static_cast<GLuint>(PRIM_VERTEX_ATTRIB::POSITION), "a_position");
 
 		FRAMEWORK_MAYBE_UNUSED bool result = program->Link();
 		assert(result);

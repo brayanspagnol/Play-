@@ -121,7 +121,6 @@ void CBasicBlock::SetAotBlockOutputStream(Framework::CStdStream* outputStream)
 #endif
 
 #ifdef PROFILE
-std::atomic<uint32> g_blockCompileCount = 0;
 std::atomic<uint32> g_vuBlockExecCount = 0;
 #endif
 
@@ -151,8 +150,9 @@ void CBasicBlock::Compile()
 #ifdef PROFILE
 	static const auto compileZone = CProfiler::GetInstance().RegisterZone("COMPILE");
 	CProfilerZone profilerZone(compileZone);
-	g_blockCompileCount++;
 #endif
+	CTimelineTimer compileTimer(CProfiler::GetInstance().IsWorkThread() ? TLT_COMPILE : TLT_VU1COMPILE);
+	g_timelineCounts[TLC_COMPILES].fetch_add(1, std::memory_order_relaxed);
 #ifndef AOT_USE_CACHE
 
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
@@ -193,7 +193,7 @@ void CBasicBlock::Compile()
 		//0x24000000: superblock (0x04000000: structured parts, not the earlier dispatch loop)
 		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000) | (IsSuperBlock() ? 0x24000000 : 0) | (UsesBlockChaining() ? 0x10000000 : 0) | ((g_jitPageAccess != ~0U) ? (0x08000000 | (g_jitPageAccess & 0x3FF)) : 0);
 		cacheKey.hash[0] = xxHash.low64;
-		cacheKey.hash[1] = xxHash.high64;
+		cacheKey.hash[1] = xxHash.high64 ^ BlockCache::CODEGEN_VERSION;
 
 		thread_local std::vector<uint8> cachedCode;
 		if(BlockCache::Find(cacheKey, cachedCode))
@@ -210,8 +210,13 @@ void CBasicBlock::Compile()
 #endif
 
 	Framework::CMemStream stream;
+	g_timelineCounts[TLC_JITRUNS].fetch_add(1, std::memory_order_relaxed);
+#ifdef PROFILE
+	auto jitStart = std::chrono::steady_clock::now();
+#endif
 	CompileToStream(stream, UsesContextPromotion());
 #ifdef PROFILE
+	auto jitEnd = std::chrono::steady_clock::now();
 	if(m_category == BLOCK_CATEGORY_PS2_EE)
 	{
 		//Steady-state recompile analysis: how often each start address went through the Jitter
@@ -273,6 +278,18 @@ void CBasicBlock::Compile()
 #endif
 		m_function = CMemoryFunction(stream.GetBuffer(), stream.GetSize());
 	}
+#ifdef PROFILE
+	{
+		auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+		double jitMs = ms(jitStart, jitEnd), wasmMs = ms(jitEnd, std::chrono::steady_clock::now());
+		if(jitMs + wasmMs > 10)
+		{
+			//Category is a four-character code ('ee', 'vu', 'iop')
+			CProfiler::GetInstance().Log("SLOWCOMPILE cat=%08X %08X-%08X words=%u bytes=%u jit=%.1fms wasm=%.1fms cacheable=%d\n",
+			                             m_category, m_begin, m_end, (m_end - m_begin) / 4 + 1, static_cast<uint32>(stream.GetSize()), jitMs, wasmMs, m_cacheable ? 1 : 0);
+		}
+	}
+#endif
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
 	if((m_category == BLOCK_CATEGORY_PS2_EE) && (g_eeBatchSize != 0) && !IsEmpty() && !m_diffExecute)
 	{

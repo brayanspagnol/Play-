@@ -59,14 +59,27 @@ public:
 	void RunSync(FunctionType);
 
 	//Waits until the VU1 thread is idle (or stalled on the GIF). Calls the flush handler first so that
-	//data the front decoder has consumed but not pushed yet is pushed.
+	//data the front decoder has consumed but not pushed yet is pushed. A stalled thread only retries after
+	//the VM thread pushes more data or calls Wake, so it stays out of what the VM thread does after Sync.
 	void Sync(SYNC_REASON = SYNC_OTHER);
+	//Sync, then true if nothing is left (no data stalled on the GIF either)
+	bool IsDrained();
+	//VM thread changed something a stall may wait for (GS CSR write acknowledging SIGNAL, GIF FIFO write)
+	void Wake();
+	//Waits until 'done' returns true (checked again after every message this thread processes) or this thread is
+	//idle. Unlike Sync, the VU1 thread keeps the rest of its queue: used to keep at most N frames in flight.
+	void WaitFor(const std::function<bool()>& done, SYNC_REASON = SYNC_OTHER);
 	//Sync + exclusive access to the GIF/GS register write path.
 	std::unique_lock<std::mutex> SyncAndLockGif(SYNC_REASON = SYNC_OTHER);
 	//Sync, then drops whatever is left (stalled data) before a reset or a state load
 	void SyncAndDiscard();
 
 	void SetFlushHandler(FunctionType);
+
+	uint64 GetPendingBytes() const
+	{
+		return m_publishedPos - m_readPos;
+	}
 
 private:
 	enum MESSAGE_TYPE : uint32
@@ -94,6 +107,9 @@ private:
 
 	uint8* Reserve(uint32);
 	void Commit(const MESSAGE_HEADER&);
+	void Push(const MESSAGE_HEADER&, const void*);
+	void FlushOverflow();
+	void DropOverflow();
 	void ThreadProc();
 	bool ProcessMessage(const MESSAGE_HEADER&, uint8*);
 	bool ProcessPath3Queue();
@@ -127,6 +143,9 @@ private:
 	bool m_quit = false;
 	bool m_discard = false;
 	std::atomic<bool> m_producerWaiting = false;
+	bool m_wakeRequested = false;
+	//Messages that did not fit in the ring while the VU1 thread was stalled on the GIF (VM thread only)
+	std::deque<std::vector<uint8>> m_overflow;
 
 	std::mutex m_gifMutex;
 	FunctionType m_flushHandler;

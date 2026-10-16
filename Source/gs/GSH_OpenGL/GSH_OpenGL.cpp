@@ -2,6 +2,9 @@
 #include <assert.h>
 #include <cstring>
 #include <math.h>
+#include <algorithm>
+#include <cfloat>
+#include <cmath>
 
 #include "AppConfig.h"
 #include "../GsPixelFormats.h"
@@ -120,8 +123,8 @@ void CGSH_OpenGL::ResetImpl()
 	m_validGlState = 0;
 	m_nVtxCount = 0;
 	m_drawingToDepth = false;
-	m_channelShuffleBase = ~0U;
-	m_skipDraw = false;
+	m_currentFramebuffer.reset();
+	m_currentAliasFramebuffer.reset();
 	m_primitiveType = PRIM_INVALID;
 	m_pendingPrim = false;
 	m_pendingPrimValue = 0;
@@ -130,6 +133,7 @@ void CGSH_OpenGL::ResetImpl()
 void CGSH_OpenGL::MarkNewFrame()
 {
 	FlushVertexBuffer();
+	ApplyFramebufferAliasSetting();
 	m_renderState.isValid = false;
 	m_validGlState = 0;
 	CGSHandler::MarkNewFrame();
@@ -170,6 +174,7 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
 
 	if(framebuffer)
 	{
+		SyncFramebufferAlias(framebuffer);
 		CommitFramebufferDirtyPages(framebuffer, 0, dispLayer.height);
 		if(m_multisampleEnabled)
 		{
@@ -269,6 +274,8 @@ void CGSH_OpenGL::NotifyPreferencesChangedImpl()
 	PalCache_Flush();
 	m_framebuffers.clear();
 	m_depthbuffers.clear();
+	m_currentFramebuffer.reset();
+	m_currentAliasFramebuffer.reset();
 	CGSHandler::NotifyPreferencesChangedImpl();
 }
 
@@ -299,6 +306,14 @@ void CGSH_OpenGL::InitializeRC()
 	m_copyToFbVertexArray = GenerateCopyToFbVertexArray();
 	m_copyToFbSrcPositionUniform = glGetUniformLocation(*m_copyToFbProgram, "g_srcPosition");
 	m_copyToFbSrcSizeUniform = glGetUniformLocation(*m_copyToFbProgram, "g_srcSize");
+
+	m_aliasProgram = GenerateAliasProgram();
+	m_aliasModeUniform = glGetUniformLocation(*m_aliasProgram, "g_mode");
+	m_aliasMaskUniform = glGetUniformLocation(*m_aliasProgram, "g_mask");
+	m_aliasScaleUniform = glGetUniformLocation(*m_aliasProgram, "g_scale");
+	glUseProgram(*m_aliasProgram);
+	glUniform1i(glGetUniformLocation(*m_aliasProgram, "g_srcA"), 0);
+	glUniform1i(glGetUniformLocation(*m_aliasProgram, "g_srcB"), 1);
 
 	m_primBuffer = Framework::OpenGl::CBuffer::Create();
 	m_primVertexArray = GeneratePrimVertexArray();
@@ -519,6 +534,12 @@ Framework::OpenGl::ProgramPtr CGSH_OpenGL::GetShaderFromCaps(const SHADERCAPS& s
 			glUniform1i(paletteUniform, 1);
 		}
 
+		auto destCopyUniform = glGetUniformLocation(*shader, "g_destCopy");
+		if(destCopyUniform != -1)
+		{
+			glUniform1i(destCopyUniform, 2);
+		}
+
 		auto vertexParamsUniformBlock = glGetUniformBlockIndex(*shader, "VertexParams");
 		if(vertexParamsUniformBlock != GL_INVALID_INDEX)
 		{
@@ -627,8 +648,6 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
 		FlushVertexBuffer();
 	}
 
-	m_skipDraw = IsUnsupportedChannelShuffleWrite(prim, frameReg, tex0Reg);
-
 	//--------------------------------------------------------
 	// Apply state changes (order kept similar to original when relevant)
 	//--------------------------------------------------------
@@ -680,6 +699,15 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
 	{
 		SetupFogColor(fogColReg);
 		CHECKGLERROR();
+	}
+
+	{
+		//Colors wrap around instead of saturating when COLCLAMP is off. God of War counts shadow
+		//volume faces in a channel this way (adding 0x01 or 0xFF). Handled for Cs + Cd only.
+		auto alpha = make_convertible<ALPHA>(alphaReg);
+		m_colorWrapAdd = m_fbAliasActive && !m_hasFramebufferFetchExtension && (prim.nAlpha != 0) && ((m_nReg[GS_REG_COLCLAMP] & 1) == 0) &&
+		                 (alpha.nA == ALPHABLEND_ABD_CS) && (alpha.nB == ALPHABLEND_ABD_ZERO) && (alpha.nC == ALPHABLEND_C_FIX) &&
+		                 (alpha.nFix == 0x80) && (alpha.nD == ALPHABLEND_ABD_CD);
 	}
 
 	auto offset = make_convertible<XYOFFSET>(m_nReg[GS_REG_XYOFFSET_1 + context]);
@@ -980,10 +1008,48 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
 	auto scissor = make_convertible<SCISSOR>(scissorReg);
 	auto test = make_convertible<TEST>(testReg);
 
+	//Look for a framebuffer that matches the specified information
+	auto framebuffer = FindFramebuffer(frame);
+	if(!framebuffer)
+	{
+		framebuffer = FramebufferPtr(new CFramebuffer(frame.GetBasePtr(), frame.GetWidth(), FRAMEBUFFER_HEIGHT, frame.nPsm, m_fbScale, m_multisampleEnabled));
+		m_framebuffers.push_back(framebuffer);
+		PopulateFramebuffer(framebuffer);
+		InitFramebufferAlias(framebuffer);
+	}
+
+	CommitFramebufferDirtyPages(framebuffer, scissor.scay0, scissor.scay1);
+
+	m_currentFramebuffer = framebuffer;
+	m_currentAliasFramebuffer = m_fbAliasActive ? FindAliasFramebuffer(framebuffer) : FramebufferPtr();
+	SyncFramebufferAlias(framebuffer);
+
 	bool r = (frame.nMask & 0x000000FF) == 0;
 	bool g = (frame.nMask & 0x0000FF00) == 0;
 	bool b = (frame.nMask & 0x00FF0000) == 0;
 	bool a = (frame.nMask & 0xFF000000) == 0;
+
+	if(m_fbAliasActive && (frame.nPsm == PSMCT16))
+	{
+		//Mask of the 16-bit pixel: R is FBMSK bits 3-7, G 11-15, B 19-23 and A 31. A channel only
+		//partly masked is written, the masked bits are put back after the draw (DoRenderPassWithCopies).
+		static const uint32 channelMasks[4] = {0x001F, 0x03E0, 0x7C00, 0x8000};
+		uint32 mask16 = ((frame.nMask >> 3) & 0x001F) | ((frame.nMask >> 6) & 0x03E0) |
+		                ((frame.nMask >> 9) & 0x7C00) | ((frame.nMask >> 16) & 0x8000);
+		bool write[4];
+		m_ct16DrawPartialMask = false;
+		for(unsigned int i = 0; i < 4; i++)
+		{
+			uint32 maskedBits = mask16 & channelMasks[i];
+			write[i] = (maskedBits != channelMasks[i]);
+			m_ct16DrawPartialMask |= write[i] && (maskedBits != 0);
+		}
+		m_ct16DrawMask = mask16;
+		r = write[0];
+		g = write[1];
+		b = write[2];
+		a = write[3];
+	}
 
 	//Don't write to alpha in PSMCT24
 	if(frame.nPsm == PSMCT24)
@@ -1015,17 +1081,6 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
 		auto depthbuffer = FindDepthbuffer(zbufWrite, frame);
 		m_drawingToDepth = (depthbuffer != nullptr);
 	}
-
-	//Look for a framebuffer that matches the specified information
-	auto framebuffer = FindFramebuffer(frame);
-	if(!framebuffer)
-	{
-		framebuffer = FramebufferPtr(new CFramebuffer(frame.GetBasePtr(), frame.GetWidth(), FRAMEBUFFER_HEIGHT, frame.nPsm, m_fbScale, m_multisampleEnabled));
-		m_framebuffers.push_back(framebuffer);
-		PopulateFramebuffer(framebuffer);
-	}
-
-	CommitFramebufferDirtyPages(framebuffer, scissor.scay0, scissor.scay1);
 
 	auto depthbuffer = FindDepthbuffer(zbuf, frame);
 	if(!depthbuffer)
@@ -1375,36 +1430,271 @@ void CGSH_OpenGL::SetupTexture(uint64 primReg, uint64 tex0Reg, uint64 tex1Reg, u
 	m_validGlState &= ~GLSTATE_FRAGMENT_PARAMS;
 }
 
-//God of War builds a mask in the green channel of its 32-bit frame buffer
-//(FBMSK = 0xFFFF00FF), then moves it to alpha and restores green with 16-bit draws that
-//view the same memory as PSMCT16 (a "channel shuffle": PSMCT16 frame and texture on the
-//PSMCT32 buffer's address). This renderer keeps PSMCT16 and PSMCT32 frame buffers in
-//separate textures, so the 16-bit draws never touch the 32-bit buffer and the mask stays
-//in the image (the scene turns green). Once such a shuffle has been seen on a buffer,
-//drop the green-only writes to that buffer: the effect (shadows) is lost, colors are right.
-//ponytail: narrow heuristic; emulating the 16-bit view of the 32-bit buffer would keep the effect.
-bool CGSH_OpenGL::IsUnsupportedChannelShuffleWrite(const PRMODE& prim, uint64 frameReg, uint64 tex0Reg)
+
+//Frame buffer aliasing: a game can draw into the memory of a PSMCT32 frame buffer as PSMCT16
+//(God of War moves bytes between channels this way: PSMCT16 frame and texture over its color
+//buffer). Frame buffers of each format are separate textures here, so the PSMCT16 view gets its
+//own frame buffer, kept in step with the PSMCT32 one by converting between the two GS memory
+//layouts when one is used after the other was written (see GenerateAliasProgram).
+CGSH_OpenGL::FramebufferPtr CGSH_OpenGL::FindAliasFramebuffer(const FramebufferPtr& framebuffer) const
 {
-	if(!m_channelShuffleHack) return false;
-	auto frame = make_convertible<FRAME>(frameReg);
-	if((frame.nPsm == PSMCT16) && prim.nTexture)
+	uint32 aliasPsm = 0;
+	switch(framebuffer->m_psm)
 	{
-		auto tex0 = make_convertible<TEX0>(tex0Reg);
-		if((tex0.nPsm == PSMCT16) && (tex0.GetBufPtr() == frame.GetBasePtr()))
-		{
-			bool overColorBuffer = std::any_of(std::begin(m_framebuffers), std::end(m_framebuffers),
-			                                   [&](const FramebufferPtr& framebuffer) {
-				                                   return (framebuffer->m_psm == PSMCT32) && (framebuffer->m_basePtr == frame.GetBasePtr());
-			                                   });
-			if(overColorBuffer && (m_channelShuffleBase != frame.GetBasePtr()))
-			{
-				m_channelShuffleBase = frame.GetBasePtr();
-				fprintf(stderr, "GSH_OpenGL: 16-bit channel shuffle on the 32-bit frame buffer at 0x%08X, dropping its green-only writes.\n", m_channelShuffleBase);
-			}
-		}
-		return false;
+	case PSMCT32:
+		aliasPsm = PSMCT16;
+		break;
+	case PSMCT16:
+		aliasPsm = PSMCT32;
+		break;
+	default:
+		return FramebufferPtr();
 	}
-	return (frame.nPsm == PSMCT32) && (frame.nMask == 0xFFFF00FF) && (frame.GetBasePtr() == m_channelShuffleBase);
+	for(const auto& candidateFramebuffer : m_framebuffers)
+	{
+		if((candidateFramebuffer->m_psm == aliasPsm) &&
+		   (candidateFramebuffer->m_basePtr == framebuffer->m_basePtr) &&
+		   (candidateFramebuffer->m_width == framebuffer->m_width))
+		{
+			return candidateFramebuffer;
+		}
+	}
+	return FramebufferPtr();
+}
+
+void CGSH_OpenGL::InitFramebufferAlias(const FramebufferPtr& framebuffer)
+{
+	if(!m_fbAliasActive) return;
+	auto aliasFramebuffer = FindAliasFramebuffer(framebuffer);
+	if(!aliasFramebuffer) return;
+	if(framebuffer->m_psm == PSMCT16)
+	{
+		//New view, loaded from memory that the PSMCT32 buffer may have drawn over
+		aliasFramebuffer->m_aliasStaleMask = ~0U;
+		aliasFramebuffer->m_aliasViewNewer = false;
+	}
+	else
+	{
+		framebuffer->m_aliasViewNewer = true;
+	}
+}
+
+//Brings a frame buffer up to date with its alias before it is drawn to or read
+void CGSH_OpenGL::SyncFramebufferAlias(const FramebufferPtr& framebuffer)
+{
+	if(!m_fbAliasActive) return;
+	auto aliasFramebuffer = FindAliasFramebuffer(framebuffer);
+	if(!aliasFramebuffer) return;
+	if((framebuffer->m_psm == PSMCT32) && framebuffer->m_aliasViewNewer)
+	{
+		framebuffer->m_aliasViewNewer = false;
+		CommitFramebufferDirtyPages(aliasFramebuffer, 0, aliasFramebuffer->m_height);
+		uint32 height = std::min(framebuffer->m_height, aliasFramebuffer->m_height / 2);
+		RunAliasPass(1, framebuffer, aliasFramebuffer->m_texture, 0, ~0U, 0, 0, framebuffer->m_width, height);
+	}
+	else if((framebuffer->m_psm == PSMCT16) && (aliasFramebuffer->m_aliasStaleMask != 0))
+	{
+		uint32 staleMask = aliasFramebuffer->m_aliasStaleMask;
+		aliasFramebuffer->m_aliasStaleMask = 0;
+		CommitFramebufferDirtyPages(aliasFramebuffer, 0, aliasFramebuffer->m_height);
+		uint32 height = std::min(framebuffer->m_height, aliasFramebuffer->m_height * 2);
+		GLuint previous = (staleMask == ~0U) ? 0 : CopyFramebuffer(framebuffer, 0, 0, 0, framebuffer->m_width, height);
+		RunAliasPass(0, framebuffer, aliasFramebuffer->m_texture, previous, staleMask, 0, 0, framebuffer->m_width, height);
+	}
+}
+
+void CGSH_OpenGL::ApplyFramebufferAliasSetting()
+{
+	bool active = m_fbAliasEnabled && !m_multisampleEnabled;
+	if(active == m_fbAliasActive) return;
+	m_fbAliasActive = active;
+	for(const auto& framebuffer : m_framebuffers)
+	{
+		//Views may have missed writes while this was off: reload them
+		framebuffer->m_aliasStaleMask = (active && FindAliasFramebuffer(framebuffer)) ? ~0U : 0;
+		framebuffer->m_aliasViewNewer = false;
+	}
+	m_currentFramebuffer.reset();
+	m_currentAliasFramebuffer.reset();
+	//Shaders depend on this (destination alpha test)
+	m_shaders.clear();
+	m_renderState.isValid = false;
+	m_validGlState = 0;
+}
+
+//Copies an area (in GS pixels) of a frame buffer into one of its copy textures
+GLuint CGSH_OpenGL::CopyFramebuffer(const FramebufferPtr& framebuffer, unsigned int index, int x, int y, int width, int height)
+{
+	auto& copy = framebuffer->m_copies[index];
+	if(copy == 0)
+	{
+		copy = Framework::OpenGl::CTexture::Create();
+		glBindTexture(GL_TEXTURE_2D, copy);
+		glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, framebuffer->m_width * m_fbScale, framebuffer->m_height * m_fbScale);
+	}
+	else
+	{
+		glBindTexture(GL_TEXTURE_2D, copy);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer->m_framebuffer);
+	glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x * m_fbScale, y * m_fbScale, x * m_fbScale, y * m_fbScale, width * m_fbScale, height * m_fbScale);
+	CHECKGLERROR();
+	m_validGlState &= ~(GLSTATE_TEXTURE | GLSTATE_FRAMEBUFFER);
+	return copy;
+}
+
+//Runs one of the GenerateAliasProgram modes over an area (in GS pixels) of dstFramebuffer
+void CGSH_OpenGL::RunAliasPass(int mode, const FramebufferPtr& dstFramebuffer, GLuint srcA, GLuint srcB, uint32 mask, int x, int y, int width, int height)
+{
+	m_validGlState &= ~(GLSTATE_BLEND | GLSTATE_COLORMASK | GLSTATE_SCISSOR | GLSTATE_PROGRAM | GLSTATE_VIEWPORT |
+	                    GLSTATE_DEPTHTEST | GLSTATE_DEPTHMASK | GLSTATE_TEXTURE | GLSTATE_FRAMEBUFFER);
+
+	glBindFramebuffer(GL_FRAMEBUFFER, dstFramebuffer->m_framebuffer);
+	glDisable(GL_BLEND);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_SCISSOR_TEST);
+	glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	glDepthMask(GL_FALSE);
+
+	glUseProgram(*m_aliasProgram);
+	glUniform1i(m_aliasModeUniform, mode);
+	glUniform1ui(m_aliasMaskUniform, mask);
+	glUniform1i(m_aliasScaleUniform, m_fbScale);
+
+	glActiveTexture(GL_TEXTURE1);
+	glBindTexture(GL_TEXTURE_2D, srcB);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, srcA);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_R, GL_RED);
+
+	glViewport(x * m_fbScale, y * m_fbScale, width * m_fbScale, height * m_fbScale);
+	glBindVertexArray(m_copyToFbVertexArray);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	CHECKGLERROR();
+
+	dstFramebuffer->m_resolveNeeded = true;
+}
+
+//Draws the vertex buffer, with a copy of the frame buffer taken before the draw when it is needed:
+//- the texture is the PSMCT16 frame buffer drawn to,
+//- destination alpha test without framebuffer fetch (the shader reads the copy),
+//- PSMCT16 frame buffer drawn with channels partly masked (masked bits taken from the copy, by the
+//  shader without blending, by a pass after the draw with it).
+//PSMCT16 to PSMCT16 copies are moved by half a pixel: the GS samples at the pixel's corner, GL at
+//its center, and channel shuffles map pixels to texels one to one (sprites 8 pixels wide, UVs on
+//texel centers would land on texel edges and pick the neighbor).
+void CGSH_OpenGL::DoRenderPassWithCopies(SHADERCAPS caps)
+{
+	const auto& framebuffer = m_currentFramebuffer;
+	bool ct16Target = framebuffer && (framebuffer->m_psm == PSMCT16);
+	bool ct16Copy = ct16Target && (m_renderState.shaderCaps.texSourceMode != TEXTURE_SOURCE_MODE_NONE) &&
+	                (make_convertible<TEX0>(m_renderState.tex0Reg).nPsm == PSMCT16);
+	bool selfTexture = ct16Target && (m_renderState.texture0Handle == framebuffer->m_texture);
+	bool destAlphaTest = m_renderState.shaderCaps.hasDestAlphaTest && !m_hasFramebufferFetchExtension;
+	bool maskFix = ct16Target && m_ct16DrawPartialMask;
+	//Without blending, the mask is applied by the shader (no copy after the draw)
+	bool maskInShader = maskFix && !m_renderState.blendEnabled;
+	caps.ct16MaskFromCopy = maskInShader;
+	GLuint shaderHandle = *GetShaderFromCaps(caps);
+	if(shaderHandle != m_renderState.shaderHandle)
+	{
+		m_renderState.shaderHandle = shaderHandle;
+		m_validGlState &= ~GLSTATE_PROGRAM;
+	}
+	if(!framebuffer || !(ct16Copy || selfTexture || destAlphaTest || maskFix))
+	{
+		DoRenderPass();
+		return;
+	}
+
+	//Area drawn: vertex bounds clipped to the scissor and the frame buffer
+	float minX = FLT_MAX, minY = FLT_MAX, maxX = -FLT_MAX, maxY = -FLT_MAX;
+	float minS = FLT_MAX, minT = FLT_MAX, maxS = -FLT_MAX, maxT = -FLT_MAX;
+	for(const auto& vertex : m_vertexBuffer)
+	{
+		minX = std::min(minX, vertex.x);
+		maxX = std::max(maxX, vertex.x);
+		minY = std::min(minY, vertex.y);
+		maxY = std::max(maxY, vertex.y);
+		float s = vertex.s / vertex.q;
+		float t = vertex.t / vertex.q;
+		minS = std::min(minS, s);
+		maxS = std::max(maxS, s);
+		minT = std::min(minT, t);
+		maxT = std::max(maxT, t);
+	}
+	int fbWidth = framebuffer->m_width;
+	int fbHeight = framebuffer->m_height;
+	int x0 = std::max<int>({static_cast<int>(std::floor(minX)) - 1, m_renderState.scissorX, 0});
+	int y0 = std::max<int>({static_cast<int>(std::floor(minY)) - 1, m_renderState.scissorY, 0});
+	int x1 = std::min<int>({static_cast<int>(std::ceil(maxX)) + 1, m_renderState.scissorX + m_renderState.scissorWidth, fbWidth});
+	int y1 = std::min<int>({static_cast<int>(std::ceil(maxY)) + 1, m_renderState.scissorY + m_renderState.scissorHeight, fbHeight});
+	if((x0 >= x1) || (y0 >= y1)) return;
+
+	//Area copied: also covers the texels read when the texture is the frame buffer
+	int cx0 = x0, cy0 = y0, cx1 = x1, cy1 = y1;
+	if(selfTexture)
+	{
+		float texWidth = static_cast<float>(m_nTexWidth);
+		float texHeight = static_cast<float>(m_nTexHeight);
+		if(std::isfinite(minS) && std::isfinite(maxS) && std::isfinite(minT) && std::isfinite(maxT))
+		{
+			cx0 = std::max(0, std::min(cx0, static_cast<int>(std::floor(minS * texWidth)) - 1));
+			cy0 = std::max(0, std::min(cy0, static_cast<int>(std::floor(minT * texHeight)) - 1));
+			cx1 = std::min(fbWidth, std::max(cx1, static_cast<int>(std::ceil(maxS * texWidth)) + 1));
+			cy1 = std::min(fbHeight, std::max(cy1, static_cast<int>(std::ceil(maxT * texHeight)) + 1));
+		}
+		else
+		{
+			cx0 = cy0 = 0;
+			cx1 = fbWidth;
+			cy1 = fbHeight;
+		}
+	}
+
+	GLuint before = (selfTexture || destAlphaTest || maskFix) ? CopyFramebuffer(framebuffer, 0, cx0, cy0, cx1 - cx0, cy1 - cy0) : 0;
+
+	GLuint texture = m_renderState.texture0Handle;
+	if(selfTexture)
+	{
+		m_renderState.texture0Handle = before;
+		m_validGlState &= ~GLSTATE_TEXTURE;
+	}
+	if(maskInShader)
+	{
+		m_fragmentParams.ct16Mask = m_ct16DrawMask;
+		m_validGlState &= ~GLSTATE_FRAGMENT_PARAMS;
+	}
+	if(destAlphaTest || maskInShader)
+	{
+		glActiveTexture(GL_TEXTURE2);
+		glBindTexture(GL_TEXTURE_2D, before);
+		glActiveTexture(GL_TEXTURE0);
+	}
+
+	if(ct16Copy)
+	{
+		MakeLinearZOrtho(m_vertexParams.projMatrix, -0.5f, fbWidth - 0.5f, -0.5f, fbHeight - 0.5f);
+		m_validGlState &= ~GLSTATE_VERTEX_PARAMS;
+	}
+
+	DoRenderPass();
+
+	if(ct16Copy)
+	{
+		MakeLinearZOrtho(m_vertexParams.projMatrix, 0, fbWidth, 0, fbHeight);
+		m_validGlState &= ~GLSTATE_VERTEX_PARAMS;
+	}
+	if(selfTexture)
+	{
+		m_renderState.texture0Handle = texture;
+		m_validGlState &= ~GLSTATE_TEXTURE;
+	}
+	if(maskFix && !maskInShader)
+	{
+		GLuint after = CopyFramebuffer(framebuffer, 1, x0, y0, x1 - x0, y1 - y0);
+		RunAliasPass(2, framebuffer, before, after, m_ct16DrawMask, x0, y0, x1 - x0, y1 - y0);
+	}
 }
 
 CGSH_OpenGL::FramebufferPtr CGSH_OpenGL::FindFramebuffer(const FRAME& frame) const
@@ -1746,12 +2036,6 @@ void CGSH_OpenGL::FlushVertexBuffer()
 {
 	if(m_vertexBuffer.empty()) return;
 
-	if(m_skipDraw)
-	{
-		m_vertexBuffer.clear();
-		return;
-	}
-
 	assert(m_renderState.isValid == true);
 
 	auto shader = GetShaderFromCaps(m_renderState.shaderCaps);
@@ -1760,7 +2044,42 @@ void CGSH_OpenGL::FlushVertexBuffer()
 		m_renderState.shaderHandle = *shader;
 		m_validGlState &= ~GLSTATE_PROGRAM;
 	}
-	DoRenderPass();
+	if(m_fbAliasActive)
+	{
+		if(m_colorWrapAdd && m_renderState.blendEnabled && !m_renderState.depthMask)
+		{
+			auto passCaps = m_renderState.shaderCaps;
+			for(unsigned int pass = 1; pass <= 2; pass++)
+			{
+				passCaps.colorWrapPass = pass;
+				glBlendEquationSeparate((pass == 1) ? GL_FUNC_ADD : GL_FUNC_REVERSE_SUBTRACT, GL_FUNC_ADD);
+				DoRenderPassWithCopies(passCaps);
+				m_vertexBufferUploaded = true;
+			}
+			m_vertexBufferUploaded = false;
+			glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+		}
+		else
+		{
+			DoRenderPassWithCopies(m_renderState.shaderCaps);
+		}
+		if(m_currentAliasFramebuffer)
+		{
+			if(m_currentFramebuffer->m_psm == PSMCT16)
+			{
+				m_currentAliasFramebuffer->m_aliasViewNewer = true;
+			}
+			else
+			{
+				m_currentFramebuffer->m_aliasStaleMask |= (m_renderState.colorMaskR ? 0x000000FF : 0) | (m_renderState.colorMaskG ? 0x0000FF00 : 0) |
+				                                          (m_renderState.colorMaskB ? 0x00FF0000 : 0) | (m_renderState.colorMaskA ? 0xFF000000 : 0);
+			}
+		}
+	}
+	else
+	{
+		DoRenderPass();
+	}
 	m_vertexBuffer.clear();
 }
 
@@ -1858,7 +2177,10 @@ void CGSH_OpenGL::DoRenderPass()
 	glBindBufferBase(GL_UNIFORM_BUFFER, 1, m_fragmentParamsBuffer);
 
 	glBindBuffer(GL_ARRAY_BUFFER, m_primBuffer);
-	glBufferData(GL_ARRAY_BUFFER, sizeof(PRIM_VERTEX) * m_vertexBuffer.size(), m_vertexBuffer.data(), GL_STREAM_DRAW);
+	if(!m_vertexBufferUploaded)
+	{
+		glBufferData(GL_ARRAY_BUFFER, sizeof(PRIM_VERTEX) * m_vertexBuffer.size(), m_vertexBuffer.data(), GL_STREAM_DRAW);
+	}
 
 	glBindVertexArray(m_primVertexArray);
 

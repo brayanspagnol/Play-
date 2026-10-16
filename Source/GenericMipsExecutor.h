@@ -73,8 +73,10 @@ public:
 			if(m_blockCategory == BLOCK_CATEGORY_PS2_EE)
 			{
 				static const auto blockZone = CProfiler::GetInstance().RegisterZone("EEBLOCK");
-				PROFILE_COUNT(PCNT_EE_BLOCK, 1);
-				PROFILE_COUNT(PCNT_EE_INSN, ((block->GetEndAddress() - block->GetBeginAddress()) / 4) + 1);
+				//(VM thread only: plain load + store, an atomic add per block costs too much here)
+				auto addCount = [](PROFILE_COUNTER counter, uint32 value) { g_profileCounters[counter].store(g_profileCounters[counter].load(std::memory_order_relaxed) + value, std::memory_order_relaxed); };
+				addCount(PCNT_EE_BLOCK, 1);
+				addCount(PCNT_EE_INSN, ((block->GetEndAddress() - block->GetBeginAddress()) / 4) + 1);
 				auto prevZone = CProfiler::GetInstance().SwapCurrentZone(blockZone);
 				block->Execute();
 				CProfiler::GetInstance().SwapCurrentZone(prevZone);

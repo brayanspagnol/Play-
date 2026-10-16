@@ -132,6 +132,26 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::SearchTextureFramebuffer(const TEX0& tex0
 		}
 	}
 
+	if(!framebuffer && m_fbAliasActive && (tex0.nPsm == PSMCT16))
+	{
+		//PSMCT16 texture over a PSMCT32 frame buffer: read it through a PSMCT16 view (see SyncFramebufferAlias)
+		auto colorBufferIterator = std::find_if(m_framebuffers.begin(), m_framebuffers.end(),
+		                                        [&](const FramebufferPtr& candidateFramebuffer) {
+			                                        return (candidateFramebuffer->m_psm == PSMCT32) &&
+			                                               (candidateFramebuffer->m_basePtr == tex0.GetBufPtr()) &&
+			                                               (candidateFramebuffer->m_width == tex0.GetBufWidth());
+		                                        });
+		if(colorBufferIterator != m_framebuffers.end())
+		{
+			uint32 height = (*colorBufferIterator)->m_height;
+			framebuffer = FramebufferPtr(new CFramebuffer(tex0.GetBufPtr(), tex0.GetBufWidth(), height, PSMCT16, m_fbScale, m_multisampleEnabled));
+			m_framebuffers.push_back(framebuffer);
+			PopulateFramebuffer(framebuffer);
+			m_validGlState &= ~GLSTATE_FRAMEBUFFER;
+			InitFramebufferAlias(framebuffer);
+		}
+	}
+
 	if(!framebuffer)
 	{
 		//Second pass, be a bit more flexible
@@ -164,6 +184,7 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::SearchTextureFramebuffer(const TEX0& tex0
 	if(framebuffer)
 	{
 		CommitFramebufferDirtyPages(framebuffer, 0, tex0.GetHeight());
+		SyncFramebufferAlias(framebuffer);
 		if(m_multisampleEnabled)
 		{
 			ResolveFramebufferMultisample(framebuffer, m_fbScale);
