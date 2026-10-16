@@ -61,6 +61,9 @@ public:
 	//Waits until the VU1 thread is idle (or stalled on the GIF). Calls the flush handler first so that
 	//data the front decoder has consumed but not pushed yet is pushed.
 	void Sync(SYNC_REASON = SYNC_OTHER);
+	//Waits until 'done' returns true (checked again after every message this thread processes) or this thread is
+	//idle. Unlike Sync, the VU1 thread keeps the rest of its queue: used to keep at most N frames in flight.
+	void WaitFor(const std::function<bool()>& done, SYNC_REASON = SYNC_OTHER);
 	//Sync + exclusive access to the GIF/GS register write path.
 	std::unique_lock<std::mutex> SyncAndLockGif(SYNC_REASON = SYNC_OTHER);
 	//Sync, then drops whatever is left (stalled data) before a reset or a state load

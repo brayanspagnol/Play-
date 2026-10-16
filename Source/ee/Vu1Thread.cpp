@@ -160,6 +160,26 @@ void CVu1Thread::Sync(SYNC_REASON reason)
 	m_idleCondition.wait(lock, isDone);
 }
 
+void CVu1Thread::WaitFor(const std::function<bool()>& done, SYNC_REASON reason)
+{
+	if(done()) return;
+	std::unique_lock lock(m_mutex);
+	auto isDone = [&]() {
+		uint64 published = m_publishedPos;
+		return done() || (m_idle && ((m_readPos == published) || (m_stalled && (m_stalledPublishedPos == published))));
+	};
+	if(isDone()) return;
+#ifdef PROFILE
+	static const char* const zoneNames[SYNC_MAX] = {"SYNC_OTHER", "SYNC_VBLANK", "SYNC_GIFFIFO", "SYNC_GSREAD", "SYNC_VU1MEM", "SYNC_VU1REG", "SYNC_ROW"};
+	CProfilerZone profilerZone(CProfiler::GetInstance().RegisterZone(zoneNames[reason]));
+#endif
+	CTimelineTimer timer(TLT_VU1SYNC);
+	//The VU1 thread notifies m_idleCondition after each message while a producer waits
+	m_producerWaiting = true;
+	m_idleCondition.wait(lock, isDone);
+	m_producerWaiting = false;
+}
+
 std::unique_lock<std::mutex> CVu1Thread::SyncAndLockGif(SYNC_REASON reason)
 {
 	Sync(reason);

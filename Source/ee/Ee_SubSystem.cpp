@@ -834,6 +834,11 @@ void CSubSystem::SyncVu1(CVu1Thread::SYNC_REASON reason)
 	if(m_vu1Threaded) m_vu1Thread->Sync(reason);
 }
 
+void CSubSystem::WaitVu1(const std::function<bool()>& done, CVu1Thread::SYNC_REASON reason)
+{
+	if(m_vu1Threaded) m_vu1Thread->WaitFor(done, reason);
+}
+
 std::unique_lock<std::mutex> CSubSystem::SyncVu1AndLockGif(CVu1Thread::SYNC_REASON reason)
 {
 	if(!m_vu1Threaded) return std::unique_lock<std::mutex>();

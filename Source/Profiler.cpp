@@ -186,7 +186,7 @@ void CProfiler::Log(const char* format, ...)
 	vsnprintf(buffer, sizeof(buffer), format, args);
 	va_end(args);
 	std::lock_guard<std::mutex> lock(m_logMutex);
-	if(m_log.size() < 65536) m_log += buffer;
+	if(m_log.size() < (1 << 20)) m_log += buffer;
 }
 
 std::string CProfiler::TakeLog()

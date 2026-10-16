@@ -996,10 +996,12 @@ void CPS2VM::EmuThread()
 							if(m_ee->IsVu1Threaded())
 							{
 								//The VU1 thread may still be sending this frame to the GS: flip in order with it.
-								//Don't let the VM thread get more than a frame ahead (input latency, ring size).
+								//Don't let the VM thread get more than two vblanks ahead (input latency, ring size):
+								//wait for the older pending flip only. Draining the whole queue here left the VU1
+								//thread idle while the VM thread started the next frame (lost overlap in VU1-bound scenes).
 								if(m_vu1PendingFlips >= 2)
 								{
-									m_ee->SyncVu1(CVu1Thread::SYNC_VBLANK);
+									m_ee->WaitVu1([this]() { return m_vu1PendingFlips < 2; }, CVu1Thread::SYNC_VBLANK);
 								}
 								auto gs = m_ee->m_gs;
 								m_vu1PendingFlips++;
