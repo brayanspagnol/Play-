@@ -1039,6 +1039,13 @@ protected:
 	void ThreadProc();
 #ifdef __EMSCRIPTEN__
 	static void ResumeThreadProc(void*);
+	//Called from a GS call: ThreadProc returns to the worker's event loop once that call is done and
+	//doesn't resume by itself; JS resumes it later with ResumeThreadProc(this) (asynchronous browser
+	//work such as WebGPU device creation or buffer readback). Calls sent meanwhile wait in the mailbox.
+	void SuspendThreadProc()
+	{
+		m_suspended = true;
+	}
 #endif
 	virtual void InitializeImpl() = 0;
 	virtual void ReleaseImpl() = 0;
@@ -1143,6 +1150,9 @@ protected:
 	CINTC* m_intc = nullptr;
 	bool m_gsThreaded = true;
 	bool m_flipped = false;
+#ifdef __EMSCRIPTEN__
+	bool m_suspended = false;
+#endif
 
 private:
 	CMailBox m_mailBox;

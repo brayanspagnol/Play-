@@ -2234,11 +2234,19 @@ void CGSHandler::ThreadProc()
 			{
 				m_mailBox.ReceiveCall();
 #ifdef __EMSCRIPTEN__
-				if(m_flipped) break;
+				if(m_flipped || m_suspended) break;
 #endif
 			}
 		}
 #ifdef __EMSCRIPTEN__
+		if(m_suspended)
+		{
+			//Resumed by whoever asked for the suspension (see SuspendThreadProc).
+			m_suspended = false;
+			m_flipped = false;
+			emscripten_runtime_keepalive_push();
+			return;
+		}
 		//Browser objects made on this thread (e.g. the ImageBitmap of each presented frame, see
 		//GSH_OpenGLJs) are only released by tasks on this worker's event loop, which never runs while
 		//this loop blocks: about one frame of shared memory leaked per flip until the system ran out
