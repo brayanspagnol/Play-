@@ -16,6 +16,13 @@ public:
 		assert(m_subTableCount != 0);
 		m_blockTable = new BlockType*[m_subTableCount];
 		memset(m_blockTable, 0, sizeof(BlockType*) * m_subTableCount);
+#ifdef __EMSCRIPTEN__
+		m_fnTable = new uint32*[m_subTableCount];
+		for(unsigned int i = 0; i < m_subTableCount; i++)
+		{
+			m_fnTable[i] = m_emptyFnSubTable;
+		}
+#endif
 	}
 
 	~BlockLookupTwoWay()
@@ -29,6 +36,10 @@ public:
 			}
 		}
 		delete[] m_blockTable;
+#ifdef __EMSCRIPTEN__
+		ClearFnTable();
+		delete[] m_fnTable;
+#endif
 	}
 
 	void Clear()
@@ -42,6 +53,9 @@ public:
 				m_blockTable[i] = nullptr;
 			}
 		}
+#ifdef __EMSCRIPTEN__
+		ClearFnTable();
+#endif
 	}
 
 	void AddBlock(BlockType block)
@@ -62,7 +76,25 @@ public:
 		}
 		assert(subTable[loAddress / INSTRUCTION_SIZE] == m_emptyBlock);
 		subTable[loAddress / INSTRUCTION_SIZE] = block;
+#ifdef __EMSCRIPTEN__
+		auto& fnSubTable = m_fnTable[hiAddress];
+		if(fnSubTable == m_emptyFnSubTable)
+		{
+			fnSubTable = new uint32[SUBTABLE_SIZE / INSTRUCTION_SIZE]();
+		}
+		fnSubTable[loAddress / INSTRUCTION_SIZE] = block->GetFunctionIndex();
+#endif
 	}
+
+#ifdef __EMSCRIPTEN__
+	//The block's function changed (module batching): refresh its function table index
+	void UpdateFunctionIndex(BlockType block)
+	{
+		uint32 address = block->GetBeginAddress();
+		if(FindBlockAt(address) != block) return;
+		m_fnTable[address >> SUBTABLE_BITS][(address & SUBTABLE_MASK) / INSTRUCTION_SIZE] = block->GetFunctionIndex();
+	}
+#endif
 
 	void DeleteBlock(BlockType block)
 	{
@@ -74,6 +106,9 @@ public:
 		assert(subTable);
 		assert(subTable[loAddress / INSTRUCTION_SIZE] != m_emptyBlock);
 		subTable[loAddress / INSTRUCTION_SIZE] = m_emptyBlock;
+#ifdef __EMSCRIPTEN__
+		m_fnTable[hiAddress][loAddress / INSTRUCTION_SIZE] = 0;
+#endif
 	}
 
 	BlockType FindBlockAt(uint32 address) const
@@ -87,7 +122,30 @@ public:
 		return result;
 	}
 
+#ifdef __EMSCRIPTEN__
+	//Function table indexes of the blocks (0: no block), same layout as the block table. Missing
+	//subtables point to a shared all-zero one so generated code can index it without checks.
+	uint32** GetFnTable() const
+	{
+		return m_fnTable;
+	}
+#endif
+
 private:
+#ifdef __EMSCRIPTEN__
+	void ClearFnTable()
+	{
+		for(unsigned int i = 0; i < m_subTableCount; i++)
+		{
+			if(m_fnTable[i] != m_emptyFnSubTable)
+			{
+				delete[] m_fnTable[i];
+				m_fnTable[i] = m_emptyFnSubTable;
+			}
+		}
+	}
+#endif
+
 	enum
 	{
 		SUBTABLE_BITS = 16,
@@ -99,4 +157,8 @@ private:
 	BlockType m_emptyBlock = nullptr;
 	BlockType** m_blockTable = nullptr;
 	uint32 m_subTableCount = 0;
+#ifdef __EMSCRIPTEN__
+	uint32** m_fnTable = nullptr;
+	static inline uint32 m_emptyFnSubTable[SUBTABLE_SIZE / INSTRUCTION_SIZE] = {};
+#endif
 };

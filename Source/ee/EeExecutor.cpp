@@ -5,6 +5,9 @@
 #include "MA_EE.h"
 #include "xxhash.h"
 #include "../Profiler.h"
+#if defined(__EMSCRIPTEN__)
+#include "WasmModuleBuilder.h"
+#endif
 
 #if defined(__unix__) || defined(__ANDROID__) || defined(__APPLE__)
 #include <sys/mman.h>
@@ -48,6 +51,7 @@ CEeExecutor::CEeExecutor(CMIPS& context, uint8* ram)
 	m_pageSize = MIPS_PAGE_SIZE;
 	m_protectedPages.resize(PS2::EE_RAM_SIZE / MIPS_PAGE_SIZE, 0);
 	m_context.m_writeWatchHandler = &CEeExecutor::WriteWatchHandler;
+	m_context.m_blockFnLookup = m_blockLookup.GetFnTable();
 #endif
 }
 
@@ -56,7 +60,30 @@ CEeExecutor::CEeExecutor(CMIPS& context, uint8* ram)
 int CEeExecutor::Execute(int cycles)
 {
 	m_executing = true;
+#if !defined(PROFILE) && !defined(DEBUGGER_INCLUDED)
+	//Same loop as CGenericMipsExecutor::Execute, but the call goes through the function index table
+	//(kept for block chaining): one dependent load less per block than going through the CBasicBlock.
+	//Index 0 (no block yet) takes the usual path, which compiles it.
+	m_context.m_State.cycleQuota = cycles;
+	uint32** fnTable = m_blockLookup.GetFnTable();
+	while(m_context.m_State.nHasException == 0)
+	{
+		uint32 address = m_context.m_State.nPC & m_addressMask;
+		uint32 fctIdx = fnTable[address >> 16][(address & 0xFFFF) / 4];
+		if(fctIdx != 0)
+		{
+			reinterpret_cast<void (*)(CMIPS*)>(static_cast<uintptr_t>(fctIdx))(&m_context);
+		}
+		else
+		{
+			m_blockLookup.FindBlockAt(address)->Execute();
+		}
+	}
+	m_context.m_State.nHasException &= ~MIPS_EXCEPTION_STATUS_QUOTADONE;
+	int result = m_context.m_State.cycleQuota;
+#else
 	int result = CGenericMipsExecutor::Execute(cycles);
+#endif
 	m_executing = false;
 	return result;
 }
@@ -78,6 +105,42 @@ void CEeExecutor::NotifyRamWritten(uint32 address, uint32 size)
 	g_eeExecutor->InvalidateWrittenRange(address, size, g_eeExecutor->m_executing);
 }
 
+extern uint32 g_eeBatchSize;
+
+void CEeExecutor::QueueForBatch(const BasicBlockPtr& block)
+{
+	if(block->GetBatchModule().empty()) return;
+	m_batchPending.push_back(block);
+	if(m_batchPending.size() >= g_eeBatchSize) FlushBatch();
+}
+
+void CEeExecutor::FlushBatch()
+{
+	std::vector<BasicBlockPtr> blocks;
+	std::vector<CWasmModuleBuilder::MODULE_BYTES> modules;
+	for(const auto& weakBlock : m_batchPending)
+	{
+		auto block = weakBlock.lock();
+		if(!block || block->GetBatchModule().empty()) continue;
+		modules.push_back({block->GetBatchModule().data(), static_cast<uint32>(block->GetBatchModule().size())});
+		blocks.push_back(std::move(block));
+	}
+	m_batchPending.clear();
+	if(blocks.empty()) return;
+	auto batch = CWasmModuleBuilder::BuildBatchModule(modules);
+	auto fctIds = batch.empty() ? std::vector<int>() : CMemoryFunction::CreateWasmBatch(batch.data(), batch.size(), static_cast<uint32>(blocks.size()));
+	for(uint32 i = 0; i < blocks.size(); i++)
+	{
+		if(fctIds.empty())
+		{
+			blocks[i]->GetBatchModule() = std::vector<uint8>();
+			continue;
+		}
+		blocks[i]->ReplaceWasmFunction(fctIds[i]);
+		m_blockLookup.UpdateFunctionIndex(blocks[i].get());
+	}
+}
+
 void CEeExecutor::InvalidateWrittenRange(uint32 address, uint32 size, bool executing)
 {
 	if(size == 0) return;
@@ -87,6 +150,10 @@ void CEeExecutor::InvalidateWrittenRange(uint32 address, uint32 size, bool execu
 	{
 		if(m_protectedPages[page])
 		{
+#ifdef PROFILE
+			PROFILE_COUNT(PCNT_EE_INVAL, 1);
+			CProfiler::GetInstance().Log("W %08X %u pc=%08X\n", address, size, m_context.m_State.nPC);
+#endif
 			ClearActiveBlocksInRange(page * MIPS_PAGE_SIZE, (page + 1) * MIPS_PAGE_SIZE, executing);
 		}
 	}
@@ -180,6 +247,9 @@ void CEeExecutor::Reset()
 {
 	SetMemoryProtected(m_ram, PS2::EE_RAM_SIZE, false);
 	m_cachedBlocks.clear();
+#if defined(__EMSCRIPTEN__)
+	m_batchPending.clear();
+#endif
 	m_blockFpRoundingModes.clear();
 	m_idleLoopBlocks.clear();
 	CGenericMipsExecutor::Reset();
@@ -281,6 +351,9 @@ BasicBlockPtr CEeExecutor::BlockFactory(CMIPS& context, uint32 start, uint32 end
 	{
 		m_cachedBlocks.insert(std::make_pair(blockKey, result));
 	}
+#if defined(__EMSCRIPTEN__)
+	QueueForBatch(result);
+#endif
 	return result;
 }
 

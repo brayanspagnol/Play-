@@ -73,6 +73,11 @@ private:
 #if defined(__EMSCRIPTEN__)
 	static void WriteWatchHandler(CMIPS*, uint32, uint32);
 	void InvalidateWrittenRange(uint32, uint32, bool);
+	//Module batching: newly compiled blocks wait here until g_eeBatchSize of them can be moved
+	//into one wasm module (fewer, larger modules: better code locality in the browser's JIT)
+	void QueueForBatch(const BasicBlockPtr&);
+	void FlushBatch();
+	std::vector<std::weak_ptr<CBasicBlock>> m_batchPending;
 
 	std::vector<uint8> m_protectedPages;
 	bool m_executing = false;

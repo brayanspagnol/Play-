@@ -366,6 +366,7 @@ std::future<bool> CPS2VM::LoadState(const fs::path& statePath)
 	m_mailBox.SendCall(
 	    [this, promise, statePath]() {
 		    auto result = LoadVMState(statePath);
+		    if(result) OnStateLoaded();
 		    promise->set_value(result);
 	    });
 	return future;

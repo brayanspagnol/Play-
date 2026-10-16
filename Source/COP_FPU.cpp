@@ -577,6 +577,14 @@ void CCOP_FPU::CVT_S_W()
 //31
 void CCOP_FPU::LWC1()
 {
+	if(UsePageAccess(4))
+	{
+		PushMemAccessPage();
+		m_codeGen->LoadFromPage(4);
+		m_codeGen->PullRel(offsetof(CMIPS, m_State.nCOP1[m_ft]));
+		return;
+	}
+
 	bool usePageLookup = (m_pCtx->m_pageLookup != nullptr);
 
 	if(usePageLookup)
@@ -616,6 +624,14 @@ void CCOP_FPU::LWC1()
 //39
 void CCOP_FPU::SWC1()
 {
+	if(UsePageAccess(8))
+	{
+		PushMemAccessPage(true);
+		m_codeGen->PushRel(offsetof(CMIPS, m_State.nCOP1[m_ft]));
+		m_codeGen->StoreAtPage(4);
+		return;
+	}
+
 	bool usePageLookup = (m_pCtx->m_pageLookup != nullptr);
 
 	if(usePageLookup)

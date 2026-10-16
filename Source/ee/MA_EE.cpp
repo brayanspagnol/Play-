@@ -107,6 +107,14 @@ void CMA_EE::LQ()
 {
 	if(m_nRT == 0) return;
 
+	if(UsePageAccess(256))
+	{
+		PushMemAccessPage();
+		m_codeGen->LoadFromPage(0x10);
+		m_codeGen->MD_PullRel(offsetof(CMIPS, m_State.nGPR[m_nRT]));
+		return;
+	}
+
 	ComputeMemAccessPageRef();
 
 	m_codeGen->PushCst(0);
@@ -153,6 +161,14 @@ void CMA_EE::LQ()
 //1F
 void CMA_EE::SQ()
 {
+	if(UsePageAccess(512))
+	{
+		PushMemAccessPage(true);
+		m_codeGen->MD_PushRel(offsetof(CMIPS, m_State.nGPR[m_nRT]));
+		m_codeGen->StoreAtPage(0x10);
+		return;
+	}
+
 	ComputeMemAccessPageRef(true);
 
 	m_codeGen->PushCst(0);

@@ -94,6 +94,14 @@ void CMA_MIPSIV::Template_Load32Idx(const MemoryAccessIdxTraits& traits)
 		    m_codeGen->PullRel(offsetof(CMIPS, m_State.nGPR[m_nRT].nV[0]));
 	    };
 
+	if(UsePageAccess(1))
+	{
+		PushMemAccessPage();
+		m_codeGen->LoadFromPage(traits.elementSize);
+		finishLoad();
+		return;
+	}
+
 	bool usePageLookup = (m_pCtx->m_pageLookup != nullptr);
 
 	if(usePageLookup)
@@ -132,6 +140,14 @@ void CMA_MIPSIV::Template_Load32Idx(const MemoryAccessIdxTraits& traits)
 void CMA_MIPSIV::Template_Store32Idx(const MemoryAccessIdxTraits& traits)
 {
 	CheckTLBExceptions(true);
+
+	if(UsePageAccess(2))
+	{
+		PushMemAccessPage(true);
+		m_codeGen->PushRel(offsetof(CMIPS, m_State.nGPR[m_nRT].nV[0]));
+		m_codeGen->StoreAtPage(traits.elementSize);
+		return;
+	}
 
 	bool usePageLookup = (m_pCtx->m_pageLookup != nullptr);
 

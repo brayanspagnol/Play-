@@ -15,10 +15,13 @@
 #include "ee/Vpu.h"
 #include <future>
 #include <mutex>
+#include <set>
 #include <map>
 #include <atomic>
 #include <algorithm>
 #include <emscripten.h>
+#include "xxhash.h"
+#include "Ps2Const.h"
 
 #ifdef PROFILE
 extern std::atomic<uint64> g_gsThreadBusyNs;
@@ -35,6 +38,7 @@ CPs2VmJs* g_virtualMachine = nullptr;
 CGSHandler::NewFrameEvent::Connection g_gsNewFrameConnection;
 std::shared_ptr<CInputProviderEmscripten> g_inputProvider;
 Framework::CSignal<void()>::Connection g_vmNewFrameConnection;
+Framework::CSignal<void()>::Connection g_vmStateLoadedConnection;
 
 //Profiling/stats snapshot, filled on the emulation thread at every vblank, read by getProfile() on the main thread.
 struct PROFILE_ACCUM
@@ -66,9 +70,70 @@ static std::string TopPcs(CProfiler::PcHistogram histogram)
 }
 #endif
 
+//Differential tests: hashes of the EE/IOP state and RAM at each of the first N vblanks after the next
+//state load (deterministic points in emulated time), see eeHashAfterLoad/eeHashResult.
+static std::atomic<int> g_hashRequest = 0;
+static int g_hashRemaining = 0;
+static std::mutex g_hashMutex;
+static std::string g_hashResult;
+
+//Benchmark over a deterministic stretch of emulated time: wall ms between vblanks [from, to) after the next state load
+static std::atomic<int> g_timeFrom = 0;
+static std::atomic<int> g_timeTo = 0;
+static std::atomic<int> g_vblanksSinceLoad = -1;
+static double g_timeStart = 0;
+static std::atomic<double> g_timeResult = -1;
+
+static void OnVmStateLoaded()
+{
+	g_hashRemaining = g_hashRequest.exchange(0);
+	g_vblanksSinceLoad = (g_timeTo > 0) ? 0 : -1;
+}
+
+static void UpdateVblankTiming()
+{
+	if(g_vblanksSinceLoad < 0) return;
+	int count = g_vblanksSinceLoad++;
+	if(count == g_timeFrom) g_timeStart = emscripten_get_now();
+	if(count == g_timeTo)
+	{
+		g_timeResult = emscripten_get_now() - g_timeStart;
+		g_vblanksSinceLoad = -1;
+		g_timeTo = 0;
+	}
+}
+
+static void HashVmState()
+{
+	auto& ee = *g_virtualMachine->m_ee;
+	auto& iop = *g_virtualMachine->m_iop;
+	//Component hashes: EE state, EE RAM, SPR, IOP state, IOP RAM (first differing component tells where to look)
+	auto h = [](const void* data, size_t size) { return static_cast<unsigned long long>(XXH3_64bits(data, size)) & 0xFFFF; };
+	std::lock_guard<std::mutex> lock(g_hashMutex);
+	g_hashResult += string_format("%s%08X:%04llX.%04llX.%04llX.%04llX.%04llX", g_hashResult.empty() ? "" : " ", ee.m_EE.m_State.nPC,
+	                              h(&ee.m_EE.m_State, sizeof(MIPSSTATE)), h(ee.m_ram, PS2::EE_RAM_SIZE), h(ee.m_spr, PS2::EE_SPR_SIZE),
+	                              h(&iop.m_cpu.m_State, sizeof(MIPSSTATE)), h(iop.m_ram, PS2::IOP_RAM_SIZE));
+}
+
+//Debug: EE MIPSSTATE as hex words (compare two builds)
+std::string eeStateDump()
+{
+	auto& state = g_virtualMachine->m_ee->m_EE.m_State;
+	auto words = reinterpret_cast<const uint32*>(&state);
+	std::string result;
+	for(uint32 i = 0; i < sizeof(MIPSSTATE) / 4; i++) result += string_format("%08X ", words[i]);
+	return result;
+}
+
 //Runs on the emulation thread (CPS2VM::OnNewFrame, at vblank start)
 static void OnVmNewFrame()
 {
+	if(g_hashRemaining > 0)
+	{
+		g_hashRemaining--;
+		HashVmState();
+	}
+	UpdateVblankTiming();
 	auto cpu = g_virtualMachine->GetCpuUtilisationInfo();
 	std::lock_guard<std::mutex> lock(g_profileMutex);
 	g_profile.vblanks++;
@@ -220,6 +285,93 @@ std::string vuDiffStats()
 static std::future<bool> g_stateFuture;
 static int g_stateResult = 1;
 
+//EE block chaining (tail calls between JIT blocks); applies to blocks compiled afterwards, set before boot
+extern bool g_eeBlockChaining;
+void setEeBlockChaining(bool enabled)
+{
+	g_eeBlockChaining = enabled;
+}
+
+//EE module batching: newly compiled EE blocks are moved into shared wasm modules of this many blocks (0 = off)
+extern uint32 g_jitPageAccess;
+//Guest loads/stores as single page-table statements (default) or the older if/else Jitter sequence
+void setJitPageAccess(uint32 mask)
+{
+	g_jitPageAccess = mask;
+}
+
+extern uint32 g_eeBatchSize;
+void setEeBatchSize(uint32 size)
+{
+	g_eeBatchSize = size;
+}
+
+//EE context promotion (MIPS state kept in wasm locals within a block); for blocks compiled afterwards
+extern bool g_eeContextPromotion;
+void setEeContextPromotion(bool enabled)
+{
+	g_eeContextPromotion = enabled;
+}
+
+extern std::mutex g_eeDumpMutex;
+extern std::set<uint32> g_eeDumpRequest;
+extern std::map<uint32, std::string> g_eeDumpResult;
+
+//Debug: EE block start addresses (hex, comma separated) whose wasm code is dumped when they compile
+void eeDumpRequest(std::string addresses)
+{
+	std::lock_guard<std::mutex> lock(g_eeDumpMutex);
+	size_t pos = 0;
+	while(pos < addresses.size())
+	{
+		size_t end = addresses.find(',', pos);
+		if(end == std::string::npos) end = addresses.size();
+		g_eeDumpRequest.insert(std::stoul(addresses.substr(pos, end - pos), nullptr, 16));
+		pos = end + 1;
+	}
+}
+
+std::string eeDumpResult()
+{
+	std::lock_guard<std::mutex> lock(g_eeDumpMutex);
+	std::string result;
+	for(const auto& entry : g_eeDumpResult) result += entry.second;
+	return result;
+}
+
+void eeHashAfterLoad(int vblanks)
+{
+	std::lock_guard<std::mutex> lock(g_hashMutex);
+	g_hashResult.clear();
+	g_hashRequest = vblanks;
+}
+
+void eeTimeAfterLoad(int from, int to)
+{
+	g_timeResult = -1;
+	g_timeFrom = from;
+	g_timeTo = to;
+}
+
+//Vblanks since the state load while a timing window is armed, -1 otherwise (lets a CDP client
+//sample thread CPU time over the same window)
+int eeTimeVblank()
+{
+	return g_vblanksSinceLoad;
+}
+
+//Wall ms between the vblanks given to eeTimeAfterLoad, -1 until done
+double eeTimeResult()
+{
+	return g_timeResult;
+}
+
+std::string eeHashResult()
+{
+	std::lock_guard<std::mutex> lock(g_hashMutex);
+	return g_hashResult;
+}
+
 void saveState(std::string path)
 {
 	g_stateResult = -1;
@@ -341,6 +493,7 @@ extern "C" void initVm()
 	g_virtualMachine->SetVu1Threaded(true);
 
 	g_vmNewFrameConnection = g_virtualMachine->OnNewFrame.Connect(&OnVmNewFrame);
+	g_vmStateLoadedConnection = g_virtualMachine->OnStateLoaded.Connect(&OnVmStateLoaded);
 	g_gsNewFrameConnection = g_virtualMachine->GetGSHandler()->OnNewFrame.Connect(std::bind(&CStatsManager::OnGsNewFrame, &CStatsManager::GetInstance(), std::placeholders::_1));
 
 	EMSCRIPTEN_RESULT result = EMSCRIPTEN_RESULT_SUCCESS;
@@ -417,6 +570,18 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("vuReplay", &vuReplay);
 	function("vuReplayResult", &vuReplayResult);
 	function("saveState", &saveState);
+	function("setEeBlockChaining", &setEeBlockChaining);
+	function("eeHashAfterLoad", &eeHashAfterLoad);
+	function("eeTimeAfterLoad", &eeTimeAfterLoad);
+	function("eeTimeResult", &eeTimeResult);
+	function("eeTimeVblank", &eeTimeVblank);
+	function("setEeContextPromotion", &setEeContextPromotion);
+	function("eeHashResult", &eeHashResult);
+	function("eeDumpRequest", &eeDumpRequest);
+	function("eeStateDump", &eeStateDump);
+	function("setEeBatchSize", &setEeBatchSize);
+	function("setJitPageAccess", &setJitPageAccess);
+	function("eeDumpResult", &eeDumpResult);
 	function("loadState", &loadState);
 	function("stateStatus", &stateStatus);
 	function("setFrameLimit", &setFrameLimit);

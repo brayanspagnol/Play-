@@ -770,6 +770,14 @@ void CMA_MIPSIV::LD()
 	if(!Ensure64BitRegs()) return;
 	if(m_nRT == 0) return;
 
+	if(UsePageAccess(16))
+	{
+		PushMemAccessPage();
+		m_codeGen->LoadFromPage(8);
+		m_codeGen->PullRel64(offsetof(CMIPS, m_State.nGPR[m_nRT]));
+		return;
+	}
+
 	ComputeMemAccessPageRef();
 
 	m_codeGen->PushCst(0);
@@ -824,6 +832,14 @@ void CMA_MIPSIV::SDC2()
 void CMA_MIPSIV::SD()
 {
 	if(!Ensure64BitRegs()) return;
+
+	if(UsePageAccess(32))
+	{
+		PushMemAccessPage(true);
+		m_codeGen->PushRel64(offsetof(CMIPS, m_State.nGPR[m_nRT]));
+		m_codeGen->StoreAtPage(8);
+		return;
+	}
 
 	ComputeMemAccessPageRef(true);
 
