@@ -176,6 +176,9 @@ public:
 	//Block chaining (WebAssembly, EE only): two-level table (address >> 16, then (address & 0xFFFF) / 4)
 	//of the function table indexes of the compiled blocks, 0 if none. Set by the executor.
 	uint32** m_blockFnLookup = nullptr;
+	//Bumped when EE blocks are deleted: EE region functions (several blocks in one wasm function)
+	//return to the executor instead of running the next block if it changed since they were entered
+	uint32 m_blockGeneration = 0;
 
 	//JIT scratch values (not architectural state, never saved): [0..2] latest value queued in the
 	//MAC, sticky and clip flag pipelines by the block being executed (see VUShared flag forwarding),

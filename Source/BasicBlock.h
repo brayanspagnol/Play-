@@ -113,6 +113,11 @@ public:
 		m_function.ReplaceWasmFunction(fctId);
 		m_batchModule = std::vector<uint8>();
 	}
+	//Leaves an EE region: a new instance of the block's own module (the region slot is removed)
+	void RecreateFunction()
+	{
+		m_function = m_function.CreateInstance();
+	}
 	//Index of the compiled function in the wasm function table
 	uint32 GetFunctionIndex() const
 	{

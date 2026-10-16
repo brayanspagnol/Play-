@@ -5,6 +5,8 @@
 #include "MA_EE.h"
 #include "xxhash.h"
 #include "../Profiler.h"
+#include "offsetof_def.h"
+#include <algorithm>
 #if defined(__EMSCRIPTEN__)
 #include "WasmModuleBuilder.h"
 #endif
@@ -57,6 +59,9 @@ CEeExecutor::CEeExecutor(CMIPS& context, uint8* ram)
 
 #if defined(__EMSCRIPTEN__)
 
+//Blocks (or region functions) called by the executor loop (Module.eeDispatchCount, benchmarks)
+uint64 g_eeDispatchCount = 0;
+
 int CEeExecutor::Execute(int cycles)
 {
 	m_executing = true;
@@ -70,6 +75,7 @@ int CEeExecutor::Execute(int cycles)
 	{
 		uint32 address = m_context.m_State.nPC & m_addressMask;
 		uint32 fctIdx = fnTable[address >> 16][(address & 0xFFFF) / 4];
+		g_eeDispatchCount++;
 		if(fctIdx != 0)
 		{
 			reinterpret_cast<void (*)(CMIPS*)>(static_cast<uintptr_t>(fctIdx))(&m_context);
@@ -114,20 +120,65 @@ void CEeExecutor::QueueForBatch(const BasicBlockPtr& block)
 	if(m_batchPending.size() >= g_eeBatchSize) FlushBatch();
 }
 
+extern uint32 g_eeRegionSpan;
+
 void CEeExecutor::FlushBatch()
 {
 	std::vector<BasicBlockPtr> blocks;
-	std::vector<CWasmModuleBuilder::MODULE_BYTES> modules;
 	for(const auto& weakBlock : m_batchPending)
 	{
 		auto block = weakBlock.lock();
 		if(!block || block->GetBatchModule().empty()) continue;
-		modules.push_back({block->GetBatchModule().data(), static_cast<uint32>(block->GetBatchModule().size())});
 		blocks.push_back(std::move(block));
 	}
 	m_batchPending.clear();
 	if(blocks.empty()) return;
-	auto batch = CWasmModuleBuilder::BuildBatchModule(modules);
+	//Ascending addresses: regions are runs of blocks within g_eeRegionSpan bytes of the first one
+	std::sort(blocks.begin(), blocks.end(), [](const auto& a, const auto& b) { return a->GetBeginAddress() < b->GetBeginAddress(); });
+	std::vector<CWasmModuleBuilder::MODULE_BYTES> modules;
+	for(const auto& block : blocks)
+	{
+		modules.push_back({block->GetBatchModule().data(), static_cast<uint32>(block->GetBatchModule().size())});
+	}
+	static const uint32 MAX_REGION_BLOCKS = 64;
+	std::vector<CWasmModuleBuilder::BATCH_FUNCTION> functions;
+	std::vector<uint32> exports(blocks.size());
+	auto isLive = [&](uint32 i) { return m_blockLookup.FindBlockAt(blocks[i]->GetBeginAddress()) == blocks[i].get(); };
+	for(uint32 i = 0; i < blocks.size();)
+	{
+		CWasmModuleBuilder::BATCH_FUNCTION function;
+		uint32 first = blocks[i]->GetBeginAddress();
+		uint32 next = i + 1;
+		function.modules.push_back(i);
+		function.starts.push_back(first);
+		if((g_eeRegionSpan != 0) && isLive(i))
+		{
+			while((next < blocks.size()) && (function.modules.size() < MAX_REGION_BLOCKS) &&
+			      ((blocks[next]->GetBeginAddress() - first) < g_eeRegionSpan) &&
+			      (blocks[next]->GetBeginAddress() != function.starts.back()) && isLive(next))
+			{
+				function.modules.push_back(next);
+				function.starts.push_back(blocks[next]->GetBeginAddress());
+				next++;
+			}
+		}
+		for(uint32 member : function.modules) exports[member] = static_cast<uint32>(functions.size());
+		functions.push_back(std::move(function));
+		i = next;
+	}
+	CWasmModuleBuilder::REGION_PARAMS regionParams;
+	regionParams.pcOffset = offsetof(CMIPS, m_State.nPC);
+	regionParams.exceptionOffset = offsetof(CMIPS, m_State.nHasException);
+	regionParams.generationOffset = offsetof(CMIPS, m_blockGeneration);
+	regionParams.addressMask = m_addressMask;
+	bool hasRegions = functions.size() != blocks.size();
+	auto batch = hasRegions ? CWasmModuleBuilder::BuildBatchModule(modules, functions, exports, regionParams) : std::vector<uint8>();
+	if(batch.empty())
+	{
+		//No regions, or a block the region builder doesn't handle: one function per block
+		hasRegions = false;
+		batch = CWasmModuleBuilder::BuildBatchModule(modules);
+	}
 	auto fctIds = batch.empty() ? std::vector<int>() : CMemoryFunction::CreateWasmBatch(batch.data(), batch.size(), static_cast<uint32>(blocks.size()));
 	for(uint32 i = 0; i < blocks.size(); i++)
 	{
@@ -138,6 +189,40 @@ void CEeExecutor::FlushBatch()
 		}
 		blocks[i]->ReplaceWasmFunction(fctIds[i]);
 		m_blockLookup.UpdateFunctionIndex(blocks[i].get());
+	}
+	if(!hasRegions || fctIds.empty()) return;
+	for(const auto& function : functions)
+	{
+		if(function.modules.size() < 2) continue;
+		REGION region;
+		for(uint32 member : function.modules)
+		{
+			region.end = std::max(region.end, blocks[member]->GetEndAddress());
+			region.members.push_back(blocks[member]);
+		}
+		m_regions.emplace(function.starts[0], std::move(region));
+	}
+}
+
+void CEeExecutor::DissolveRegions(uint32 start, uint32 end)
+{
+	//ponytail: linear scan; invalidations are rare in steady state. Index by address if they show up in profiles.
+	for(auto regionIterator = m_regions.begin(); regionIterator != m_regions.end();)
+	{
+		const auto& region = regionIterator->second;
+		if(!RangesOverlap(regionIterator->first, region.end, start, end - 1))
+		{
+			regionIterator++;
+			continue;
+		}
+		for(const auto& weakMember : region.members)
+		{
+			auto member = weakMember.lock();
+			if(!member) continue;
+			member->RecreateFunction();
+			m_blockLookup.UpdateFunctionIndex(member.get());
+		}
+		regionIterator = m_regions.erase(regionIterator);
 	}
 }
 
@@ -249,6 +334,7 @@ void CEeExecutor::Reset()
 	m_cachedBlocks.clear();
 #if defined(__EMSCRIPTEN__)
 	m_batchPending.clear();
+	m_regions.clear();
 #endif
 	m_blockFpRoundingModes.clear();
 	m_idleLoopBlocks.clear();
@@ -257,6 +343,12 @@ void CEeExecutor::Reset()
 
 void CEeExecutor::ClearActiveBlocksInRange(uint32 start, uint32 end, bool executing)
 {
+#if defined(__EMSCRIPTEN__)
+	//Region functions on the stack stop at their next block exit; regions with blocks that may be
+	//deleted are dissolved so none of their stale blocks can be reached again
+	m_context.m_blockGeneration++;
+	DissolveRegions(start, end);
+#endif
 	uint32 rangeSize = end - start;
 	SetMemoryProtected(m_ram + start, rangeSize, false);
 	CGenericMipsExecutor::ClearActiveBlocksInRange(start, end, executing);

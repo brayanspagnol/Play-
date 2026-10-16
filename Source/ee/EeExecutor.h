@@ -78,6 +78,15 @@ private:
 	void QueueForBatch(const BasicBlockPtr&);
 	void FlushBatch();
 	std::vector<std::weak_ptr<CBasicBlock>> m_batchPending;
+	//EE regions: blocks of a batch compiled into one function (first block address -> members).
+	//A region is dissolved (members get functions of their own) when any of its blocks may be deleted.
+	struct REGION
+	{
+		uint32 end = 0;
+		std::vector<std::weak_ptr<CBasicBlock>> members;
+	};
+	std::multimap<uint32, REGION> m_regions;
+	void DissolveRegions(uint32 start, uint32 end);
 
 	std::vector<uint8> m_protectedPages;
 	bool m_executing = false;

@@ -306,6 +306,25 @@ void setEeBatchSize(uint32 size)
 	g_eeBatchSize = size;
 }
 
+extern uint64 g_eeDispatchCount;
+double eeDispatchCount()
+{
+	return static_cast<double>(g_eeDispatchCount);
+}
+
+extern bool g_jitBranchSelect;
+void setJitBranchSelect(bool enabled)
+{
+	g_jitBranchSelect = enabled;
+}
+
+//EE regions: max distance in bytes between the first and last block of a region, 0 = off
+extern uint32 g_eeRegionSpan;
+void setEeRegionSpan(uint32 span)
+{
+	g_eeRegionSpan = span;
+}
+
 //EE context promotion (MIPS state kept in wasm locals within a block); for blocks compiled afterwards
 extern bool g_eeContextPromotion;
 void setEeContextPromotion(bool enabled)
@@ -580,6 +599,9 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("eeDumpRequest", &eeDumpRequest);
 	function("eeStateDump", &eeStateDump);
 	function("setEeBatchSize", &setEeBatchSize);
+	function("setEeRegionSpan", &setEeRegionSpan);
+	function("eeDispatchCount", &eeDispatchCount);
+	function("setJitBranchSelect", &setJitBranchSelect);
 	function("setJitPageAccess", &setJitPageAccess);
 	function("eeDumpResult", &eeDumpResult);
 	function("loadState", &loadState);

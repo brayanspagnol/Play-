@@ -179,9 +179,25 @@ void CMIPSInstructionFactory::ComputeMemAccessPageRef(bool forWrite)
 	m_codeGen->LoadRefFromRefIdx();
 }
 
+//Branches and the block epilogue use selects instead of if/else (Module.setJitBranchSelect, WebAssembly)
+bool g_jitBranchSelect = false;
+
 void CMIPSInstructionFactory::Branch(Jitter::CONDITION condition)
 {
 	uint16 nImmediate = (uint16)(m_nOpcode & 0xFFFF);
+
+	if(g_jitBranchSelect)
+	{
+		//nDelayedJumpAddr = condition ? target : MIPS_INVALID_PC
+		m_codeGen->Cmp(condition);
+		m_codeGen->PushRel(offsetof(CMIPS, m_State.nPC));
+		m_codeGen->PushCst((m_instrPosition + 4) + CMIPS::GetBranch(nImmediate));
+		m_codeGen->Add();
+		m_codeGen->PushCst(MIPS_INVALID_PC);
+		m_codeGen->Select();
+		m_codeGen->PullRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
+		return;
+	}
 
 	m_codeGen->PushCst(MIPS_INVALID_PC);
 	m_codeGen->PullRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));

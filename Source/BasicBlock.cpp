@@ -125,7 +125,11 @@ std::atomic<uint32> g_vuBlockExecCount = 0;
 #endif
 
 //EE module batching (Module.setEeBatchSize): blocks per batch module, 0 = off (one module per block)
-uint32 g_eeBatchSize = 64;
+uint32 g_eeBatchSize = 128;
+//EE regions (Module.setEeRegionSpan): blocks of one batch whose start addresses lie within this many
+//bytes are compiled into one function (see CEeExecutor::FlushBatch); 0 = off
+uint32 g_eeRegionSpan = 16384;
+extern bool g_jitBranchSelect;
 //Block chaining switch (Module.setEeBlockChaining), read when blocks are compiled
 bool g_eeBlockChaining = false;
 //EE context promotion (Module.setEeContextPromotion), read when blocks are compiled
@@ -178,7 +182,7 @@ void CBasicBlock::Compile()
 		cacheKey.category = m_category;
 		cacheKey.size = wordCount * 4;
 		cacheKey.hints = m_blockCompileHints;
-		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000) | (IsSuperBlock() ? 0x20000000 : 0) | (UsesBlockChaining() ? 0x10000000 : 0) | ((g_jitPageAccess != ~0U) ? (0x08000000 | (g_jitPageAccess & 0x3FF)) : 0);
+		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000) | (IsSuperBlock() ? 0x20000000 : 0) | (UsesBlockChaining() ? 0x10000000 : 0) | ((g_jitPageAccess != ~0U) ? (0x08000000 | (g_jitPageAccess & 0x3FF)) : 0) | (g_jitBranchSelect ? 0x04000000 : 0);
 		cacheKey.hash[0] = xxHash.low64;
 		cacheKey.hash[1] = xxHash.high64;
 
@@ -465,6 +469,22 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 		jitter->PushCst(m_end - m_begin + 4);
 		jitter->Add();
 		jitter->PullRel(offsetof(CMIPS, m_State.nPC));
+	}
+	else if(g_jitBranchSelect && !loopsOnItself)
+	{
+		//nPC = (nDelayedJumpAddr != MIPS_INVALID_PC) ? nDelayedJumpAddr : nPC + size, no branch
+		jitter->PushRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
+		jitter->PushCst(MIPS_INVALID_PC);
+		jitter->Cmp(Jitter::CONDITION_NE);
+		jitter->PushRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
+		jitter->PushRel(offsetof(CMIPS, m_State.nPC));
+		jitter->PushCst(m_end - m_begin + 4);
+		jitter->Add();
+		jitter->Select();
+		jitter->PullRel(offsetof(CMIPS, m_State.nPC));
+
+		jitter->PushCst(MIPS_INVALID_PC);
+		jitter->PullRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
 	}
 	else
 	{
