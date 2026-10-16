@@ -35,6 +35,8 @@ list(APPEND UI_JS_PROJECT_LIBS gsh_opengl)
 add_executable(Play
 	GSH_OpenGLJs.cpp
 	GSH_OpenGLJs.h
+	GSH_WebGPU.cpp
+	GSH_WebGPU.h
 	InputProviderEmscripten.cpp
 	InputProviderEmscripten.h
 	Main.cpp
@@ -67,3 +69,6 @@ set_property(TARGET Play APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR
 #Audio output: AudioWorklet + time-stretching (see SH_WebAudio.h)
 target_link_options(Play PRIVATE "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/WebAudio.js")
 set_property(TARGET Play APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/WebAudio.js)
+#WebGPU GS renderer (GPU side, WGSL shaders), see GSH_WebGPU.h
+target_link_options(Play PRIVATE "--pre-js=${CMAKE_CURRENT_SOURCE_DIR}/GSH_WebGPU.js")
+set_property(TARGET Play APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/GSH_WebGPU.js)

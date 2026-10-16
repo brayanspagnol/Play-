@@ -2,6 +2,7 @@
 #include <emscripten/bind.h>
 #include "Ps2VmJs.h"
 #include "GSH_OpenGLJs.h"
+#include "GSH_WebGPU.h"
 #include "SH_WebAudio.h"
 #include "input/PH_GenericInput.h"
 #include "InputProviderEmscripten.h"
@@ -34,6 +35,8 @@ extern std::atomic<uint32> g_eeIdleSlices;
 #endif
 
 CPs2VmJs* g_virtualMachine = nullptr;
+//GS renderer picked by the page before initVm (Module.gsBackend = "webgpu", see emulator.js); WebGL2 otherwise.
+bool g_gsWebGpu = false;
 CGSHandler::NewFrameEvent::Connection g_gsNewFrameConnection;
 std::shared_ptr<CInputProviderEmscripten> g_inputProvider;
 Framework::CSignal<void()>::Connection g_vmNewFrameConnection;
@@ -561,6 +564,7 @@ int stateStatus()
 //GS renderer workarounds by name (bench/debug switch). "gowShuffle": see CGSH_OpenGL::IsUnsupportedChannelShuffleWrite.
 bool setGsHack(std::string name, bool enabled)
 {
+	if(g_gsWebGpu) return false;
 	auto gs = static_cast<CGSH_OpenGLJs*>(g_virtualMachine->GetGSHandler());
 	if(name == "gowShuffle")
 	{
@@ -596,8 +600,17 @@ void setGsOptions(int resolutionFactor, bool forceBilinear, bool widescreen, int
 	config.SetPreferenceBoolean(PREF_CGSH_OPENGL_FORCEBILINEARTEXTURES, forceBilinear);
 	config.SetPreferenceBoolean(PREF_CGSHANDLER_WIDESCREEN, widescreen);
 	config.SetPreferenceInteger(PREF_CGSHANDLER_PRESENTATION_MODE, presentationMode);
+	int width = (widescreen ? 854 : 640) * resolutionFactor;
+	int height = 480 * resolutionFactor;
+	auto mode = static_cast<CGSHandler::PRESENTATION_MODE>(presentationMode);
+	if(g_gsWebGpu)
+	{
+		//ponytail: WebGPU renders at native resolution only (the output is just scaled).
+		static_cast<CGSH_WebGPU*>(g_virtualMachine->GetGSHandler())->SetOutput(width, height, mode);
+		return;
+	}
 	auto gs = static_cast<CGSH_OpenGLJs*>(g_virtualMachine->GetGSHandler());
-	gs->SetOutput((widescreen ? 854 : 640) * resolutionFactor, 480 * resolutionFactor, static_cast<CGSHandler::PRESENTATION_MODE>(presentationMode));
+	gs->SetOutput(width, height, mode);
 }
 
 //Replaces the keyboard/gamepad bindings: keys = [[KeyboardEvent.code, PS2 button, positive], ...]
@@ -673,7 +686,8 @@ extern "C" void initVm()
 	//it receives through Module.onGsFrame, which must be set before this call.
 	g_virtualMachine = new CPs2VmJs();
 	g_virtualMachine->Initialize();
-	g_virtualMachine->CreateGSHandler(CGSH_OpenGLJs::GetFactoryFunction(640, 480));
+	g_gsWebGpu = EM_ASM_INT({ return Module["gsBackend"] === "webgpu" ? 1 : 0; }) != 0;
+	g_virtualMachine->CreateGSHandler(g_gsWebGpu ? CGSH_WebGPU::GetFactoryFunction(640, 480) : CGSH_OpenGLJs::GetFactoryFunction(640, 480));
 
 	{
 		//Size here needs to match the size of the canvas in HTML file.
@@ -729,8 +743,16 @@ extern "C" void initVm()
 	emscripten_request_animation_frame_loop(&gamepadPollCallback, nullptr);
 
 	//Not waited for: the GS thread needs the main thread free to create its WebGL context.
-	auto gs = static_cast<CGSH_OpenGLJs*>(g_virtualMachine->GetGSHandler());
-	gs->SendGSCall([gs]() { gs->InitializeContext(); });
+	if(g_gsWebGpu)
+	{
+		auto gs = static_cast<CGSH_WebGPU*>(g_virtualMachine->GetGSHandler());
+		gs->SendGSCall([gs]() { gs->InitializeContext(); });
+	}
+	else
+	{
+		auto gs = static_cast<CGSH_OpenGLJs*>(g_virtualMachine->GetGSHandler());
+		gs->SendGSCall([gs]() { gs->InitializeContext(); });
+	}
 }
 
 //The page left the game: stop emulating until the next boot (VM thread idle, audio context suspended).
