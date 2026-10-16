@@ -265,11 +265,14 @@ Module["webAudioStart"] = function(ring) {
 		node.connect(ctx.destination);
 	}, (e) => console.error("Audio worklet failed to load:", e));
 
-	// Autoplay policy: the context may only start after a user gesture; hidden tab: suspend.
-	const resume = () => { if(ctx.state === "suspended" && !document.hidden) ctx.resume(); };
+	// Autoplay policy: the context may only start after a user gesture; hidden tab or paused VM: suspend.
+	let paused = true; // until the first boot: no audio thread while the page has no game running
+	const resume = () => { if(ctx.state === "suspended" && !document.hidden && !paused) ctx.resume(); };
 	for(const type of ["pointerdown", "keydown", "touchstart"]) window.addEventListener(type, resume, true);
 	document.addEventListener("visibilitychange", () => { if(document.hidden) ctx.suspend(); else resume(); });
-	resume();
+	ctx.suspend(); // a page that already had a user gesture starts the context running
+	// pauseVm/boot (Main.cpp). Samples left in the ring are dropped on resume (the worklet flushes after a gap).
+	Module["audioSetPaused"] = (p) => { paused = p; if(p) ctx.suspend(); else resume(); };
 
 	const hdr = () => new Uint32Array(HEAPU8.buffer, ring, 4);
 	Module["audioContext"] = ctx;
