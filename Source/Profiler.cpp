@@ -5,6 +5,10 @@
 #include <cstdio>
 
 std::atomic<uint32> g_profileCounters[PCNT_MAX];
+std::atomic<uint64> g_timelineNs[TLT_MAX];
+std::atomic<uint32> g_timelineCounts[TLC_MAX];
+thread_local std::atomic<int32>* CProfiler::t_currentZone = nullptr;
+static std::mutex g_registerMutex;
 const char* const g_profileCounterNames[PCNT_MAX] =
     {
         "vif1Dma", "vif1DmaQw", "mscal", "unpack", "mpg", "direct", "flush", "ibit", "mskpath3",
@@ -14,8 +18,7 @@ const char* const g_profileCounterNames[PCNT_MAX] =
 CProfiler::ZoneHandle CProfiler::RegisterZone(const char* name)
 {
 #ifdef PROFILE
-	static std::mutex registerMutex;
-	std::lock_guard<std::mutex> registerLock(registerMutex);
+	std::lock_guard<std::mutex> registerLock(g_registerMutex);
 	for(unsigned int i = 0; i < m_zoneNames.size(); i++)
 	{
 		if(m_zoneNames[i] == name) return i;
@@ -66,6 +69,21 @@ CProfiler::ZoneArray CProfiler::GetStats() const
 	return result;
 }
 
+void CProfiler::GetZoneTimes(uint64* times, uint64* secondTimes, unsigned int count) const
+{
+	for(unsigned int i = 0; i < count && i < MAX_ZONES; i++)
+	{
+		times[i] = m_zoneTimes[i].load(std::memory_order_relaxed);
+		secondTimes[i] = m_secondZoneTimes[i].load(std::memory_order_relaxed);
+	}
+}
+
+std::vector<std::string> CProfiler::GetZoneNames() const
+{
+	std::lock_guard<std::mutex> registerLock(g_registerMutex);
+	return m_zoneNames;
+}
+
 void CProfiler::Reset()
 {
 	for(auto& zoneTime : m_zoneTimes)
@@ -81,6 +99,7 @@ void CProfiler::Reset()
 void CProfiler::SetWorkThread()
 {
 	m_workThreadId = std::this_thread::get_id();
+	t_currentZone = &m_currentZone;
 #ifdef PROFILE
 	if(!m_samplerThread.joinable())
 	{
@@ -93,6 +112,7 @@ void CProfiler::SetWorkThread()
 void CProfiler::SetSecondWorkThread()
 {
 	m_secondWorkThreadId = std::this_thread::get_id();
+	t_currentZone = &m_secondCurrentZone;
 }
 
 void CProfiler::SetPcSampler(unsigned int slot, ZoneHandle zone, const uint32* pc)
@@ -166,7 +186,7 @@ void CProfiler::Log(const char* format, ...)
 	vsnprintf(buffer, sizeof(buffer), format, args);
 	va_end(args);
 	std::lock_guard<std::mutex> lock(m_logMutex);
-	if(m_log.size() < 65536) m_log += buffer;
+	if(m_log.size() < (1 << 20)) m_log += buffer;
 }
 
 std::string CProfiler::TakeLog()

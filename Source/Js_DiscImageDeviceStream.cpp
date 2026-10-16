@@ -3,6 +3,7 @@
 #include <cassert>
 #include <emscripten.h>
 #include <unistd.h>
+#include "Profiler.h"
 
 static std::string g_discImageUrl;
 
@@ -13,7 +14,7 @@ void Js_SetDiscImageUrl(const std::string& url)
 
 // Runs on the calling (emulation) thread: reads [position, position + size) from
 // the URL in 1 MB blocks through a small LRU kept in this worker's global scope.
-// Returns 0 on failure so the caller can fall back to the main-thread path.
+// Returns 0 on failure so the caller can fall back to the main-thread path, else 1 + the number of blocks fetched.
 EM_JS(int, Js_ReadDiscUrl, (const char* urlPtr, uint32 positionLow, uint32 positionHigh, void* buffer, uint32 size), {
 	const url = UTF8ToString(urlPtr);
 	let d = globalThis.__ps2Disc;
@@ -22,6 +23,7 @@ EM_JS(int, Js_ReadDiscUrl, (const char* urlPtr, uint32 positionLow, uint32 posit
 	let pos = (positionLow >>> 0) + (positionHigh >>> 0) * 4294967296;
 	let dst = buffer >>> 0;
 	let left = size >>> 0;
+	let fetched = 0;
 	while(left > 0)
 	{
 		const bi = Math.floor(pos / BS);
@@ -56,6 +58,7 @@ EM_JS(int, Js_ReadDiscUrl, (const char* urlPtr, uint32 positionLow, uint32 posit
 					}
 				}
 			}
+			fetched++;
 			d.blocks.set(bi, b);
 			if(d.blocks.size > MAX_BLOCKS) d.blocks.delete(d.blocks.keys().next().value);
 		}
@@ -67,7 +70,7 @@ EM_JS(int, Js_ReadDiscUrl, (const char* urlPtr, uint32 positionLow, uint32 posit
 		pos += n;
 		left -= n;
 	}
-	return 1;
+	return 1 + fetched;
 });
 
 void CJsDiscImageDeviceStream::Seek(int64 position, Framework::STREAM_SEEK_DIRECTION whence)
@@ -100,12 +103,20 @@ uint64 CJsDiscImageDeviceStream::Read(void* buffer, uint64 size)
 	if(size == 0) return 0;
 
 	assert(size <= std::numeric_limits<uint32>::max());
+#ifdef PROFILE
+	static const auto discZone = CProfiler::GetInstance().RegisterZone("DISC");
+	CProfilerZone profilerZone(discZone);
+#endif
+	CTimelineTimer timer(TLT_DISC);
+	g_timelineCounts[TLC_DISCBYTES].fetch_add(static_cast<uint32>(size), std::memory_order_relaxed);
 
 	uint32 positionLow = static_cast<uint32>(m_position);
 	uint32 positionHigh = static_cast<uint32>(m_position >> 32);
 
-	if(!g_discImageUrl.empty() && Js_ReadDiscUrl(g_discImageUrl.c_str(), positionLow, positionHigh, buffer, static_cast<uint32>(size)))
+	int urlResult = g_discImageUrl.empty() ? 0 : Js_ReadDiscUrl(g_discImageUrl.c_str(), positionLow, positionHigh, buffer, static_cast<uint32>(size));
+	if(urlResult > 0)
 	{
+		g_timelineCounts[TLC_DISCXHR].fetch_add(urlResult - 1, std::memory_order_relaxed);
 		m_position += size;
 		return size;
 	}

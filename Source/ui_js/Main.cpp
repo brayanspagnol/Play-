@@ -20,13 +20,12 @@
 #include <atomic>
 #include <algorithm>
 #include <emscripten.h>
+#include <emscripten/html5.h>
+#include <cstring>
 #include "xxhash.h"
 #include "Ps2Const.h"
 
 #ifdef PROFILE
-extern std::atomic<uint64> g_gsThreadBusyNs;
-extern std::atomic<uint64> g_vu1ThreadBusyNs;
-extern std::atomic<uint32> g_blockCompileCount;
 extern std::atomic<uint32> g_vuBlockExecCount;
 extern std::atomic<uint32> g_eeSyscallCounts[0x100];
 extern std::atomic<uint32> g_eeInterruptCount;
@@ -52,6 +51,164 @@ struct PROFILE_ACCUM
 static std::mutex g_profileMutex;
 static PROFILE_ACCUM g_profile;
 static double g_profileLastTime = 0;
+
+//Increase of a cumulative counter since the previous call with the same 'last'
+template <typename T>
+static T TakeDelta(const std::atomic<T>& counter, T& last)
+{
+	T value = counter.load(std::memory_order_relaxed);
+	T delta = value - last;
+	last = value;
+	return delta;
+}
+
+//Per-vblank timeline: one row per emulated vblank (wall time, waits, compiles, disc reads, other threads'
+//busy time; zone times in profiling builds), kept in a ring and read with getTimeline(from).
+namespace Timeline
+{
+	enum
+	{
+		RING_SIZE = 16384, //~5 min at 50-60 vblanks/s
+	};
+	//Base columns (all builds)
+	static const char* const g_baseColumns[] = {
+	    "t", "wall", "limiter", "vu1sync", "ringfull", "gswait", "vu1gswait", "disc", "compile", "vu1compile",
+	    "gsbusy", "vu1busy", "compiles", "jitruns", "discKB", "discxhr", "ringKB", "eeBusy"};
+	enum
+	{
+		BASE_COLUMNS = sizeof(g_baseColumns) / sizeof(g_baseColumns[0]),
+#ifdef PROFILE
+		ZONE_COLUMNS = CProfiler::MAX_ZONES,
+		COUNTER_COLUMNS = PCNT_MAX,
+#else
+		ZONE_COLUMNS = 0,
+		COUNTER_COLUMNS = 0,
+#endif
+		COLUMNS = BASE_COLUMNS + COUNTER_COLUMNS + (2 * ZONE_COLUMNS),
+	};
+	static std::mutex g_mutex;
+	static std::vector<float> g_rows; //RING_SIZE * COLUMNS
+	static uint64 g_count = 0;        //rows written so far
+	static double g_start = 0;        //emscripten_get_now() at the first row
+	static double g_startDate = 0;    //Date.now() at the first row
+	static double g_lastTime = 0;
+	static uint64 g_lastNs[TLT_MAX] = {};
+	static uint32 g_lastCounts[TLC_MAX] = {};
+#ifdef PROFILE
+	static uint32 g_lastProfileCounters[PCNT_MAX] = {};
+#endif
+
+	//VM thread, at every vblank (before the profiler's zone times are reset)
+	static void Record(const CPS2VM::CPU_UTILISATION_INFO& cpu)
+	{
+		double now = emscripten_get_now();
+		float row[COLUMNS] = {};
+		if(g_start == 0)
+		{
+			g_start = now;
+			g_startDate = emscripten_date_now();
+			g_lastTime = now;
+		}
+		row[0] = static_cast<float>(now - g_start);
+		row[1] = static_cast<float>(now - g_lastTime);
+		g_lastTime = now;
+		static const TIMELINE_TIMER timers[] = {TLT_LIMITER, TLT_VU1SYNC, TLT_RINGFULL, TLT_GSWAIT, TLT_VU1GSWAIT, TLT_DISC, TLT_COMPILE, TLT_VU1COMPILE, TLT_GSBUSY, TLT_VU1BUSY};
+		unsigned int column = 2;
+		for(auto timer : timers)
+		{
+			row[column++] = static_cast<float>(TakeDelta(g_timelineNs[timer], g_lastNs[timer]) / 1e6);
+		}
+		row[column++] = static_cast<float>(TakeDelta(g_timelineCounts[TLC_COMPILES], g_lastCounts[TLC_COMPILES]));
+		row[column++] = static_cast<float>(TakeDelta(g_timelineCounts[TLC_JITRUNS], g_lastCounts[TLC_JITRUNS]));
+		row[column++] = static_cast<float>(TakeDelta(g_timelineCounts[TLC_DISCBYTES], g_lastCounts[TLC_DISCBYTES]) / 1024.0);
+		row[column++] = static_cast<float>(TakeDelta(g_timelineCounts[TLC_DISCXHR], g_lastCounts[TLC_DISCXHR]));
+		row[column++] = static_cast<float>(g_virtualMachine->m_ee->GetVu1PendingBytes() / 1024.0);
+		row[column++] = cpu.eeTotalTicks ? static_cast<float>(100.0 * (cpu.eeTotalTicks - cpu.eeIdleTicks) / cpu.eeTotalTicks) : 0;
+		assert(column == BASE_COLUMNS);
+#ifdef PROFILE
+		for(uint32 i = 0; i < PCNT_MAX; i++)
+		{
+			row[column++] = static_cast<float>(TakeDelta(g_profileCounters[i], g_lastProfileCounters[i]));
+		}
+		uint64 zoneNs[CProfiler::MAX_ZONES] = {};
+		uint64 secondZoneNs[CProfiler::MAX_ZONES] = {};
+		CProfiler::GetInstance().GetZoneTimes(zoneNs, secondZoneNs, CProfiler::MAX_ZONES);
+		for(uint32 i = 0; i < CProfiler::MAX_ZONES; i++)
+		{
+			row[column + i] = static_cast<float>(zoneNs[i] / 1e6);
+			row[column + CProfiler::MAX_ZONES + i] = static_cast<float>(secondZoneNs[i] / 1e6);
+		}
+#endif
+		std::lock_guard<std::mutex> lock(g_mutex);
+		if(g_rows.empty()) g_rows.resize(RING_SIZE * COLUMNS);
+		memcpy(g_rows.data() + (g_count % RING_SIZE) * COLUMNS, row, sizeof(row));
+		g_count++;
+	}
+
+	//JSON: {"cols":[...],"next":<index after the last row>,"t0":<Date.now() of row t=0>,"rows":[[...],...]}
+	//with the rows of index >= from that are still in the ring.
+	static std::string Get(double fromValue)
+	{
+		std::vector<float> rows;
+		uint64 first = 0, next = 0;
+		double startDate = 0;
+		{
+			std::lock_guard<std::mutex> lock(g_mutex);
+			next = g_count;
+			first = std::max<uint64>(static_cast<uint64>(std::max(fromValue, 0.0)), (g_count > RING_SIZE) ? (g_count - RING_SIZE) : 0);
+			first = std::min(first, next);
+			rows.reserve((next - first) * COLUMNS);
+			for(uint64 i = first; i < next; i++)
+			{
+				const float* row = g_rows.data() + (i % RING_SIZE) * COLUMNS;
+				rows.insert(rows.end(), row, row + COLUMNS);
+			}
+			startDate = g_startDate;
+		}
+		std::vector<std::string> columns(g_baseColumns, g_baseColumns + BASE_COLUMNS);
+		unsigned int usedColumns = BASE_COLUMNS;
+#ifdef PROFILE
+		for(uint32 i = 0; i < PCNT_MAX; i++) columns.push_back(std::string("n:") + g_profileCounterNames[i]);
+		//Every zone slot, so that rows fetched at different times line up (zones registered later are "#<slot>" until then)
+		auto zoneNames = CProfiler::GetInstance().GetZoneNames();
+		for(const char* prefix : {"z:", "v:"})
+		{
+			for(uint32 i = 0; i < CProfiler::MAX_ZONES; i++)
+			{
+				columns.push_back(prefix + ((i < zoneNames.size()) ? zoneNames[i] : string_format("#%u", i)));
+			}
+		}
+		usedColumns = COLUMNS;
+#endif
+		std::string result = "{\"cols\":[";
+		for(size_t i = 0; i < columns.size(); i++)
+		{
+			result += string_format("%s\"%s\"", i ? "," : "", columns[i].c_str());
+		}
+		result += string_format("],\"first\":%llu,\"next\":%llu,\"t0\":%.0f,\"rows\":[", static_cast<unsigned long long>(first), static_cast<unsigned long long>(next), startDate);
+		auto appendValue = [&](float value, bool comma) {
+			if(comma) result += ',';
+			if(value == 0)
+				result += '0';
+			else
+				result += string_format("%.2f", value);
+		};
+		for(uint64 r = 0; r < (next - first); r++)
+		{
+			const float* row = rows.data() + r * COLUMNS;
+			result += r ? ",[" : "[";
+			for(unsigned int c = 0; c < usedColumns; c++) appendValue(row[c], c != 0);
+			result += ']';
+		}
+		result += "]}";
+		return result;
+	}
+}
+
+std::string getTimeline(double from)
+{
+	return Timeline::Get(from);
+}
 
 #ifdef PROFILE
 static std::string TopPcs(CProfiler::PcHistogram histogram)
@@ -135,6 +292,7 @@ static void OnVmNewFrame()
 	}
 	UpdateVblankTiming();
 	auto cpu = g_virtualMachine->GetCpuUtilisationInfo();
+	Timeline::Record(cpu);
 	std::lock_guard<std::mutex> lock(g_profileMutex);
 	g_profile.vblanks++;
 	g_profile.cpu.eeTotalTicks += cpu.eeTotalTicks;
@@ -178,10 +336,14 @@ std::string getProfile()
 	uint64 vu1BusyNs = 0;
 	uint32 compiles = 0;
 	std::string extra;
+	{
+		static uint64 lastGsBusy = 0, lastVu1Busy = 0;
+		static uint32 lastCompiles = 0;
+		gsBusyNs = TakeDelta(g_timelineNs[TLT_GSBUSY], lastGsBusy);
+		vu1BusyNs = TakeDelta(g_timelineNs[TLT_VU1BUSY], lastVu1Busy);
+		compiles = TakeDelta(g_timelineCounts[TLC_COMPILES], lastCompiles);
+	}
 #ifdef PROFILE
-	gsBusyNs = g_gsThreadBusyNs.exchange(0);
-	vu1BusyNs = g_vu1ThreadBusyNs.exchange(0);
-	compiles = g_blockCompileCount.exchange(0);
 	{
 		std::string syscalls;
 		for(uint32 i = 0; i < 0x100; i++)
@@ -198,9 +360,10 @@ std::string getProfile()
 			if(static_cast<unsigned char>(c) >= 0x20) escapedLog += c;
 		}
 		std::string counters;
+		static uint32 lastCounters[PCNT_MAX] = {};
 		for(uint32 i = 0; i < PCNT_MAX; i++)
 		{
-			counters += string_format("%s\"%s\":%u", i ? "," : "", g_profileCounterNames[i], g_profileCounters[i].exchange(0));
+			counters += string_format("%s\"%s\":%u", i ? "," : "", g_profileCounterNames[i], TakeDelta(g_profileCounters[i], lastCounters[i]));
 		}
 		extra = string_format(",\"counters\":{%s},\"vuBlocks\":%u,\"log\":\"%s\",\"syscalls\":{%s},\"eeInts\":%u,\"eeSlices\":%u,\"eeIdleSlices\":%u",
 		                      counters.c_str(), g_vuBlockExecCount.exchange(0), escapedLog.c_str(), syscalls.c_str(), g_eeInterruptCount.exchange(0), g_eeSlices.exchange(0), g_eeIdleSlices.exchange(0));
@@ -632,6 +795,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("getFrames", &getFrames);
 	function("clearStats", &clearStats);
 	function("getProfile", &getProfile);
+	function("getTimeline", &getTimeline);
 	function("setVuJitOptions", &setVuJitOptions);
 	function("setVuSuperBlocks", &setVuSuperBlocks);
 	function("vuDiffStats", &vuDiffStats);

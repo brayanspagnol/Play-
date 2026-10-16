@@ -2200,9 +2200,6 @@ void CGSHandler::WriteToDelayedRegister(uint32 address, uint32 value, DELAYED_RE
 	}
 }
 
-#ifdef PROFILE
-std::atomic<uint64> g_gsThreadBusyNs = 0;
-#endif
 
 #ifdef __EMSCRIPTEN__
 // clang-format off
@@ -2231,19 +2228,16 @@ void CGSHandler::ThreadProc()
 	while(!m_threadDone)
 	{
 		m_mailBox.WaitForCall();
-#ifdef PROFILE
-		auto busyStart = std::chrono::steady_clock::now();
-#endif
-		while(m_mailBox.IsPending())
 		{
-			m_mailBox.ReceiveCall();
+			CTimelineTimer busyTimer(TLT_GSBUSY);
+			while(m_mailBox.IsPending())
+			{
+				m_mailBox.ReceiveCall();
 #ifdef __EMSCRIPTEN__
-			if(m_flipped) break;
+				if(m_flipped) break;
 #endif
+			}
 		}
-#ifdef PROFILE
-		g_gsThreadBusyNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - busyStart).count();
-#endif
 #ifdef __EMSCRIPTEN__
 		//Browser objects made on this thread (e.g. the ImageBitmap of each presented frame, see
 		//GSH_OpenGLJs) are only released by tasks on this worker's event loop, which never runs while
@@ -2268,15 +2262,16 @@ void CGSHandler::SendGSCall(const CMailBox::FunctionType& function, bool waitFor
 		waitForCompletion = false;
 	}
 	waitForCompletion |= forceWaitForCompletion;
-#ifdef PROFILE
 	if(waitForCompletion)
 	{
+		CTimelineTimer timer(CProfiler::GetInstance().IsWorkThread() ? TLT_GSWAIT : TLT_VU1GSWAIT);
+#ifdef PROFILE
 		static const auto gsWaitZone = CProfiler::GetInstance().RegisterZone("GSWAIT");
 		CProfilerZone profilerZone(gsWaitZone);
+#endif
 		m_mailBox.SendCall(function, waitForCompletion);
 		return;
 	}
-#endif
 	m_mailBox.SendCall(function, waitForCompletion);
 }
 
