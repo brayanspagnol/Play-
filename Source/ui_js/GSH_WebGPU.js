@@ -55,7 +55,10 @@ var GsWgpu = {
 				const adapter = await navigator.gpu.requestAdapter();
 				this.timestamps = adapter.features.has("timestamp-query");
 				this.device = await adapter.requestDevice({ requiredFeatures: this.timestamps ? ["timestamp-query"] : [] });
-				this.device.lost.then((info) => console.error("GSH_WebGPU: device lost:", info.message));
+				this.device.lost.then((info) => {
+					console.error("GSH_WebGPU: device lost:", info.message);
+					if (info.reason !== "destroyed") postMessage({ cmd: "callHandler", handler: "onGsDeviceLost", args: [] });
+				});
 				this.device.onuncapturederror = (e) => {
 					if (this.errorCount++ < 20) console.error("GSH_WebGPU:", e.error.message);
 				};
@@ -64,6 +67,7 @@ var GsWgpu = {
 			} catch (e) {
 				console.error("GSH_WebGPU: initialization failed:", e);
 			}
+			if (!ok) postMessage({ cmd: "callHandler", handler: "onGsDeviceLost", args: [] }); // the page falls back to WebGL2
 			this.callWasm(readyFn, gs, ok ? 1 : 0);
 			this.callWasm(resumeFn, gs);
 		})();
