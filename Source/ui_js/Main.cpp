@@ -515,10 +515,33 @@ void setEeRegionParts(uint32 parts)
 	g_eeRegionParts = parts;
 }
 
-extern uint32 g_eeRegionStats[2];
+//Tier-2 EE regions compiled with context promotion (GPRs in wasm locals across the region)
+extern bool g_eeRegionPromotion;
+void setEeRegionPromotion(bool enabled)
+{
+	g_eeRegionPromotion = enabled;
+}
+
+//Tier-2 EE regions: an entry gets a region after this many samples (one dispatch in 64 is sampled)
+extern uint32 g_eeRegionHotSamples;
+void setEeRegionHotSamples(uint32 samples)
+{
+	g_eeRegionHotSamples = std::clamp<uint32>(samples, 1, 0xFFFF);
+}
+
+extern uint32 g_eeRegionStats[EE_REGION_STAT_COUNT];
+extern uint64 g_eeDispatchCount;
+extern uint32 g_eeRegionJitRuns;
+
+//Counters in EE_REGION_STAT order (ee/EeExecutor.h), then the EE dispatch count and region Jitter runs
 std::string eeRegionStats()
 {
-	return string_format("%u %u", g_eeRegionStats[0], g_eeRegionStats[1]);
+	std::string result;
+	for(int i = 0; i < EE_REGION_STAT_COUNT; i++)
+	{
+		result += string_format("%u ", g_eeRegionStats[i]);
+	}
+	return result + string_format("%llu %u", static_cast<unsigned long long>(g_eeDispatchCount), g_eeRegionJitRuns);
 }
 
 extern std::mutex g_eeDumpMutex;
@@ -858,6 +881,8 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("setEeContextPromotion", &setEeContextPromotion);
 	function("setEeRegionParts", &setEeRegionParts);
 	function("eeRegionStats", &eeRegionStats);
+	function("setEeRegionHotSamples", &setEeRegionHotSamples);
+	function("setEeRegionPromotion", &setEeRegionPromotion);
 	function("eeHashResult", &eeHashResult);
 	function("eeEdgeProfile", &eeEdgeProfile);
 	function("eeDumpRequest", &eeDumpRequest);

@@ -19,6 +19,21 @@
 
 #include "../GenericMipsExecutor.h"
 
+//Tier-2 region counters (g_eeRegionStats, Module.eeRegionStats)
+enum EE_REGION_STAT
+{
+	EE_REGION_CREATED,           //regions created (including recreations after invalidation)
+	EE_REGION_PARTS,             //their total parts
+	EE_REGION_ENTRIES,           //distinct entries that got a region
+	EE_REGION_REBUILT_ENTRIES,   //entries whose region was created more than once
+	EE_REGION_REBUILT8_ENTRIES,  //entries whose region was created more than 8 times
+	EE_REGION_MAX_BUILDS,        //most creations for one entry
+	EE_REGION_COMPILED,          //regions compiled (tier-1 cache miss: block cache lookup + module)
+	EE_REGION_REUSED,            //regions recreated from m_cachedBlocks (no compile)
+	EE_REGION_PAGE_CLEARS,       //protected pages cleared by a write (all blocks)
+	EE_REGION_STAT_COUNT,
+};
+
 class CEeExecutor : public CGenericMipsExecutor<BlockLookupTwoWay>
 {
 public:
@@ -102,17 +117,22 @@ private:
 	uint64 HashRegionWords(const std::vector<CBasicBlock::SUPERBLOCK_PART>&) const;
 	std::unordered_map<uint32, std::vector<REGION_PLAN>> m_regionPlans;
 	std::vector<CBasicBlock::SUPERBLOCK_PART> m_pendingRegionParts;
-	//Hot entries: a dispatch address sampled REGION_HOT_SAMPLES times gets a region
-	//ponytail: fixed period/threshold and sample counts that only grow until Reset; tune by profile
+	//Hot entries: a dispatch address sampled g_eeRegionHotSamples times gets a region
+	//ponytail: fixed average period; counts restart only on Reset/state load (no decay)
 	enum
 	{
 		REGION_SAMPLE_PERIOD = 64,
-		REGION_HOT_SAMPLES = 16,
 	};
+	static constexpr uint32 REGION_SAMPLE_SEED = 0x9E3779B9;
 	void SampleRegionEntry(uint32);
+	void ResetRegionSampling();
 	uint32 m_regionSampleCountdown = REGION_SAMPLE_PERIOD;
-	std::unordered_map<uint32, uint32> m_regionEntrySamples;
+	uint32 m_regionSampleRng = REGION_SAMPLE_SEED;
+	//Sample counts by word address (an unordered_map cost ~1 ms/vblank in GTA)
+	//ponytail: aliases addresses 4 MB apart (the first to reach the threshold gets the region); tag it if that matters
+	std::vector<uint16> m_regionEntrySamples = std::vector<uint16>(0x100000);
 	std::set<uint32> m_regionHotEntries;
+	std::unordered_map<uint32, uint32> m_regionBuildCounts;
 	//Regions removed by an invalidation while they may be running, kept alive until Execute returns
 	std::vector<BasicBlockPtr> m_retiredRegions;
 

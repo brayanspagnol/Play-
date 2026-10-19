@@ -130,6 +130,8 @@ uint32 g_eeBatchSize = 64;
 bool g_eeBlockChaining = false;
 //EE context promotion (Module.setEeContextPromotion), read when blocks are compiled
 bool g_eeContextPromotion = false;
+//EE regions (tier 2) with context promotion (Module.setEeRegionPromotion), read when regions are compiled
+bool g_eeRegionPromotion = false;
 
 extern uint32 g_jitPageAccess;
 
@@ -207,6 +209,13 @@ void CBasicBlock::Compile()
 
 	Framework::CMemStream stream;
 	g_timelineCounts[TLC_JITRUNS].fetch_add(1, std::memory_order_relaxed);
+#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+	if((m_category == BLOCK_CATEGORY_PS2_EE) && IsSuperBlock())
+	{
+		extern uint32 g_eeRegionJitRuns;
+		g_eeRegionJitRuns++;
+	}
+#endif
 #ifdef PROFILE
 	auto jitStart = std::chrono::steady_clock::now();
 #endif
@@ -717,7 +726,7 @@ void CBasicBlock::CompileToStream(Framework::CMemStream& stream, bool contextPro
 bool CBasicBlock::UsesContextPromotion() const
 {
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
-	if(m_category == BLOCK_CATEGORY_PS2_EE) return g_eeContextPromotion;
+	if(m_category == BLOCK_CATEGORY_PS2_EE) return g_eeContextPromotion || (g_eeRegionPromotion && IsSuperBlock());
 	return (m_category == BLOCK_CATEGORY_PS2_VU) && g_vuContextPromotion && !m_forceReference;
 #else
 	return false;

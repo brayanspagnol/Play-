@@ -45,8 +45,13 @@ static CEeExecutor* g_eeExecutor = nullptr;
 //Tier-2 EE regions (notes/tier2-m2b.md): most tier-1 blocks per region, 0 or 1 = off.
 //Applies to blocks created afterwards.
 uint32 g_eeRegionParts = 0;
-//Regions created and their total parts (eeRegionStats)
-uint32 g_eeRegionStats[2] = {};
+//Samples (one dispatch in REGION_SAMPLE_PERIOD) after which an entry is hot and gets a region
+uint32 g_eeRegionHotSamples = 64;
+//Region counters (eeRegionStats), see EE_REGION_STAT
+uint32 g_eeRegionStats[EE_REGION_STAT_COUNT] = {};
+uint64 g_eeDispatchCount = 0;
+//Regions translated by the Jitter (persistent block cache misses), counted by CBasicBlock::Compile
+uint32 g_eeRegionJitRuns = 0;
 
 CEeExecutor::CEeExecutor(CMIPS& context, uint8* ram)
     : CGenericMipsExecutor(context, 0x20000000, BLOCK_CATEGORY_PS2_EE)
@@ -76,10 +81,16 @@ int CEeExecutor::Execute(int cycles)
 	while(m_context.m_State.nHasException == 0)
 	{
 		uint32 address = m_context.m_State.nPC & m_addressMask;
-		//Tier-2 hot entry detection: sample one dispatch out of REGION_SAMPLE_PERIOD (deterministic)
+		g_eeDispatchCount++;
+		//Tier-2 hot entry detection: sample one dispatch in REGION_SAMPLE_PERIOD on average. The period varies
+		//(deterministic xorshift) so loops whose length divides it don't send every sample to the same block,
+		//which made the hot set (and region cache keys) depend on the sampling phase
 		if((g_eeRegionParts >= 2) && (--m_regionSampleCountdown == 0))
 		{
-			m_regionSampleCountdown = REGION_SAMPLE_PERIOD;
+			m_regionSampleRng ^= m_regionSampleRng << 13;
+			m_regionSampleRng ^= m_regionSampleRng >> 17;
+			m_regionSampleRng ^= m_regionSampleRng << 5;
+			m_regionSampleCountdown = (REGION_SAMPLE_PERIOD / 2) + (m_regionSampleRng % REGION_SAMPLE_PERIOD);
 			SampleRegionEntry(address);
 		}
 		uint32 fctIdx = fnTable[address >> 16][(address & 0xFFFF) / 4];
@@ -163,6 +174,7 @@ void CEeExecutor::InvalidateWrittenRange(uint32 address, uint32 size, bool execu
 	{
 		if(m_protectedPages[page])
 		{
+			g_eeRegionStats[EE_REGION_PAGE_CLEARS]++;
 #ifdef PROFILE
 			PROFILE_COUNT(PCNT_EE_INVAL, 1);
 			CProfiler::GetInstance().Log("W %08X %u pc=%08X\n", address, size, m_context.m_State.nPC);
@@ -368,8 +380,7 @@ void CEeExecutor::Reset()
 #if defined(__EMSCRIPTEN__)
 	m_regionPlans.clear();
 	m_pendingRegionParts.clear();
-	m_regionEntrySamples.clear();
-	m_regionHotEntries.clear();
+	ResetRegionSampling();
 #endif
 	CGenericMipsExecutor::Reset();
 }
@@ -379,6 +390,12 @@ void CEeExecutor::ClearActiveBlocksInRange(uint32 start, uint32 end, bool execut
 	uint32 rangeSize = end - start;
 	SetMemoryProtected(m_ram + start, rangeSize, false);
 #if defined(__EMSCRIPTEN__)
+	if((start == 0) && (end >= PS2::EE_RAM_SIZE))
+	{
+		//Whole RAM (state load): restart hot entry detection, so the regions built afterwards only depend on
+		//what runs from here (stable region set, and thus persistent cache keys, for the same state)
+		ResetRegionSampling();
+	}
 	if(executing)
 	{
 		//A region may be running (entered at m_jitFlagScratch[4], see CEeBasicBlock::CompileRange): an odd
@@ -401,10 +418,21 @@ void CEeExecutor::ClearActiveBlocksInRange(uint32 start, uint32 end, bool execut
 
 #if defined(__EMSCRIPTEN__)
 
+void CEeExecutor::ResetRegionSampling()
+{
+	std::fill(m_regionEntrySamples.begin(), m_regionEntrySamples.end(), 0);
+	m_regionHotEntries.clear();
+	m_regionBuildCounts.clear();
+	m_regionSampleCountdown = REGION_SAMPLE_PERIOD;
+	m_regionSampleRng = REGION_SAMPLE_SEED;
+}
+
 void CEeExecutor::SampleRegionEntry(uint32 address)
 {
 	if((address < 0x100000) || (address >= PS2::EE_RAM_SIZE)) return;
-	if(++m_regionEntrySamples[address] != REGION_HOT_SAMPLES) return;
+	auto& samples = m_regionEntrySamples[(address / 4) & (m_regionEntrySamples.size() - 1)];
+	if(samples >= g_eeRegionHotSamples) return;
+	if(++samples != g_eeRegionHotSamples) return;
 	//Hot: replace the tier-1 block there by a region (nothing runs between dispatches)
 	m_regionHotEntries.insert(address);
 	auto block = FindBlockStartingAt(address);
@@ -451,8 +479,13 @@ void CEeExecutor::PartitionFunction(uint32 startAddress)
 	{
 		endAddress = std::max(endAddress, part.end);
 	}
-	g_eeRegionStats[0]++;
-	g_eeRegionStats[1] += plan->parts.size();
+	g_eeRegionStats[EE_REGION_CREATED]++;
+	g_eeRegionStats[EE_REGION_PARTS] += plan->parts.size();
+	uint32 builds = ++m_regionBuildCounts[startAddress];
+	if(builds == 1) g_eeRegionStats[EE_REGION_ENTRIES]++;
+	if(builds == 2) g_eeRegionStats[EE_REGION_REBUILT_ENTRIES]++;
+	if(builds == 9) g_eeRegionStats[EE_REGION_REBUILT8_ENTRIES]++;
+	g_eeRegionStats[EE_REGION_MAX_BUILDS] = std::max(g_eeRegionStats[EE_REGION_MAX_BUILDS], builds);
 	m_pendingRegionParts = plan->parts;
 	CreateBlock(startAddress, endAddress);
 	m_pendingRegionParts.clear();
@@ -463,7 +496,9 @@ uint64 CEeExecutor::HashRegionWords(const std::vector<CBasicBlock::SUPERBLOCK_PA
 	uint64 hash = 0;
 	for(const auto& part : parts)
 	{
-		hash = XXH3_64bits_withSeed(m_ram + part.begin, part.end - part.begin + 4, hash ^ part.begin);
+		//The word after the part counts too: FindBlockEnd ends a block before a branch in a delay slot
+		uint32 end = std::min<uint32>(part.end + 8, PS2::EE_RAM_SIZE);
+		hash = XXH3_64bits_withSeed(m_ram + part.begin, end - part.begin, hash ^ part.begin);
 	}
 	return hash;
 }
@@ -593,6 +628,7 @@ BasicBlockPtr CEeExecutor::BlockFactory(CMIPS& context, uint32 start, uint32 end
 			const auto& basicBlock(blockIterator->second);
 			if(basicBlock->GetBeginAddress() == start && basicBlock->GetEndAddress() == end)
 			{
+				if(basicBlock->IsSuperBlock()) g_eeRegionStats[EE_REGION_REUSED]++;
 				uint32 recycleCount = basicBlock->GetRecycleCount();
 				basicBlock->SetRecycleCount(std::min<uint32>(RECYCLE_NOLINK_THRESHOLD, recycleCount + 1));
 				return basicBlock;
@@ -600,6 +636,10 @@ BasicBlockPtr CEeExecutor::BlockFactory(CMIPS& context, uint32 start, uint32 end
 			else
 			{
 				auto result = std::make_shared<CEeBasicBlock>(context, start, end, m_blockCategory);
+#if defined(__EMSCRIPTEN__)
+				//Same code elsewhere: a region copy must stay a region (invalidation handles running regions)
+				result->SetRegionParts(m_pendingRegionParts);
+#endif
 				result->CopyFunctionFrom(basicBlock);
 				return result;
 			}
@@ -623,6 +663,7 @@ BasicBlockPtr CEeExecutor::BlockFactory(CMIPS& context, uint32 start, uint32 end
 		result->AddBlockCompileHints(CMA_EE::COMPILEHINT_FPU_USE_ACCURATE_ADD_SUB);
 	}
 
+	if(result->IsSuperBlock()) g_eeRegionStats[EE_REGION_COMPILED]++;
 	result->Compile();
 	if(isCacheableBlock)
 	{
