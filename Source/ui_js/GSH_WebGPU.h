@@ -87,7 +87,7 @@ public:
 		DRAW_FEATURE_TEXTURE = 1 << 0,
 		DRAW_FEATURE_LINEAR = 1 << 1,
 		DRAW_FEATURE_MIPLOD = 1 << 2,
-		DRAW_FEATURE_CLUT = 1 << 3,
+		DRAW_FEATURE_CLUT32 = 1 << 3,
 		DRAW_FEATURE_MEMCOPY = 1 << 4,
 		DRAW_FEATURE_BLEND = 1 << 5,
 		DRAW_FEATURE_FOG = 1 << 6,
@@ -98,6 +98,12 @@ public:
 		DRAW_FEATURE_TRIANGLE = 1 << 11,
 		DRAW_FEATURE_SPRITE = 1 << 12,
 		DRAW_FEATURE_LINE = 1 << 13,
+		//Texture formats: 32/24-bit, 16-bit, 8-bit indexed, 4-bit indexed, 16-bit CLUT
+		DRAW_FEATURE_TEX32 = 1 << 14,
+		DRAW_FEATURE_TEX16 = 1 << 15,
+		DRAW_FEATURE_TEX8 = 1 << 16,
+		DRAW_FEATURE_TEX4 = 1 << 17,
+		DRAW_FEATURE_CLUT16 = 1 << 18,
 	};
 
 	enum PRIM_TYPE : uint32

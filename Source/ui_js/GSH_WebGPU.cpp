@@ -1360,7 +1360,31 @@ void CGSH_WebGPU::SetRenderingContext(uint64 primReg)
 			features |= DRAW_FEATURE_TEXTURE;
 			if(flags0 & (1 << 5)) features |= DRAW_FEATURE_LINEAR;
 			if(flags0 & (1 << 6)) features |= DRAW_FEATURE_MIPLOD;
-			if(CGsPixelFormats::IsPsmIDTEX(tex0.nPsm)) features |= DRAW_FEATURE_CLUT;
+			if(CGsPixelFormats::IsPsmIDTEX(tex0.nPsm))
+			{
+				features |= ((tex0.nCPSM == PSMCT16) || (tex0.nCPSM == PSMCT16S)) ? DRAW_FEATURE_CLUT16 : DRAW_FEATURE_CLUT32;
+			}
+			switch(tex0.nPsm)
+			{
+			case PSMCT16:
+			case PSMCT16S:
+			case PSMZ16:
+			case PSMZ16S:
+				features |= DRAW_FEATURE_TEX16;
+				break;
+			case PSMT8:
+			case PSMT8H:
+				features |= DRAW_FEATURE_TEX8;
+				break;
+			case PSMT4:
+			case PSMT4HL:
+			case PSMT4HH:
+				features |= DRAW_FEATURE_TEX4;
+				break;
+			default:
+				features |= DRAW_FEATURE_TEX32;
+				break;
+			}
 			if(needsTextureCopy) features |= DRAW_FEATURE_MEMCOPY;
 		}
 		if(prim.nAlpha) features |= DRAW_FEATURE_BLEND;

@@ -28,8 +28,9 @@ var GsWgpu = {
 	MAX_FRAMES_IN_FLIGHT: 2,
 	// Draw shader variant: tile = workgroup side in pixels.
 	// Bit i of a draw's feature mask (CGSH_WebGPU::DRAW_FEATURE_*) = override constant drawFeatures[i]
-	drawFeatures: ["F_TEXTURE", "F_LINEAR", "F_MIPLOD", "F_CLUT", "F_MEMCOPY", "F_BLEND", "F_FOG", "F_ALPHATEST",
-		"F_DATE", "F_DEPTHTEST", "F_DEPTHWRITE", "F_TRIANGLE", "F_SPRITE", "F_LINE"],
+	drawFeatures: ["F_TEXTURE", "F_LINEAR", "F_MIPLOD", "F_CLUT32", "F_MEMCOPY", "F_BLEND", "F_FOG", "F_ALPHATEST",
+		"F_DATE", "F_DEPTHTEST", "F_DEPTHWRITE", "F_TRIANGLE", "F_SPRITE", "F_LINE", "F_TEX32", "F_TEX16", "F_TEX8", "F_TEX4",
+		"F_CLUT16"],
 	drawConfig: { tile: 8 }, // tile must match CGSH_WebGPU::DRAW_TILE_SIZE
 	framesInFlight: 0,
 	waitingForGpu: false,
@@ -507,10 +508,12 @@ fn readPixelFrom(fromCopy : bool, psm : u32, bufAddress : u32, bufWidth : u32, x
 	}
 }
 
+// Writes the mask bits of a word shared with other invocations. Within a dispatch, bits are only ever written by
+// one invocation (draws: one per pixel; transfers: overlapping ones go to separate dispatches), so the mask bits
+// read here are still current when the XOR (one atomic instead of an AND and an OR) lands.
 fn writeMasked(word : u32, mask : u32, value : u32) {
 	let i = word & WORDMASK;
-	atomicAnd(&mem[i], ~mask);
-	atomicOr(&mem[i], value & mask);
+	atomicXor(&mem[i], (atomicLoad(&mem[i]) ^ value) & mask);
 }
 
 fn write32(a : u32, v : u32) { atomicStore(&mem[(a >> 2u) & WORDMASK], v); }
@@ -542,8 +545,13 @@ fn uploadByte(byteOffset : u32) -> u32 { return (upload[byteOffset >> 2u] >> ((b
 fn xferHost(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index) li : u32) {
 	let count = param(0u);
 	let table = param(1u);
+	// Last transfer whose first workgroup is <= this one (binary search)
 	var t = 0u;
-	while((t + 1u < count) && (upload[table + (t + 1u) * 9u + 8u] <= wid.x)) { t++; }
+	var hi = count - 1u;
+	while(t < hi) {
+		let mid = (t + hi + 1u) >> 1u;
+		if(upload[table + mid * 9u + 8u] <= wid.x) { t = mid; } else { hi = mid - 1u; }
+	}
 	let x = table + t * 9u;
 	let psm = upload[x + 0u];
 	let bufAddress = upload[x + 1u];
@@ -692,19 +700,43 @@ fn readTexWord(fromCopy : bool, i : u32) -> u32 {
 	return atomicLoad(&mem[i & WORDMASK]);
 }
 
+// pixelAddress for texture formats: only the formats the pipeline was specialized for (F_TEX*) are compiled in.
+fn texelAddress(psm : u32, bufAddress : u32, bufWidth : u32, x : u32, y : u32) -> u32 {
+	var info = vec3<u32>(0u, 6u, 5u); // PSMCT32 and the formats stored like it
+	switch(psm) {
+		case 0x30u, 0x31u: { if(F_TEX32) { info = vec3<u32>(2048u, 6u, 5u); } }
+		case 0x02u: { if(F_TEX16) { info = vec3<u32>(4096u, 6u, 6u); } }
+		case 0x0Au: { if(F_TEX16) { info = vec3<u32>(8192u, 6u, 6u); } }
+		case 0x32u: { if(F_TEX16) { info = vec3<u32>(12288u, 6u, 6u); } }
+		case 0x3Au: { if(F_TEX16) { info = vec3<u32>(16384u, 6u, 6u); } }
+		case 0x13u: { if(F_TEX8) { info = vec3<u32>(20480u, 7u, 6u); } }
+		case 0x14u: { if(F_TEX4) { info = vec3<u32>(28672u, 7u, 7u); } }
+		default: { }
+	}
+	let pageWidth = 1u << info.y;
+	let pageHeight = 1u << info.z;
+	let pageNum = (x >> info.y) + ((y >> info.z) * bufWidth) / pageWidth;
+	let pageOffset = swz[info.x + ((y & (pageHeight - 1u)) << info.y) + (x & (pageWidth - 1u))];
+	if(F_TEX4 && (psm == PSMT4)) {
+		return (bufAddress + pageNum * 8192u) * 2u + pageOffset;
+	}
+	return bufAddress + pageNum * 8192u + pageOffset;
+}
+
 // Texel (raw value) of a texture format at (x, y), from GS memory or from the copy (texture = frame buffer).
 fn readTexel(fromCopy : bool, psm : u32, bufAddress : u32, bufWidth : u32, x : u32, y : u32) -> u32 {
-	let a = pixelAddress(psm, bufAddress, bufWidth, x, y);
+	let a = texelAddress(psm, bufAddress, bufWidth, x, y);
 	switch(psm) {
-		case 0x01u, 0x09u, 0x31u: { return readTexWord(fromCopy, a >> 2u) & 0xFFFFFFu; }
-		case 0x02u, 0x0Au, 0x32u, 0x3Au: { return (readTexWord(fromCopy, a >> 2u) >> ((a & 2u) * 8u)) & 0xFFFFu; }
-		case 0x13u: { return (readTexWord(fromCopy, a >> 2u) >> ((a & 3u) * 8u)) & 0xFFu; }
-		case 0x14u: { return (readTexWord(fromCopy, a >> 3u) >> ((a & 7u) * 4u)) & 0xFu; }
-		case 0x1Bu: { return readTexWord(fromCopy, a >> 2u) >> 24u; }
-		case 0x24u: { return (readTexWord(fromCopy, a >> 2u) >> 24u) & 0xFu; }
-		case 0x2Cu: { return readTexWord(fromCopy, a >> 2u) >> 28u; }
-		default: { return readTexWord(fromCopy, a >> 2u); }
+		case 0x01u, 0x09u, 0x31u: { if(F_TEX32) { return readTexWord(fromCopy, a >> 2u) & 0xFFFFFFu; } }
+		case 0x02u, 0x0Au, 0x32u, 0x3Au: { if(F_TEX16) { return (readTexWord(fromCopy, a >> 2u) >> ((a & 2u) * 8u)) & 0xFFFFu; } }
+		case 0x13u: { if(F_TEX8) { return (readTexWord(fromCopy, a >> 2u) >> ((a & 3u) * 8u)) & 0xFFu; } }
+		case 0x14u: { if(F_TEX4) { return (readTexWord(fromCopy, a >> 3u) >> ((a & 7u) * 4u)) & 0xFu; } }
+		case 0x1Bu: { if(F_TEX8) { return readTexWord(fromCopy, a >> 2u) >> 24u; } }
+		case 0x24u: { if(F_TEX4) { return (readTexWord(fromCopy, a >> 2u) >> 24u) & 0xFu; } }
+		case 0x2Cu: { if(F_TEX4) { return readTexWord(fromCopy, a >> 2u) >> 28u; } }
+		default: { if(F_TEX32) { return readTexWord(fromCopy, a >> 2u); } }
 	}
+	return 0u;
 }
 
 // 16-bit color with alpha expansion (TEXA): the A bit selects TA1/TA0; AEM makes black with A = 0 transparent.
@@ -723,26 +755,28 @@ fn texelColor(s : u32, raw : u32) -> vec4<f32> {
 	let ta0 = sw(s, 10u);
 	let ta1 = sw(s, 11u);
 	switch(psm) {
-		case 0x00u, 0x30u: { return unpackColor(raw); }
+		case 0x00u, 0x30u: { if(F_TEX32) { return unpackColor(raw); } }
 		case 0x01u, 0x09u, 0x31u: {
-			var a = ta0;
-			if(aem && ((raw & 0xFFFFFFu) == 0u)) { a = 0u; }
-			return vec4<f32>(unpackColor(raw).rgb, f32(a));
+			if(F_TEX32) {
+				var a = ta0;
+				if(aem && ((raw & 0xFFFFFFu) == 0u)) { a = 0u; }
+				return vec4<f32>(unpackColor(raw).rgb, f32(a));
+			}
 		}
-		case 0x02u, 0x0Au, 0x32u, 0x3Au: { return expand16(raw, tcc, aem, ta0, ta1); }
+		case 0x02u, 0x0Au, 0x32u, 0x3Au: { if(F_TEX16) { return expand16(raw, tcc, aem, ta0, ta1); } }
 		default: {
-			if(!F_CLUT) { return vec4<f32>(0.0); }
 			// Indexed: CLUT lookup (GSH_VulkanDrawUtils GetClutColor)
 			var index = raw;
-			if((psm == PSMT4) || (psm == PSMT4HL) || (psm == PSMT4HH)) { index = raw + sw(s, 9u); }
+			if(F_TEX4 && ((psm == PSMT4) || (psm == PSMT4HL) || (psm == PSMT4HH))) { index = raw + sw(s, 9u); }
 			let clutBase = sw(s, 19u);
 			let cpsm = sw(s, 3u);
-			if((cpsm == PSMCT16) || (cpsm == PSMCT16S)) {
+			if(F_CLUT16 && ((cpsm == PSMCT16) || (cpsm == PSMCT16S))) {
 				return expand16(clut[clutBase + (index & 511u)], tcc, aem, ta0, ta1);
 			}
-			return unpackColor(clut[clutBase + (index & 0xFFu)]);
+			if(F_CLUT32) { return unpackColor(clut[clutBase + (index & 0xFFu)]); }
 		}
 	}
+	return vec4<f32>(0.0);
 }
 
 fn clampTexCoord(mode : u32, c : i32, size : i32, minValue : i32, maxValue : i32) -> i32 {
