@@ -13,11 +13,34 @@ void CEeBasicBlock::SetIsIdleLoopBlock()
 	AddCacheVariant(1 << 16);
 }
 
+//Wait loop found by CEeExecutor's analysis: when the branch back to the loop head is taken,
+//EeAutoIdleCheck decides whether the EE is idle (see EeExecutor.cpp)
+void CEeBasicBlock::SetIsAutoIdleLoopBlock()
+{
+	m_isAutoIdleLoopBlock = true;
+	AddCacheVariant(1 << 17);
+}
+
+//Start of a path that a wait loop's analysis found unsafe: calls EeAutoIdleTaint when it runs
+void CEeBasicBlock::SetIsAutoIdleTaintBlock()
+{
+	m_isAutoIdleTaintBlock = true;
+	AddCacheVariant(1 << 18);
+}
+
+extern "C" void EeAutoIdleCheck(CMIPS*);
+extern "C" void EeAutoIdleTaint(CMIPS*);
+
 void CEeBasicBlock::CompileProlog(CMipsJitter* jitter)
 {
 	if(m_fpRoundingMode != DEFAULT_FP_ROUNDING_MODE)
 	{
 		jitter->FP_SetRoundingMode(m_fpRoundingMode);
+	}
+	if(m_isAutoIdleTaintBlock)
+	{
+		jitter->PushCtx();
+		jitter->Call(reinterpret_cast<void*>(&EeAutoIdleTaint), 1, Jitter::CJitter::RETURN_VALUE_NONE);
 	}
 	CBasicBlock::CompileProlog(jitter);
 }
@@ -29,16 +52,27 @@ void CEeBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 		jitter->FP_SetRoundingMode(DEFAULT_FP_ROUNDING_MODE);
 	}
 
-	if(m_isIdleLoopBlock || IsCodeIdleLoopBlock())
+	if(m_isIdleLoopBlock || IsCodeIdleLoopBlock(m_context, m_begin, m_end))
 	{
 		jitter->PushCst(MIPS_EXCEPTION_IDLE);
 		jitter->PullRel(offsetof(CMIPS, m_State.nHasException));
+	}
+	else if(m_isAutoIdleLoopBlock)
+	{
+		jitter->PushCst(MIPS_INVALID_PC);
+		jitter->PushRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
+		jitter->BeginIf(Jitter::CONDITION_NE);
+		{
+			jitter->PushCtx();
+			jitter->Call(reinterpret_cast<void*>(&EeAutoIdleCheck), 1, Jitter::CJitter::RETURN_VALUE_NONE);
+		}
+		jitter->EndIf();
 	}
 
 	CBasicBlock::CompileEpilog(jitter, loopsOnItself);
 }
 
-bool CEeBasicBlock::IsCodeIdleLoopBlock() const
+bool CEeBasicBlock::IsCodeIdleLoopBlock(CMIPS& context, uint32 begin, uint32 end)
 {
 	enum OP
 	{
@@ -64,17 +98,17 @@ bool CEeBasicBlock::IsCodeIdleLoopBlock() const
 		OP_SPECIAL_DSRL32 = 0x3E,
 	};
 
-	uint32 endInstructionAddress = m_end - 4;
-	uint32 endInstruction = m_context.m_pMemoryMap->GetWord(endInstructionAddress);
+	uint32 endInstructionAddress = end - 4;
+	uint32 endInstruction = context.m_pMemoryMap->GetWord(endInstructionAddress);
 
 	//We need a branch at the end of the block
-	auto branchType = m_context.m_pArch->IsInstructionBranch(&m_context, endInstructionAddress, endInstruction);
+	auto branchType = context.m_pArch->IsInstructionBranch(&context, endInstructionAddress, endInstruction);
 	if(branchType != MIPS_BRANCH_NORMAL) return false;
 
 	//Check that the branch target is ourself
-	uint32 branchTarget = m_context.m_pArch->GetInstructionEffectiveAddress(&m_context, endInstructionAddress, endInstruction);
+	uint32 branchTarget = context.m_pArch->GetInstructionEffectiveAddress(&context, endInstructionAddress, endInstruction);
 	if(branchTarget == MIPS_INVALID_PC) return false;
-	if(branchTarget != m_begin) return false;
+	if(branchTarget != begin) return false;
 
 	uint32 compareRs = 0;
 	uint32 compareRt = 0;
@@ -96,12 +130,12 @@ bool CEeBasicBlock::IsCodeIdleLoopBlock() const
 	uint32 useState = 0; //Set of previous state usage within this block
 
 	//Check all instructions inside to see if we can prove it's waiting for some kind of flag
-	for(uint32 address = m_begin; address <= m_end; address += 4)
+	for(uint32 address = begin; address <= end; address += 4)
 	{
 		//Don't check branch instruction as we've checked it already
 		if(address == endInstructionAddress) continue;
 
-		uint32 inst = m_context.m_pMemoryMap->GetWord(address);
+		uint32 inst = context.m_pMemoryMap->GetWord(address);
 		if(inst == 0) continue;
 		uint32 special = inst & 0x3F;
 		uint32 rd = (inst >> 11) & 0x1F;

@@ -64,6 +64,18 @@ private:
 	CachedBlockMap m_cachedBlocks;
 
 	IdleLoopBlockMap m_idleLoopBlocks;
+
+	//Automatically detected wait loops (see EeExecutor.cpp): block address and the pages of code read by its analysis
+	struct AUTOIDLE_LOOP
+	{
+		uint32 blockStart = 0;
+		std::vector<uint32> pages;
+	};
+	std::vector<AUTOIDLE_LOOP> m_autoIdleLoops;
+	std::set<uint32> m_autoIdleTaintBlocks;
+	std::vector<uint32> m_autoIdlePendingInvalidations;
+	bool IsAutoIdleLoop(uint32, uint32);
+	void FlushAutoIdleInvalidations();
 	BlockFpUseAccurateAddSubSet m_blockFpUseAccurateAddSub;
 	BlockFpRoundingModeMap m_blockFpRoundingModes;
 

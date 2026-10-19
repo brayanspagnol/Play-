@@ -14,6 +14,8 @@ extern "C" void SWL_Proxy(uint32, uint32, CMIPS*);
 extern "C" void SWR_Proxy(uint32, uint32, CMIPS*);
 extern "C" void SDL_Proxy(uint32, uint64, CMIPS*);
 extern "C" void SDR_Proxy(uint32, uint64, CMIPS*);
+extern "C" void EeAutoIdleCheck(CMIPS*);
+extern "C" void EeAutoIdleTaint(CMIPS*);
 
 static const struct
 {
@@ -39,6 +41,8 @@ static const struct
         {reinterpret_cast<uintptr_t>(&SWR_Proxy), "_SWR_Proxy", "viii"},
         {reinterpret_cast<uintptr_t>(&SDL_Proxy), "_SDL_Proxy", "viji"},
         {reinterpret_cast<uintptr_t>(&SDR_Proxy), "_SDR_Proxy", "viji"},
+        {reinterpret_cast<uintptr_t>(&EeAutoIdleCheck), "_EeAutoIdleCheck", "vi"},
+        {reinterpret_cast<uintptr_t>(&EeAutoIdleTaint), "_EeAutoIdleTaint", "vi"},
 };
 
 //Defined by CodeGen (EM_JS): adds a function to this thread's Module.codeGenImportTable

@@ -476,6 +476,19 @@ void setEeContextPromotion(bool enabled)
 	g_eeContextPromotion = enabled;
 }
 
+//Automatic EE wait loop detection (see CEeExecutor): on/off, and the detected loops with their counters
+extern bool g_eeAutoIdle;
+std::string EeAutoIdleStats(bool);
+void setEeAutoIdle(bool enabled)
+{
+	g_eeAutoIdle = enabled;
+}
+
+std::string eeAutoIdleStats(bool reset)
+{
+	return EeAutoIdleStats(reset);
+}
+
 extern std::mutex g_eeDumpMutex;
 extern std::set<uint32> g_eeDumpRequest;
 extern std::map<uint32, std::string> g_eeDumpResult;
@@ -811,6 +824,8 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("eeTimeResult", &eeTimeResult);
 	function("eeTimeVblank", &eeTimeVblank);
 	function("setEeContextPromotion", &setEeContextPromotion);
+	function("setEeAutoIdle", &setEeAutoIdle);
+	function("eeAutoIdleStats", &eeAutoIdleStats);
 	function("eeHashResult", &eeHashResult);
 	function("eeDumpRequest", &eeDumpRequest);
 	function("eeStateDump", &eeStateDump);
