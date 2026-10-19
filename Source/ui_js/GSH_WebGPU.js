@@ -31,8 +31,7 @@ var GsWgpu = {
 	drawFeatures: ["F_TEXTURE", "F_LINEAR", "F_MIPLOD", "F_CLUT32", "F_MEMCOPY", "F_BLEND", "F_FOG", "F_ALPHATEST",
 		"F_DATE", "F_DEPTHTEST", "F_DEPTHWRITE", "F_TRIANGLE", "F_SPRITE", "F_LINE", "F_TEX32", "F_TEX16", "F_TEX8", "F_TEX4",
 		"F_CLUT16"],
-	drawConfig: {},
-	DRAW_FEATURE_TILE16: 1 << 19, // CGSH_WebGPU::DRAW_FEATURE_TILE16: the batch was binned in 16 x 16 tiles
+	drawConfig: { tile: 8 }, // tile must match CGSH_WebGPU::DRAW_TILE_SIZE
 	framesInFlight: 0,
 	waitingForGpu: false,
 
@@ -103,15 +102,12 @@ var GsWgpu = {
 			],
 		});
 
-		// Draw tiles (workgroups) are 8 x 8 pixels, or 16 x 16 for batches of big primitives (DRAW_FEATURE_TILE16)
-		const computeModule = this.computeModule = d.createShaderModule({ label: "GS compute", code: this.wgslCompute(8) });
-		this.computeModule16 = d.createShaderModule({ label: "GS compute (16 x 16 tiles)", code: this.wgslCompute(16) });
+		const computeModule = this.computeModule = d.createShaderModule({ label: "GS compute", code: this.wgslCompute() });
 		const computePipelineLayout = this.computePipelineLayout = d.createPipelineLayout({ bindGroupLayouts: [this.computeLayout] });
 		this.drawPipelines = new Map();
 		// Index = CGSH_WebGPU::PIPELINE
 		this.computePipelines = ["xferHost", "xferLocal", "clutLoad", "draw"].map((entryPoint) =>
 			d.createComputePipeline({ label: entryPoint, layout: computePipelineLayout, compute: { module: computeModule, entryPoint } }));
-		this.drawPipeline16 = d.createComputePipeline({ label: "draw16", layout: computePipelineLayout, compute: { module: this.computeModule16, entryPoint: "draw" } });
 
 		this.format = navigator.gpu.getPreferredCanvasFormat();
 		this.context = this.canvas.getContext("webgpu");
@@ -149,10 +145,10 @@ var GsWgpu = {
 		if (pipeline === undefined && this.drawConfig.specialize !== false) {
 			this.drawPipelines.set(features, null);
 			const constants = Object.fromEntries(this.drawFeatures.map((f, i) => [f, (features >> i) & 1]));
-			this.device.createComputePipelineAsync({ label: `draw ${features.toString(16)}`, layout: this.computePipelineLayout, compute: { module: (features & this.DRAW_FEATURE_TILE16) ? this.computeModule16 : this.computeModule, entryPoint: "draw", constants } })
+			this.device.createComputePipelineAsync({ label: `draw ${features.toString(16)}`, layout: this.computePipelineLayout, compute: { module: this.computeModule, entryPoint: "draw", constants } })
 				.then((p) => this.drawPipelines.set(features, p), (e) => console.error("GSH_WebGPU: draw pipeline:", e));
 		}
-		return (features & this.DRAW_FEATURE_TILE16) ? this.drawPipeline16 : this.computePipelines[3];
+		return this.computePipelines[3];
 	},
 
 	ensureBuffers(uploadSize, primsSize, statesSize) {
@@ -483,8 +479,7 @@ fn psm16ToColor(c : u32) -> vec4<f32> {
 `;
 	},
 
-	// tile: draw tile (workgroup) side in pixels, 8 or 16
-	wgslCompute(tile) {
+	wgslCompute() {
 		return `
 @group(0) @binding(0) var<storage, read_write> mem : array<atomic<u32>>;
 @group(0) @binding(1) var<storage, read> memCopy : array<u32>;
@@ -570,6 +565,23 @@ fn xferHost(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_in
 	if(i >= pixelCount) { return; }
 	let px = ((i % rrw) + dsax) % 2048u;
 	let py = ((i / rrw) + dsay) % 2048u;
+	if((psm & 0x100u) != 0u) {
+		// PSMT8/PSMT4 rectangle of whole columns (CGSH_WebGPU::XFER_WHOLE_WORDS): the pixels of a word are
+		// (x, y), (x ^ 4, y | 2) (bit 0 of their index in the word), x | 8 (bit 1) and, PSMT4, x | 16 (bit 2).
+		// The first pixel of each word assembles it and stores it whole (no read-modify-write).
+		let t4 = (psm & 0xFFu) == PSMT4;
+		if(((px & select(8u, 24u, t4)) != 0u) || ((py & 2u) != 0u)) { return; }
+		var word = 0u;
+		for(var k = 0u; k < select(4u, 8u, t4); k++) {
+			let j = i + select(0u, 2u * rrw, (k & 1u) != 0u) + (((i % rrw) ^ select(0u, 4u, (k & 1u) != 0u)) - (i % rrw)) + (k & 6u) * 4u;
+			var v = 0u;
+			if(t4) { v = (upload[dataOffset + (j >> 3u)] >> ((j & 7u) * 4u)) & 0xFu; } else { v = uploadByte(dataOffset * 4u + j); }
+			word |= v << (k * select(8u, 4u, t4));
+		}
+		let a = pixelAddress(psm & 0xFFu, bufAddress, bufWidth, px, py);
+		atomicStore(&mem[(a >> select(2u, 3u, t4)) & WORDMASK], word);
+		return;
+	}
 	var value = 0u;
 	switch(psm) {
 		case 0x01u, 0x09u, 0x31u: {
@@ -653,16 +665,16 @@ const PRIM_SPRITE = 1u;
 const PRIM_LINE = 2u;
 const PRIM_POINT = 3u;
 
-const TILE_SIZE = ${tile}u;   // tile = workgroup = TILE_SIZE x TILE_SIZE pixels
-const GROUP_SIZE = ${tile ** 2}u;
+const TILE_SIZE = ${this.drawConfig.tile}u;   // tile = workgroup = TILE_SIZE x TILE_SIZE pixels
+const GROUP_SIZE = ${this.drawConfig.tile ** 2}u;
 
 // Features used by a batch (CGSH_WebGPU::DRAW_FEATURE_*): pipelines are specialized per combination so that
 // the unused paths are compiled out (the shader is big; registers decide the speed). All on = any batch.
 ${this.drawFeatures.map((f) => `override ${f} : bool = true;`).join("\n")}
 
 // The tile's primitives of the current chunk and their coverage of the tile (bit y * TILE_SIZE + x).
-var<workgroup> chunkPrims : array<u32, ${tile ** 2}>;
-var<workgroup> chunkMasks : array<array<u32, ${tile ** 2 / 32}>, ${tile ** 2}>;
+var<workgroup> chunkPrims : array<u32, ${this.drawConfig.tile ** 2}>;
+var<workgroup> chunkMasks : array<array<u32, ${this.drawConfig.tile ** 2 / 32}>, ${this.drawConfig.tile ** 2}>;
 
 // Word k of primitive p
 fn pw(p : u32, k : u32) -> u32 {
@@ -919,8 +931,8 @@ fn tileEdge(o : i32, dx : i32, dy : i32, sx : i32, sy : i32) -> TileEdge {
 }
 
 // Coverage of the tile at (tileX, tileY) by primitive p: bit (y * TILE_SIZE + x) of word bit / 32.
-fn coverageMask(p : u32, tileX : u32, tileY : u32) -> array<u32, ${tile ** 2 / 32}> {
-	var mask : array<u32, ${tile ** 2 / 32}>;
+fn coverageMask(p : u32, tileX : u32, tileY : u32) -> array<u32, ${Math.max(this.drawConfig.tile ** 2 / 32, 1)}> {
+	var mask : array<u32, ${Math.max(this.drawConfig.tile ** 2 / 32, 1)}>;
 	let bboxMin = pw(p, 26u);
 	let bboxMax = pw(p, 27u);
 	// Rows and columns of the tile inside the bounding box
@@ -1259,9 +1271,9 @@ fn writeBackPixel(cache : ptr<function, PixelCache>) {
 // tileOrder, tile count
 // Invocations are mapped to 4 x 4 pixel blocks (16 consecutive invocations = one SIMD16 thread on Intel): small
 // primitives cover fewer threads than with rows of pixels.
-@compute @workgroup_size(${tile ** 2})
+@compute @workgroup_size(${this.drawConfig.tile ** 2})
 fn draw(@builtin(local_invocation_index) li : u32, @builtin(workgroup_id) wid : vec3<u32>) {
-	let lid = vec2<u32>((li & 3u) | ((li >> 2u) & (TILE_SIZE - 4u)), ((li >> 2u) & 3u) | ((li >> ${tile === 8 ? 3 : 4}u) & (TILE_SIZE - 4u)));
+	let lid = vec2<u32>((li & 3u) | ((li >> 2u) & 4u), ((li >> 2u) & 3u) | ((li >> 3u) & 4u)); // 8 x 8 tile
 	let index = wid.y * 32768u + wid.x;
 	if(index >= param(15u)) { return; }
 	let tile = upload[param(14u) + index];

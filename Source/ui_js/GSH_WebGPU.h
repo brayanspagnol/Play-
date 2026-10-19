@@ -75,9 +75,7 @@ public:
 	{
 		PRIM_WORDS = 28,  //3 x (x, y (12.4, offset applied), z, rgba, s, t, q, fog), type, state, bbox min, bbox max
 		STATE_WORDS = 40, //see SetRenderingContext
-		DRAW_TILE_SIZE = 8, //pixels per side of a draw shader tile (workgroup)
-		DRAW_BIG_TILE_SIZE = 16, //tile size of batches of big primitives (DRAW_FEATURE_TILE16)
-		DRAW_BIG_TILE_AREA = 256, //average primitive area (pixels) from which a batch uses big tiles
+		DRAW_TILE_SIZE = 8, //pixels per side of a draw shader tile (workgroup), see GsWgpu.drawConfig.tile
 		SUBMIT_PRIMS = 8192, //command lists are submitted when they hold this many primitives (and at flips)
 		DRAW_GROUPS_PER_ROW = 32768, //draw dispatches are 2D past this many workgroups (WebGPU limit 65535 per dimension)
 		CPU_BLOCK_SIZE = 256, //granularity of m_cpuValid
@@ -106,7 +104,6 @@ public:
 		DRAW_FEATURE_TEX8 = 1 << 16,
 		DRAW_FEATURE_TEX4 = 1 << 17,
 		DRAW_FEATURE_CLUT16 = 1 << 18,
-		DRAW_FEATURE_TILE16 = 1 << 19, //16 x 16 tiles (not a shader feature: another workgroup size)
 	};
 
 	enum PRIM_TYPE : uint32
@@ -139,6 +136,7 @@ private:
 		PARAMS_SIZE = 256,
 		MAX_PENDING_XFERS = 64,
 		XFER_WORDS = 9,
+		XFER_WHOLE_WORDS = 0x100, //flag in a transfer's psm (see FlushTransfers)
 	};
 
 	struct VERTEX_DATA
@@ -165,8 +163,6 @@ private:
 		uint32 primStart = 0;
 		uint32 minX = ~0U, minY = ~0U, maxX = 0, maxY = 0;
 		uint32 features = 0;
-		uint64 primArea = 0; //sum of the primitives' bounding box areas
-		uint32 primCount = 0;
 	};
 
 	void ProcessPrim(uint64);
