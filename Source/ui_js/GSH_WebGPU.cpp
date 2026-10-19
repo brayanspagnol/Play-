@@ -1656,11 +1656,13 @@ void CGSH_WebGPU::AddPrim(PRIM_TYPE type, const VERTEX_DATA* vertices, uint32 ve
 	m_batch.minY = std::min<uint32>(m_batch.minY, minY);
 	m_batch.maxX = std::max<uint32>(m_batch.maxX, maxX);
 	m_batch.maxY = std::max<uint32>(m_batch.maxY, maxY);
+	m_batch.primArea += static_cast<uint64>(maxX - minX + 1) * static_cast<uint64>(maxY - minY + 1);
+	m_batch.primCount++;
 }
 
 //Whether a triangle can't cover any pixel of the tile whose first pixel is (tileX, tileY): all the tile's sample
 //points are outside one of its edges (conservative). Same edge functions as the draw shader (12.4 coordinates).
-static bool TriangleMissesTile(const uint32* prim, int32 tileX, int32 tileY)
+static bool TriangleMissesTile(const uint32* prim, int32 tileX, int32 tileY, int32 tileSize)
 {
 	int64 x0 = static_cast<int32>(prim[0]), y0 = static_cast<int32>(prim[1]);
 	int64 x1 = static_cast<int32>(prim[8]), y1 = static_cast<int32>(prim[9]);
@@ -1668,8 +1670,8 @@ static bool TriangleMissesTile(const uint32* prim, int32 tileX, int32 tileY)
 	int64 area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
 	if(area == 0) return true;
 	int64 o = (area > 0) ? 1 : -1;
-	int64 minX = tileX * 16, maxX = (tileX + CGSH_WebGPU::DRAW_TILE_SIZE - 1) * 16;
-	int64 minY = tileY * 16, maxY = (tileY + CGSH_WebGPU::DRAW_TILE_SIZE - 1) * 16;
+	int64 minX = tileX * 16, maxX = (tileX + tileSize - 1) * 16;
+	int64 minY = tileY * 16, maxY = (tileY + tileSize - 1) * 16;
 	const int64 ax[3] = {x1, x2, x0}, ay[3] = {y1, y2, y0}, bx[3] = {x2, x0, x1}, by[3] = {y2, y0, y1};
 	for(uint32 i = 0; i < 3; i++)
 	{
@@ -1694,21 +1696,25 @@ void CGSH_WebGPU::FlushBatch()
 	//the primitives that can touch its tile.
 	uint32 originX = m_batch.minX & ~15U;
 	uint32 originY = m_batch.minY & ~15U;
-	uint32 tilesX = (m_batch.maxX - originX) / DRAW_TILE_SIZE + 1;
-	uint32 tilesY = (m_batch.maxY - originY) / DRAW_TILE_SIZE + 1;
+	//Big primitives (full screen effects...): bigger tiles, fewer workgroups (their fixed cost dominates then)
+	bool bigTiles = m_batch.primArea >= static_cast<uint64>(m_batch.primCount) * DRAW_BIG_TILE_AREA;
+	uint32 tileSize = bigTiles ? DRAW_BIG_TILE_SIZE : DRAW_TILE_SIZE;
+	if(bigTiles) m_batch.features |= DRAW_FEATURE_TILE16;
+	uint32 tilesX = (m_batch.maxX - originX) / tileSize + 1;
+	uint32 tilesY = (m_batch.maxY - originY) / tileSize + 1;
 	uint32 tileCount = tilesX * tilesY;
 	m_binOffsets.assign(tileCount + 1, 0);
 	for(uint32 p = m_batch.primStart; p < primEnd; p++)
 	{
 		const uint32* prim = m_prims.data() + p * PRIM_WORDS;
-		uint32 tx0 = ((prim[26] & 0xFFFF) - originX) / DRAW_TILE_SIZE, ty0 = ((prim[26] >> 16) - originY) / DRAW_TILE_SIZE;
-		uint32 tx1 = ((prim[27] & 0xFFFF) - originX) / DRAW_TILE_SIZE, ty1 = ((prim[27] >> 16) - originY) / DRAW_TILE_SIZE;
+		uint32 tx0 = ((prim[26] & 0xFFFF) - originX) / tileSize, ty0 = ((prim[26] >> 16) - originY) / tileSize;
+		uint32 tx1 = ((prim[27] & 0xFFFF) - originX) / tileSize, ty1 = ((prim[27] >> 16) - originY) / tileSize;
 		bool test = (prim[24] == PRIM_TYPE_TRIANGLE) && ((tx0 != tx1) || (ty0 != ty1));
 		for(uint32 ty = ty0; ty <= ty1; ty++)
 		{
 			for(uint32 tx = tx0; tx <= tx1; tx++)
 			{
-				if(test && TriangleMissesTile(prim, originX + tx * DRAW_TILE_SIZE, originY + ty * DRAW_TILE_SIZE)) continue;
+				if(test && TriangleMissesTile(prim, originX + tx * tileSize, originY + ty * tileSize, tileSize)) continue;
 				m_binOffsets[ty * tilesX + tx + 1]++;
 			}
 		}
@@ -1736,14 +1742,14 @@ void CGSH_WebGPU::FlushBatch()
 	for(uint32 p = m_batch.primStart; p < primEnd; p++)
 	{
 		const uint32* prim = m_prims.data() + p * PRIM_WORDS;
-		uint32 tx0 = ((prim[26] & 0xFFFF) - originX) / DRAW_TILE_SIZE, ty0 = ((prim[26] >> 16) - originY) / DRAW_TILE_SIZE;
-		uint32 tx1 = ((prim[27] & 0xFFFF) - originX) / DRAW_TILE_SIZE, ty1 = ((prim[27] >> 16) - originY) / DRAW_TILE_SIZE;
+		uint32 tx0 = ((prim[26] & 0xFFFF) - originX) / tileSize, ty0 = ((prim[26] >> 16) - originY) / tileSize;
+		uint32 tx1 = ((prim[27] & 0xFFFF) - originX) / tileSize, ty1 = ((prim[27] >> 16) - originY) / tileSize;
 		bool test = (prim[24] == PRIM_TYPE_TRIANGLE) && ((tx0 != tx1) || (ty0 != ty1));
 		for(uint32 ty = ty0; ty <= ty1; ty++)
 		{
 			for(uint32 tx = tx0; tx <= tx1; tx++)
 			{
-				if(test && TriangleMissesTile(prim, originX + tx * DRAW_TILE_SIZE, originY + ty * DRAW_TILE_SIZE)) continue;
+				if(test && TriangleMissesTile(prim, originX + tx * tileSize, originY + ty * tileSize, tileSize)) continue;
 				entries[m_binOffsets[ty * tilesX + tx]++] = p;
 			}
 		}
@@ -1776,6 +1782,8 @@ void CGSH_WebGPU::FlushBatch()
 	m_batch.minX = m_batch.minY = ~0U;
 	m_batch.maxX = m_batch.maxY = 0;
 	m_batch.features = 0;
+	m_batch.primArea = 0;
+	m_batch.primCount = 0;
 	m_batch.writeStart = m_batch.writeEnd = m_batch.fbAddress;
 	m_batch.zbWriteStart = m_batch.zbWriteEnd = m_batch.zbAddress;
 	//Submit big frames in parts: the GPU starts on the first draws while the rest of the frame is processed
