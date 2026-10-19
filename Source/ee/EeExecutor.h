@@ -102,6 +102,17 @@ private:
 	uint64 HashRegionWords(const std::vector<CBasicBlock::SUPERBLOCK_PART>&) const;
 	std::unordered_map<uint32, std::vector<REGION_PLAN>> m_regionPlans;
 	std::vector<CBasicBlock::SUPERBLOCK_PART> m_pendingRegionParts;
+	//Hot entries: a dispatch address sampled REGION_HOT_SAMPLES times gets a region
+	//ponytail: fixed period/threshold and sample counts that only grow until Reset; tune by profile
+	enum
+	{
+		REGION_SAMPLE_PERIOD = 64,
+		REGION_HOT_SAMPLES = 16,
+	};
+	void SampleRegionEntry(uint32);
+	uint32 m_regionSampleCountdown = REGION_SAMPLE_PERIOD;
+	std::unordered_map<uint32, uint32> m_regionEntrySamples;
+	std::set<uint32> m_regionHotEntries;
 	//Regions removed by an invalidation while they may be running, kept alive until Execute returns
 	std::vector<BasicBlockPtr> m_retiredRegions;
 

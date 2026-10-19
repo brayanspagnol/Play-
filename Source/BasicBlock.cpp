@@ -179,13 +179,9 @@ void CBasicBlock::Compile()
 	bool useBlockCache = BlockCache::IsEnabled() && !IsEmpty() && !dumpBlock && (g_vuExperiment == 0) && !(g_vuDiffMode && (m_category == BLOCK_CATEGORY_PS2_VU));
 	if(useBlockCache)
 	{
-		uint32 wordCount = ((m_end - m_begin) / 4) + 1;
 		thread_local std::vector<uint32> words;
-		words.resize(wordCount);
-		for(uint32 i = 0; i < wordCount; i++)
-		{
-			words[i] = m_context.m_pMemoryMap->GetInstruction(m_begin + (i * 4));
-		}
+		GetCodeWords(words);
+		uint32 wordCount = static_cast<uint32>(words.size());
 		auto xxHash = XXH3_128bits(words.data(), wordCount * 4);
 		cacheKey.category = m_category;
 		cacheKey.size = wordCount * 4;
@@ -658,6 +654,15 @@ bool CBasicBlock::IsReducible(const std::vector<SUPERBLOCK_PART>& parts)
 		}
 	}
 	return true;
+}
+
+void CBasicBlock::GetCodeWords(std::vector<uint32>& words) const
+{
+	words.clear();
+	for(uint32 address = m_begin; address <= m_end; address += 4)
+	{
+		words.push_back(m_context.m_pMemoryMap->GetInstruction(address));
+	}
 }
 
 bool CBasicBlock::MaySetDelayedJump() const

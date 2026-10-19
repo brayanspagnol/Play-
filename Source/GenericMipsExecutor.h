@@ -327,6 +327,15 @@ protected:
 			if(block == protectedBlock) continue;
 			if(!RangesOverlap(block->GetBeginAddress(), block->GetEndAddress(), start, end)) continue;
 			clearedBlocks.insert(block);
+		}
+		DropBlocks(clearedBlocks);
+	}
+
+	//Removes blocks from the lookup and all of our bookkeeping structures (none may be running)
+	void DropBlocks(const std::set<CBasicBlock*>& clearedBlocks)
+	{
+		for(auto& block : clearedBlocks)
+		{
 			m_blockLookup.DeleteBlock(block);
 		}
 

@@ -515,6 +515,12 @@ void setEeRegionParts(uint32 parts)
 	g_eeRegionParts = parts;
 }
 
+extern uint32 g_eeRegionStats[2];
+std::string eeRegionStats()
+{
+	return string_format("%u %u", g_eeRegionStats[0], g_eeRegionStats[1]);
+}
+
 extern std::mutex g_eeDumpMutex;
 extern std::set<uint32> g_eeDumpRequest;
 extern std::map<uint32, std::string> g_eeDumpResult;
@@ -851,6 +857,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("eeTimeVblank", &eeTimeVblank);
 	function("setEeContextPromotion", &setEeContextPromotion);
 	function("setEeRegionParts", &setEeRegionParts);
+	function("eeRegionStats", &eeRegionStats);
 	function("eeHashResult", &eeHashResult);
 	function("eeEdgeProfile", &eeEdgeProfile);
 	function("eeDumpRequest", &eeDumpRequest);

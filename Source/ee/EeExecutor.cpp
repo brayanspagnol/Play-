@@ -45,6 +45,8 @@ static CEeExecutor* g_eeExecutor = nullptr;
 //Tier-2 EE regions (notes/tier2-m2b.md): most tier-1 blocks per region, 0 or 1 = off.
 //Applies to blocks created afterwards.
 uint32 g_eeRegionParts = 0;
+//Regions created and their total parts (eeRegionStats)
+uint32 g_eeRegionStats[2] = {};
 
 CEeExecutor::CEeExecutor(CMIPS& context, uint8* ram)
     : CGenericMipsExecutor(context, 0x20000000, BLOCK_CATEGORY_PS2_EE)
@@ -74,6 +76,12 @@ int CEeExecutor::Execute(int cycles)
 	while(m_context.m_State.nHasException == 0)
 	{
 		uint32 address = m_context.m_State.nPC & m_addressMask;
+		//Tier-2 hot entry detection: sample one dispatch out of REGION_SAMPLE_PERIOD (deterministic)
+		if((g_eeRegionParts >= 2) && (--m_regionSampleCountdown == 0))
+		{
+			m_regionSampleCountdown = REGION_SAMPLE_PERIOD;
+			SampleRegionEntry(address);
+		}
 		uint32 fctIdx = fnTable[address >> 16][(address & 0xFFFF) / 4];
 		if(fctIdx != 0)
 		{
@@ -360,6 +368,8 @@ void CEeExecutor::Reset()
 #if defined(__EMSCRIPTEN__)
 	m_regionPlans.clear();
 	m_pendingRegionParts.clear();
+	m_regionEntrySamples.clear();
+	m_regionHotEntries.clear();
 #endif
 	CGenericMipsExecutor::Reset();
 }
@@ -391,9 +401,20 @@ void CEeExecutor::ClearActiveBlocksInRange(uint32 start, uint32 end, bool execut
 
 #if defined(__EMSCRIPTEN__)
 
+void CEeExecutor::SampleRegionEntry(uint32 address)
+{
+	if((address < 0x100000) || (address >= PS2::EE_RAM_SIZE)) return;
+	if(++m_regionEntrySamples[address] != REGION_HOT_SAMPLES) return;
+	//Hot: replace the tier-1 block there by a region (nothing runs between dispatches)
+	m_regionHotEntries.insert(address);
+	auto block = FindBlockStartingAt(address);
+	if(block->IsEmpty() || block->IsSuperBlock()) return;
+	DropBlocks({block});
+}
+
 void CEeExecutor::PartitionFunction(uint32 startAddress)
 {
-	if((g_eeRegionParts < 2) || (startAddress < 0x100000) || (startAddress >= PS2::EE_RAM_SIZE))
+	if((g_eeRegionParts < 2) || (m_regionHotEntries.count(startAddress) == 0))
 	{
 		CGenericMipsExecutor::PartitionFunction(startAddress);
 		return;
@@ -430,6 +451,8 @@ void CEeExecutor::PartitionFunction(uint32 startAddress)
 	{
 		endAddress = std::max(endAddress, part.end);
 	}
+	g_eeRegionStats[0]++;
+	g_eeRegionStats[1] += plan->parts.size();
 	m_pendingRegionParts = plan->parts;
 	CreateBlock(startAddress, endAddress);
 	m_pendingRegionParts.clear();
@@ -516,7 +539,19 @@ BasicBlockPtr CEeExecutor::BlockFactory(CMIPS& context, uint32 start, uint32 end
 		blockMemory[index] = opcode;
 	}
 
+	//Regions: only the words of their parts (words between them are often data)
 	auto xxHash = XXH3_128bits(blockMemory, blockSize);
+#if defined(__EMSCRIPTEN__)
+	if(!m_pendingRegionParts.empty())
+	{
+		std::vector<uint32> words;
+		for(const auto& part : m_pendingRegionParts)
+		{
+			words.insert(words.end(), blockMemory + ((part.begin - start) / 4), blockMemory + ((part.end - start) / 4) + 1);
+		}
+		xxHash = XXH3_128bits(words.data(), words.size() * 4);
+	}
+#endif
 	uint128 hash;
 	memcpy(&hash, &xxHash, sizeof(xxHash));
 	static_assert(sizeof(hash) == sizeof(xxHash));

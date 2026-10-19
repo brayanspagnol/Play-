@@ -144,6 +144,8 @@ protected:
 
 	uint32 m_blockCompileHints = 0;
 	uint32 m_cacheVariant = 0;
+	//Instruction words the compiled code depends on (cache keys): the whole range, or only the parts of an EE region
+	virtual void GetCodeWords(std::vector<uint32>&) const;
 	//Mixed into the cache key hash (EE regions: part layout)
 	uint64 m_cacheSalt = 0;
 	//Cleared by CompileRange when the generated code depends on more than the block's own words.

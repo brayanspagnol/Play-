@@ -200,6 +200,24 @@ uint64 CEeBasicBlock::GetRegionLayoutHash(const std::vector<SUPERBLOCK_PART>& pa
 	return XXH3_64bits(layout.data(), layout.size() * sizeof(uint32));
 }
 
+void CEeBasicBlock::GetCodeWords(std::vector<uint32>& words) const
+{
+	if(m_regionParts.empty())
+	{
+		CBasicBlock::GetCodeWords(words);
+		return;
+	}
+	//Words between the parts (often data) don't change the code
+	words.clear();
+	for(const auto& part : m_regionParts)
+	{
+		for(uint32 address = part.begin; address <= part.end; address += 4)
+		{
+			words.push_back(m_context.m_pMemoryMap->GetInstruction(address));
+		}
+	}
+}
+
 void CEeBasicBlock::CompileRange(CMipsJitter* jitter)
 {
 	if(m_regionParts.empty())

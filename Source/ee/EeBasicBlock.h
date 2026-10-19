@@ -15,6 +15,7 @@ public:
 	void SetRegionParts(std::vector<SUPERBLOCK_PART>);
 	bool IsSuperBlock() const override;
 	void CompileRange(CMipsJitter*) override;
+	void GetCodeWords(std::vector<uint32>&) const override;
 	//Hash of the part layout (relative to begin), mixed into cache keys of region code
 	static uint64 GetRegionLayoutHash(const std::vector<SUPERBLOCK_PART>&, uint32 begin);
 
