@@ -1,4 +1,5 @@
 #include "GSH_WebGPU.h"
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <emscripten/em_js.h>
@@ -42,6 +43,11 @@ static uint16 RGBA32ToRGBA16(uint32 inputColor)
 	return result;
 }
 
+static bool RangesOverlap(uint32 start1, uint32 end1, uint32 start2, uint32 end2)
+{
+	return (start1 < end2) && (start2 < end1);
+}
+
 static void OnDeviceReadyCallback(void* gs, int success)
 {
 	reinterpret_cast<CGSH_WebGPU*>(gs)->OnDeviceReady(success != 0);
@@ -63,6 +69,8 @@ void CGSH_WebGPU::InitializeImpl()
 	//GPU objects are made by InitializeContext (device creation is asynchronous).
 	m_memoryCache = new uint8[RAMSIZE];
 	memset(m_memoryCache, 0, RAMSIZE);
+	m_cpuValid.assign(RAMSIZE / CPU_BLOCK_SIZE, 1);
+	m_pendingXferBlocks.assign(RAMSIZE / CPU_BLOCK_SIZE, 0);
 	ClearClutCache();
 	UploadSwizzleTables();
 	WriteBackMemoryCache();
@@ -170,6 +178,32 @@ void CGSH_WebGPU::Dispatch(PIPELINE pipeline, uint32 paramsOffset, uint32 groups
 bool CGSH_WebGPU::Flush()
 {
 	FlushBatch();
+	if(!m_clutUploads.empty())
+	{
+		//CLUTs built on the CPU go to fresh slots: write them before anything else in the list, one copy per
+		//run of consecutive slots.
+		std::vector<uint32> uploads;
+		uint32 recordSize = CLUTENTRYCOUNT + 1;
+		uint32 count = m_clutUploads.size() / recordSize;
+		uint32 offset = AllocUpload(count * CLUTENTRYCOUNT * sizeof(uint32), 4);
+		auto dst = reinterpret_cast<uint32*>(m_upload.data() + offset);
+		uint32 runStart = 0;
+		for(uint32 i = 0; i < count; i++)
+		{
+			const uint32* record = m_clutUploads.data() + i * recordSize;
+			memcpy(dst + i * CLUTENTRYCOUNT, record + 1, CLUTENTRYCOUNT * sizeof(uint32));
+			bool runEnds = (i + 1 == count) || (m_clutUploads[(i + 1) * recordSize] != record[0] + 1);
+			if(runEnds)
+			{
+				uint32 firstSlot = m_clutUploads[runStart * recordSize];
+				uploads.insert(uploads.end(), {OP_UPLOAD_TO_CLUT, offset + runStart * CLUTENTRYCOUNT * 4,
+				                               firstSlot * CLUTENTRYCOUNT * 4, (i + 1 - runStart) * CLUTENTRYCOUNT * 4});
+				runStart = i + 1;
+			}
+		}
+		m_commands.insert(m_commands.begin(), uploads.begin(), uploads.end());
+		m_clutUploads.clear();
+	}
 	if(!m_deviceReady || m_commands.empty()) return false;
 	m_upload.resize((m_upload.size() + 3) & ~3);
 	bool gpuBusy = GsWgpu_Execute(m_commands.data(), m_commands.size(), m_upload.data(), m_upload.size(),
@@ -189,6 +223,7 @@ void CGSH_WebGPU::Readback(uint32 address, uint32 size)
 	if(!m_deviceReady) return;
 	FlushBatch();
 	PushCommand({OP_READBACK, address, size, static_cast<uint32>(reinterpret_cast<uintptr_t>(m_memoryCache + address))});
+	std::fill(m_cpuValid.begin() + address / CPU_BLOCK_SIZE, m_cpuValid.begin() + (address + size) / CPU_BLOCK_SIZE, 1);
 	Flush();
 	//The data lands in m_memoryCache when the map completes; the next GS call runs after that.
 	SuspendThreadProc();
@@ -329,9 +364,55 @@ void CGSH_WebGPU::TransferWrite(const uint8* imageData, uint32 length)
 	m_xferBuffer.insert(m_xferBuffer.end(), imageData, imageData + length);
 }
 
+//Calls f(block index) for every 256-byte block of GS memory holding pixels of the rectangle
+template <typename Storage, typename F>
+static void ForEachBlockOf(uint32 bufAddress, uint32 bufWidth, uint32 x0, uint32 y0, uint32 width, uint32 height, F&& f)
+{
+	static uint8 dummy[1];
+	CGsPixelFormats::CPixelIndexor<Storage> indexor(dummy, bufAddress, std::max<uint32>(bufWidth / 64, 1));
+	for(uint32 y = y0 & ~(Storage::BLOCKHEIGHT - 1); y < y0 + height; y += Storage::BLOCKHEIGHT)
+	{
+		for(uint32 x = x0 & ~(Storage::BLOCKWIDTH - 1); x < x0 + width; x += Storage::BLOCKWIDTH)
+		{
+			uint32 address = reinterpret_cast<uint8*>(indexor.GetPixelAddress(x % 2048, y % 2048)) - dummy;
+			f(address / CGSH_WebGPU::CPU_BLOCK_SIZE);
+		}
+	}
+}
+
+template <typename F>
+static bool ForEachBlock(uint32 psm, uint32 bufAddress, uint32 bufWidth, uint32 x0, uint32 y0, uint32 width, uint32 height, F&& f)
+{
+	switch(psm)
+	{
+	case CGSHandler::PSMCT32:
+	case CGSHandler::PSMCT24:
+	case CGSHandler::PSMT8H:
+	case CGSHandler::PSMT4HL:
+	case CGSHandler::PSMT4HH:
+		ForEachBlockOf<CGsPixelFormats::STORAGEPSMCT32>(bufAddress, bufWidth, x0, y0, width, height, f);
+		return true;
+	case CGSHandler::PSMCT16:
+		ForEachBlockOf<CGsPixelFormats::STORAGEPSMCT16>(bufAddress, bufWidth, x0, y0, width, height, f);
+		return true;
+	case CGSHandler::PSMCT16S:
+		ForEachBlockOf<CGsPixelFormats::STORAGEPSMCT16S>(bufAddress, bufWidth, x0, y0, width, height, f);
+		return true;
+	case CGSHandler::PSMT8:
+		ForEachBlockOf<CGsPixelFormats::STORAGEPSMT8>(bufAddress, bufWidth, x0, y0, width, height, f);
+		return true;
+	case CGSHandler::PSMT4:
+		ForEachBlockOf<CGsPixelFormats::STORAGEPSMT4>(bufAddress, bufWidth, x0, y0, width, height, f);
+		return true;
+	default:
+		return false;
+	}
+}
+
+//Host -> local transfers are queued and dispatched together (one dispatch for many small texture uploads):
+//they may run before the draws of the open batch as long as that batch doesn't read or write their memory.
 void CGSH_WebGPU::ProcessHostToLocalTransfer()
 {
-	FlushBatch();
 	ClearClutCache();
 
 	auto bltBuf = make_convertible<BITBLTBUF>(m_nReg[GS_REG_BITBLTBUF]);
@@ -370,23 +451,152 @@ void CGSH_WebGPU::ProcessHostToLocalTransfer()
 
 	if(pixelCount != 0)
 	{
+		auto [dstAddress, dstSize] = GsTransfer::GetDstRange(bltBuf, trxReg, trxPos);
+		uint32 dstEnd = dstAddress + dstSize;
+		if(BatchAccesses(dstAddress, dstEnd))
+		{
+			FlushBatch();
+		}
+		uint32 groupCount = (pixelCount + 255) / 256;
+		uint32 rrh = (pixelCount + trxReg.nRRW - 1) / std::max<uint32>(trxReg.nRRW, 1);
+		//Blocks written by this transfer (the page ranges of GetDstRange are too coarse: small uploads share pages)
+		m_xferBlocks.clear();
+		bool knownBlocks = ForEachBlock(bltBuf.nDstPsm, bltBuf.GetDstPtr(), bltBuf.GetDstWidth(), trxPos.nDSAX, trxPos.nDSAY, trxReg.nRRW, rrh,
+		                                [&](uint32 block) { m_xferBlocks.push_back(block % (RAMSIZE / CPU_BLOCK_SIZE)); });
+		bool overlapsPending = false;
+		if(knownBlocks)
+		{
+			overlapsPending = std::any_of(m_xferBlocks.begin(), m_xferBlocks.end(), [&](uint32 block) { return m_pendingXferBlocks[block] != 0; });
+		}
+		else
+		{
+			overlapsPending = std::any_of(m_pendingXfers.begin(), m_pendingXfers.end(),
+			                              [&](const PENDING_XFER& xfer) { return RangesOverlap(dstAddress, dstEnd, xfer.start, xfer.end); });
+		}
+		if(overlapsPending || (m_pendingXfers.size() == MAX_PENDING_XFERS) || ((m_pendingXferGroups + groupCount) > 65535))
+		{
+			FlushTransfers();
+		}
+
 		uint32 dataOffset = AllocUpload(m_xferBuffer.size() + 4, 4);
 		memcpy(m_upload.data() + dataOffset, m_xferBuffer.data(), m_xferBuffer.size());
 
-		uint32 paramsOffset = 0;
-		auto params = AllocParams(paramsOffset);
-		params[0] = bltBuf.nDstPsm;
-		params[1] = bltBuf.GetDstPtr();
-		params[2] = bltBuf.GetDstWidth();
-		params[3] = trxReg.nRRW;
-		params[4] = trxPos.nDSAX;
-		params[5] = trxPos.nDSAY;
-		params[6] = dataOffset / 4;
-		params[7] = pixelCount;
-		Dispatch(PIPELINE_XFER_HOST, paramsOffset, (pixelCount + 255) / 256);
+		PENDING_XFER xfer;
+		xfer.psm = bltBuf.nDstPsm;
+		xfer.bufAddress = bltBuf.GetDstPtr();
+		xfer.bufWidth = bltBuf.GetDstWidth();
+		xfer.rrw = trxReg.nRRW;
+		xfer.dsax = trxPos.nDSAX;
+		xfer.dsay = trxPos.nDSAY;
+		xfer.dataOffset = dataOffset / 4;
+		xfer.pixelCount = pixelCount;
+		xfer.firstGroup = m_pendingXferGroups;
+		xfer.rrh = rrh;
+		xfer.start = dstAddress;
+		xfer.end = dstEnd;
+		m_pendingXfers.push_back(xfer);
+		m_pendingXferGroups += groupCount;
+		if(knownBlocks)
+		{
+			for(uint32 block : m_xferBlocks) m_pendingXferBlocks[block] = 1;
+		}
+		else
+		{
+			std::fill(m_pendingXferBlocks.begin() + dstAddress / CPU_BLOCK_SIZE, m_pendingXferBlocks.begin() + std::min<uint32>(dstEnd, RAMSIZE) / CPU_BLOCK_SIZE, 1);
+		}
+
+		//Keep the CPU copy of small CLUT-format uploads (CLUTs are built on the CPU from it, see LoadClutFromCpu)
+		InvalidateCpuMemory(dstAddress, dstEnd);
+		if((m_xferBuffer.size() <= 0x1000) && ((xfer.psm == PSMCT32) || (xfer.psm == PSMCT16) || (xfer.psm == PSMCT16S)))
+		{
+			WriteCpuMemory(xfer, trxReg.nRRH);
+		}
 	}
 
 	m_xferBuffer.clear();
+}
+
+void CGSH_WebGPU::FlushTransfers()
+{
+	if(m_pendingXfers.empty()) return;
+	//Table of XFER_WORDS words per transfer (layout read by the xferHost shader)
+	uint32 tableOffset = AllocUpload(m_pendingXfers.size() * XFER_WORDS * sizeof(uint32), 4);
+	auto table = reinterpret_cast<uint32*>(m_upload.data() + tableOffset);
+	for(const auto& xfer : m_pendingXfers)
+	{
+		*table++ = xfer.psm;
+		*table++ = xfer.bufAddress;
+		*table++ = xfer.bufWidth;
+		*table++ = xfer.rrw;
+		*table++ = xfer.dsax;
+		*table++ = xfer.dsay;
+		*table++ = xfer.dataOffset;
+		*table++ = xfer.pixelCount;
+		*table++ = xfer.firstGroup;
+	}
+	uint32 paramsOffset = 0;
+	auto params = AllocParams(paramsOffset);
+	params[0] = m_pendingXfers.size();
+	params[1] = tableOffset / 4;
+	PushCommand({OP_DISPATCH, PIPELINE_XFER_HOST, paramsOffset, m_pendingXferGroups, 1, 1});
+	std::fill(m_pendingXferBlocks.begin(), m_pendingXferBlocks.end(), 0);
+	m_pendingXfers.clear();
+	m_pendingXferGroups = 0;
+}
+
+//Memory written by the GPU: transfer data remembered for CLUTs is no longer what's there
+//The CPU copy of GS memory (m_memoryCache) is only up to date where m_cpuValid says so: everything after a
+//readback or a state load, plus small host transfers written on both sides. GPU writes invalidate it.
+void CGSH_WebGPU::InvalidateCpuMemory(uint32 start, uint32 end)
+{
+	start = std::min<uint32>(start, RAMSIZE) / CPU_BLOCK_SIZE;
+	end = (std::min<uint32>(end, RAMSIZE) + CPU_BLOCK_SIZE - 1) / CPU_BLOCK_SIZE;
+	std::fill(m_cpuValid.begin() + start, m_cpuValid.begin() + end, 0);
+}
+
+template <typename Storage>
+static void WriteTransferPixels(uint8* ram, uint8* valid, const uint8* data, uint32 bufAddress, uint32 bufWidth,
+                                uint32 dsax, uint32 dsay, uint32 rrw, uint32 pixelCount)
+{
+	CGsPixelFormats::CPixelIndexor<Storage> indexor(ram, bufAddress, bufWidth / 64);
+	auto pixels = reinterpret_cast<const typename Storage::Unit*>(data);
+	for(uint32 i = 0; i < pixelCount; i++)
+	{
+		uint32 x = ((i % rrw) + dsax) % 2048;
+		uint32 y = ((i / rrw) + dsay) % 2048;
+		auto address = indexor.GetPixelAddress(x, y);
+		*address = pixels[i];
+		valid[(reinterpret_cast<uint8*>(address) - ram) / CGSH_WebGPU::CPU_BLOCK_SIZE] = 1;
+	}
+}
+
+void CGSH_WebGPU::WriteCpuMemory(const PENDING_XFER& xfer, uint32)
+{
+	switch(xfer.psm)
+	{
+	case PSMCT32:
+		WriteTransferPixels<CGsPixelFormats::STORAGEPSMCT32>(m_memoryCache, m_cpuValid.data(), m_xferBuffer.data(), xfer.bufAddress, xfer.bufWidth, xfer.dsax, xfer.dsay, xfer.rrw, xfer.pixelCount);
+		break;
+	case PSMCT16:
+		WriteTransferPixels<CGsPixelFormats::STORAGEPSMCT16>(m_memoryCache, m_cpuValid.data(), m_xferBuffer.data(), xfer.bufAddress, xfer.bufWidth, xfer.dsax, xfer.dsay, xfer.rrw, xfer.pixelCount);
+		break;
+	case PSMCT16S:
+		WriteTransferPixels<CGsPixelFormats::STORAGEPSMCT16S>(m_memoryCache, m_cpuValid.data(), m_xferBuffer.data(), xfer.bufAddress, xfer.bufWidth, xfer.dsax, xfer.dsay, xfer.rrw, xfer.pixelCount);
+		break;
+	}
+}
+
+//Whether the open batch reads (textures) or writes (frame/depth buffer) memory in [start, end)
+bool CGSH_WebGPU::BatchAccesses(uint32 start, uint32 end) const
+{
+	if((m_prims.size() / PRIM_WORDS) == m_batch.primStart) return false;
+	if(RangesOverlap(start, end, m_batch.writeStart, m_batch.writeEnd) ||
+	   RangesOverlap(start, end, m_batch.zbWriteStart, m_batch.zbWriteEnd))
+	{
+		return true;
+	}
+	return std::any_of(m_batchReads.begin(), m_batchReads.end(),
+	                   [&](const auto& range) { return RangesOverlap(start, end, range.first, range.second); });
 }
 
 void CGSH_WebGPU::ProcessLocalToHostTransfer()
@@ -425,6 +635,7 @@ void CGSH_WebGPU::ProcessLocalToLocalTransfer()
 	auto [srcAddress, srcSize] = GsTransfer::GetSrcRange(bltBuf, trxReg, trxPos);
 	auto [dstAddress, dstSize] = GsTransfer::GetDstRange(bltBuf, trxReg, trxPos);
 	srcSize = std::min<uint32>(srcSize, RAMSIZE - std::min<uint32>(srcAddress, RAMSIZE));
+	InvalidateCpuMemory(dstAddress, dstAddress + dstSize);
 	bool useCopy = (srcAddress < (dstAddress + dstSize)) && (dstAddress < (srcAddress + srcSize));
 	if(useCopy && (srcSize != 0))
 	{
@@ -456,6 +667,7 @@ void CGSH_WebGPU::ProcessClutTransfer(uint32, uint32)
 void CGSH_WebGPU::WriteBackMemoryCache()
 {
 	FlushBatch();
+	std::fill(m_cpuValid.begin(), m_cpuValid.end(), 1);
 	uint32 offset = AllocUpload(RAMSIZE);
 	memcpy(m_upload.data() + offset, m_memoryCache, RAMSIZE);
 	PushCommand({OP_UPLOAD_TO_MEMORY, offset, 0, RAMSIZE});
@@ -517,9 +729,32 @@ CGSH_WebGPU::CLUTKEY CGSH_WebGPU::MakeCachedClutKey(const TEX0& tex0, const TEXC
 	return clutKey;
 }
 
-void CGSH_WebGPU::DoClutLoad(uint32 clutIndex, const TEX0& tex0, const TEXCLUT& texClut)
+//CLUTs are loaded into a ring of CLUT_SLOTS slots (the Vulkan backend reuses 32 slots and ends its render
+//pass at each load): a slot isn't overwritten before the draws using it ran, so loads don't split batches.
+//The load is recorded before the batch's draw dispatch, so it must not depend on what the batch draws.
+uint32 CGSH_WebGPU::DoClutLoad(const TEX0& tex0, const TEXCLUT& texClut)
 {
-	FlushBatch();
+	uint32 clutStart = tex0.GetCLUTPtr();
+	uint32 clutEnd = clutStart + ((tex0.nCSM == 0) ? 0x2000 : RAMSIZE);
+	if(RangesOverlap(clutStart, clutEnd, m_batch.writeStart, m_batch.writeEnd) ||
+	   RangesOverlap(clutStart, clutEnd, m_batch.zbWriteStart, m_batch.zbWriteEnd))
+	{
+		FlushBatch();
+	}
+	uint32 clutIndex = m_nextClutSlot;
+	m_nextClutSlot = (m_nextClutSlot + 1) % CLUT_SLOTS;
+	if(m_nextClutSlot == 0)
+	{
+		//Wrapping around: the next loads overwrite slots that queued draws may use (CPU loaded CLUTs
+		//are written at the start of the command list, so submit it).
+		Flush();
+		ClearClutCache();
+	}
+	if(LoadClutFromCpu(clutIndex, tex0, texClut))
+	{
+		return clutIndex;
+	}
+	FlushTransfers();
 	uint32 paramsOffset = 0;
 	auto params = AllocParams(paramsOffset);
 	params[0] = CGsPixelFormats::IsPsmIDTEX8(tex0.nPsm) ? 1 : 0;
@@ -532,6 +767,88 @@ void CGSH_WebGPU::DoClutLoad(uint32 clutIndex, const TEX0& tex0, const TEXCLUT& 
 	params[7] = texClut.GetOffsetV();
 	params[8] = clutIndex * CLUTENTRYCOUNT;
 	Dispatch(PIPELINE_CLUT_LOAD, paramsOffset, 1);
+	return clutIndex;
+}
+
+//Most CLUTs are uploaded with a small host -> local transfer: when the CPU copy of their memory is up to date,
+//build them on the CPU (no GPU dispatch, no need to run the queued transfers first).
+template <typename Storage>
+static bool ReadClutPixels(uint8* ram, const uint8* valid, uint32 bufAddress, uint32 bufWidth,
+                           uint32 x0, uint32 y0, uint32 width, uint32 count, uint32* pixels)
+{
+	CGsPixelFormats::CPixelIndexor<Storage> indexor(ram, bufAddress, bufWidth / 64);
+	for(uint32 i = 0; i < count; i++)
+	{
+		auto address = indexor.GetPixelAddress(x0 + (i % width), y0 + (i / width));
+		if(!valid[(reinterpret_cast<uint8*>(address) - ram) / CGSH_WebGPU::CPU_BLOCK_SIZE]) return false;
+		pixels[i] = *address;
+	}
+	return true;
+}
+
+bool CGSH_WebGPU::LoadClutFromCpu(uint32 clutIndex, const TEX0& tex0, const TEXCLUT& texClut)
+{
+	bool idx8 = CGsPixelFormats::IsPsmIDTEX8(tex0.nPsm);
+	uint32 bufWidth = (tex0.nCSM == 0) ? 0x40 : texClut.GetBufWidth();
+	uint32 x0 = 0, y0 = 0, width = 0, count = 0;
+	if(tex0.nCSM == 0)
+	{
+		width = idx8 ? 16 : 8;
+		count = idx8 ? 256 : 16;
+	}
+	else
+	{
+		x0 = texClut.GetOffsetU();
+		y0 = texClut.GetOffsetV();
+		width = count = idx8 ? 256 : 16;
+	}
+	uint32 pixels[256];
+	bool is32 = (tex0.nCPSM == PSMCT32) || (tex0.nCPSM == PSMCT24);
+	bool ok = false;
+	switch(tex0.nCPSM)
+	{
+	case PSMCT32:
+	case PSMCT24:
+		ok = ReadClutPixels<CGsPixelFormats::STORAGEPSMCT32>(m_memoryCache, m_cpuValid.data(), tex0.GetCLUTPtr(), bufWidth, x0, y0, width, count, pixels);
+		break;
+	case PSMCT16:
+		ok = ReadClutPixels<CGsPixelFormats::STORAGEPSMCT16>(m_memoryCache, m_cpuValid.data(), tex0.GetCLUTPtr(), bufWidth, x0, y0, width, count, pixels);
+		break;
+	case PSMCT16S:
+		ok = ReadClutPixels<CGsPixelFormats::STORAGEPSMCT16S>(m_memoryCache, m_cpuValid.data(), tex0.GetCLUTPtr(), bufWidth, x0, y0, width, count, pixels);
+		break;
+	}
+	if(!ok) return false;
+
+	m_clutUploads.resize(m_clutUploads.size() + CLUTENTRYCOUNT + 1);
+	uint32* clut = m_clutUploads.data() + m_clutUploads.size() - CLUTENTRYCOUNT;
+	clut[-1] = clutIndex;
+	//Same mapping as the clutLoad shader (GSH_VulkanClutLoad)
+	for(uint32 i = 0; i < count; i++)
+	{
+		uint32 index = i;
+		if(tex0.nCSM == 0)
+		{
+			if(idx8)
+			{
+				index = (index & ~0x18) | ((index & 0x08) << 1) | ((index & 0x10) >> 1);
+			}
+			else
+			{
+				index += tex0.nCSA * 16;
+			}
+		}
+		if(is32)
+		{
+			//Whole colors in the first 256 entries, halves swapped at index >= 256 (see the clutLoad shader)
+			clut[index & 255] = (index & 256) ? ((pixels[i] >> 16) | (pixels[i] << 16)) : pixels[i];
+		}
+		else
+		{
+			clut[index & 511] = pixels[i];
+		}
+	}
+	return true;
 }
 
 void CGSH_WebGPU::SyncCLUT(const TEX0& tex0)
@@ -544,7 +861,7 @@ void CGSH_WebGPU::SyncCLUT(const TEX0& tex0)
 		if((tex0.nCSM == 0) && CGsPixelFormats::IsPsmIDTEX4(tex0.nPsm) &&
 		   (m_lastClutFillCacheIndex != -1) && (m_lastClutFillPointer == tex0.nCBP))
 		{
-			m_clutIndex = m_lastClutFillCacheIndex;
+			m_clutIndex = m_clutSlots[m_lastClutFillCacheIndex];
 		}
 		return;
 	}
@@ -555,13 +872,14 @@ void CGSH_WebGPU::SyncCLUT(const TEX0& tex0)
 	int32 clutCacheIndex = FindCachedClut(clutKey);
 	if(clutCacheIndex == -1)
 	{
+		uint32 slot = DoClutLoad(tex0, texClut);
 		clutCacheIndex = m_nextClutCacheIndex++;
 		m_nextClutCacheIndex %= CLUT_CACHE_SIZE;
 		m_clutStates[clutCacheIndex] = clutKey;
-		DoClutLoad(clutCacheIndex, tex0, texClut);
+		m_clutSlots[clutCacheIndex] = slot;
 	}
 
-	m_clutIndex = clutCacheIndex;
+	m_clutIndex = m_clutSlots[clutCacheIndex];
 
 	if(tex0.nCSM == 0)
 	{
@@ -623,11 +941,6 @@ static uint32 AreaSize(uint32 psm, uint32 width, uint32 height)
 	CGsCachedArea area;
 	area.SetArea(psm, 0, width, height);
 	return area.GetSize();
-}
-
-static bool RangesOverlap(uint32 start1, uint32 end1, uint32 start2, uint32 end2)
-{
-	return (start1 < end2) && (start2 < end1);
 }
 
 void CGSH_WebGPU::ProcessPrim(uint64 data)
@@ -1027,6 +1340,20 @@ void CGSH_WebGPU::SetRenderingContext(uint64 primReg)
 		}
 		memcpy(m_state, state, sizeof(state));
 		m_stateIndex = -1;
+		m_stateInBatch = false;
+		m_stateReadStart = m_stateReadEnd = 0;
+		if(hasTexture)
+		{
+			//Memory the texture (all its mip levels) can read
+			m_stateReadStart = tex0.GetBufPtr();
+			m_stateReadEnd = m_stateReadStart + AreaSize(tex0.nPsm, tex0.GetBufWidth(), tex0.GetHeight());
+			for(uint32 level = 1; level <= tex1.nMaxMip; level++)
+			{
+				auto info = GetMipLevelInfo(level, miptbp1, miptbp2);
+				m_stateReadStart = std::min(m_stateReadStart, info.first);
+				m_stateReadEnd = std::max(m_stateReadEnd, info.first + AreaSize(tex0.nPsm, info.second, std::max(tex0.GetHeight() >> level, 1U)));
+			}
+		}
 		uint32 features = 0;
 		if(hasTexture)
 		{
@@ -1055,6 +1382,7 @@ void CGSH_WebGPU::SetRenderingContext(uint64 primReg)
 void CGSH_WebGPU::CopyMemoryForTexture()
 {
 	FlushBatch();
+	FlushTransfers();
 	PushCommand({OP_MEMORY_TO_COPY, m_memoryCopyAddress, m_memoryCopySize});
 	m_memoryCopyRegion.Reset();
 }
@@ -1268,6 +1596,14 @@ void CGSH_WebGPU::AddPrim(PRIM_TYPE type, const VERTEX_DATA* vertices, uint32 ve
 		m_stateIndex = m_states.size() / STATE_WORDS;
 		m_states.insert(m_states.end(), std::begin(m_state), std::end(m_state));
 	}
+	if(!m_stateInBatch)
+	{
+		m_stateInBatch = true;
+		if(m_stateReadEnd != m_stateReadStart)
+		{
+			m_batchReads.emplace_back(m_stateReadStart, m_stateReadEnd);
+		}
+	}
 
 	size_t base = m_prims.size();
 	m_prims.resize(base + PRIM_WORDS);
@@ -1298,9 +1634,36 @@ void CGSH_WebGPU::AddPrim(PRIM_TYPE type, const VERTEX_DATA* vertices, uint32 ve
 	m_batch.maxY = std::max<uint32>(m_batch.maxY, maxY);
 }
 
+//Whether a triangle can't cover any pixel of the tile whose first pixel is (tileX, tileY): all the tile's sample
+//points are outside one of its edges (conservative). Same edge functions as the draw shader (12.4 coordinates).
+static bool TriangleMissesTile(const uint32* prim, int32 tileX, int32 tileY)
+{
+	int64 x0 = static_cast<int32>(prim[0]), y0 = static_cast<int32>(prim[1]);
+	int64 x1 = static_cast<int32>(prim[8]), y1 = static_cast<int32>(prim[9]);
+	int64 x2 = static_cast<int32>(prim[16]), y2 = static_cast<int32>(prim[17]);
+	int64 area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+	if(area == 0) return true;
+	int64 o = (area > 0) ? 1 : -1;
+	int64 minX = tileX * 16, maxX = (tileX + CGSH_WebGPU::DRAW_TILE_SIZE - 1) * 16;
+	int64 minY = tileY * 16, maxY = (tileY + CGSH_WebGPU::DRAW_TILE_SIZE - 1) * 16;
+	const int64 ax[3] = {x1, x2, x0}, ay[3] = {y1, y2, y0}, bx[3] = {x2, x0, x1}, by[3] = {y2, y0, y1};
+	for(uint32 i = 0; i < 3; i++)
+	{
+		int64 dx = o * (bx[i] - ax[i]), dy = o * (by[i] - ay[i]);
+		//e = dx * (sy - ay) - dy * (sx - ax), largest at this corner of the tile
+		int64 sx = (dy < 0) ? maxX : minX;
+		int64 sy = (dx > 0) ? maxY : minY;
+		if((dx * (sy - ay[i]) - dy * (sx - ax[i])) < 0) return true;
+	}
+	return false;
+}
+
 void CGSH_WebGPU::FlushBatch()
 {
+	FlushTransfers();
 	uint32 primEnd = m_prims.size() / PRIM_WORDS;
+	m_batchReads.clear();
+	m_stateInBatch = false;
 	if(primEnd == m_batch.primStart) return;
 
 	//Bin the primitives per tile (in drawing order), so that each workgroup of the draw shader only walks
@@ -1316,32 +1679,47 @@ void CGSH_WebGPU::FlushBatch()
 		const uint32* prim = m_prims.data() + p * PRIM_WORDS;
 		uint32 tx0 = ((prim[26] & 0xFFFF) - originX) / DRAW_TILE_SIZE, ty0 = ((prim[26] >> 16) - originY) / DRAW_TILE_SIZE;
 		uint32 tx1 = ((prim[27] & 0xFFFF) - originX) / DRAW_TILE_SIZE, ty1 = ((prim[27] >> 16) - originY) / DRAW_TILE_SIZE;
+		bool test = (prim[24] == PRIM_TYPE_TRIANGLE) && ((tx0 != tx1) || (ty0 != ty1));
 		for(uint32 ty = ty0; ty <= ty1; ty++)
 		{
 			for(uint32 tx = tx0; tx <= tx1; tx++)
 			{
+				if(test && TriangleMissesTile(prim, originX + tx * DRAW_TILE_SIZE, originY + ty * DRAW_TILE_SIZE)) continue;
 				m_binOffsets[ty * tilesX + tx + 1]++;
 			}
 		}
 	}
+	//Workgroups only for the tiles with primitives, the longest lists first: a tile's list is walked by one
+	//workgroup, so a long list started late would run alone at the end of the dispatch.
+	m_tileOrder.clear();
+	for(uint32 t = 0; t < tileCount; t++)
+	{
+		if(m_binOffsets[t + 1] != 0) m_tileOrder.push_back(t);
+	}
+	std::stable_sort(m_tileOrder.begin(), m_tileOrder.end(),
+	                 [&](uint32 a, uint32 b) { return m_binOffsets[a + 1] > m_binOffsets[b + 1]; });
 	for(uint32 t = 0; t < tileCount; t++)
 	{
 		m_binOffsets[t + 1] += m_binOffsets[t];
 	}
 	uint32 entryCount = m_binOffsets[tileCount];
-	uint32 binOffset = AllocUpload((tileCount + 1 + entryCount) * sizeof(uint32), 4);
+	uint32 orderCount = m_tileOrder.size();
+	uint32 binOffset = AllocUpload((tileCount + 1 + entryCount + orderCount) * sizeof(uint32), 4);
 	auto bins = reinterpret_cast<uint32*>(m_upload.data() + binOffset);
 	memcpy(bins, m_binOffsets.data(), (tileCount + 1) * sizeof(uint32));
 	uint32* entries = bins + tileCount + 1;
+	memcpy(entries + entryCount, m_tileOrder.data(), orderCount * sizeof(uint32));
 	for(uint32 p = m_batch.primStart; p < primEnd; p++)
 	{
 		const uint32* prim = m_prims.data() + p * PRIM_WORDS;
 		uint32 tx0 = ((prim[26] & 0xFFFF) - originX) / DRAW_TILE_SIZE, ty0 = ((prim[26] >> 16) - originY) / DRAW_TILE_SIZE;
 		uint32 tx1 = ((prim[27] & 0xFFFF) - originX) / DRAW_TILE_SIZE, ty1 = ((prim[27] >> 16) - originY) / DRAW_TILE_SIZE;
+		bool test = (prim[24] == PRIM_TYPE_TRIANGLE) && ((tx0 != tx1) || (ty0 != ty1));
 		for(uint32 ty = ty0; ty <= ty1; ty++)
 		{
 			for(uint32 tx = tx0; tx <= tx1; tx++)
 			{
+				if(test && TriangleMissesTile(prim, originX + tx * DRAW_TILE_SIZE, originY + ty * DRAW_TILE_SIZE)) continue;
 				entries[m_binOffsets[ty * tilesX + tx]++] = p;
 			}
 		}
@@ -1361,7 +1739,13 @@ void CGSH_WebGPU::FlushBatch()
 	params[11] = tilesX;
 	params[12] = binOffset / 4;
 	params[13] = binOffset / 4 + tileCount + 1;
-	PushCommand({OP_DISPATCH, PIPELINE_DRAW | (m_batch.features << 8), paramsOffset, tilesX, tilesY, 1});
+	params[14] = binOffset / 4 + tileCount + 1 + entryCount;
+	params[15] = orderCount;
+	uint32 groupsX = std::min<uint32>(orderCount, DRAW_GROUPS_PER_ROW);
+	uint32 groupsY = (orderCount + DRAW_GROUPS_PER_ROW - 1) / DRAW_GROUPS_PER_ROW;
+	PushCommand({OP_DISPATCH, PIPELINE_DRAW | (m_batch.features << 8), paramsOffset, groupsX, groupsY, 1});
+	InvalidateCpuMemory(m_batch.writeStart, m_batch.writeEnd);
+	InvalidateCpuMemory(m_batch.zbWriteStart, m_batch.zbWriteEnd);
 	m_drawCallCount++;
 
 	m_batch.primStart = primEnd;
@@ -1370,4 +1754,9 @@ void CGSH_WebGPU::FlushBatch()
 	m_batch.features = 0;
 	m_batch.writeStart = m_batch.writeEnd = m_batch.fbAddress;
 	m_batch.zbWriteStart = m_batch.zbWriteEnd = m_batch.zbAddress;
+	//Submit big frames in parts: the GPU starts on the first draws while the rest of the frame is processed
+	if((m_prims.size() / PRIM_WORDS) >= SUBMIT_PRIMS)
+	{
+		Flush();
+	}
 }

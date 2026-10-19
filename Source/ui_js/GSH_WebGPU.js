@@ -12,9 +12,10 @@ var GsWgpu = {
 	OP_DISPATCH: 4,
 	OP_PRESENT: 5,
 	OP_READBACK: 6,
+	OP_UPLOAD_TO_CLUT: 7,
 
 	RAMSIZE: 0x400000,
-	CLUT_BUFFER_SIZE: 32 * 512 * 4,
+	CLUT_BUFFER_SIZE: 1024 * 512 * 4, // CGSH_WebGPU::CLUT_SLOTS slots
 	SWIZZLE_TABLES_SIZE: 45056 * 4,
 	PARAMS_SIZE: 256,
 
@@ -22,15 +23,14 @@ var GsWgpu = {
 	errorCount: 0,
 	debug: 0,
 	// Per-interval counters, logged every 2 s when debug is set (CGSH_WebGPU::SetDebug)
-	stats: { frames: 0, executes: 0, batches: 0, prims: 0, uploadBytes: 0, gpuNs: 0, gpuPasses: 0, gpuExecutes: 0, since: 0 },
+	stats: { frames: 0, executes: 0, batches: 0, prims: 0, uploadBytes: 0, gpuNs: 0, gpuPasses: 0, gpuExecutes: 0, jsMs: 0, since: 0 },
 	MAX_TIMED_PASSES: 512,
 	MAX_FRAMES_IN_FLIGHT: 2,
-	// Draw shader variant (tuning knobs, see notes/webgpu.md): tile = workgroup side in pixels, primCache =
-	// copy the tile's primitives to workgroup memory, pixelCache = keep frame/depth values in registers.
+	// Draw shader variant: tile = workgroup side in pixels.
 	// Bit i of a draw's feature mask (CGSH_WebGPU::DRAW_FEATURE_*) = override constant drawFeatures[i]
 	drawFeatures: ["F_TEXTURE", "F_LINEAR", "F_MIPLOD", "F_CLUT", "F_MEMCOPY", "F_BLEND", "F_FOG", "F_ALPHATEST",
 		"F_DATE", "F_DEPTHTEST", "F_DEPTHWRITE", "F_TRIANGLE", "F_SPRITE", "F_LINE"],
-	drawConfig: { tile: 8, primCache: true, pixelCache: true, exit: 0 }, // tile must match CGSH_WebGPU::DRAW_TILE_SIZE
+	drawConfig: { tile: 8 }, // tile must match CGSH_WebGPU::DRAW_TILE_SIZE
 	framesInFlight: 0,
 	waitingForGpu: false,
 
@@ -213,6 +213,7 @@ var GsWgpu = {
 		let timedPasses = 0;
 		const st = this.stats;
 		st.executes++;
+		const executeStart = performance.now();
 		st.prims += primsSize / 112;
 		st.uploadBytes += uploadSize + primsSize + statesSize;
 		for (let i = 0; i < commandCount;) {
@@ -226,6 +227,11 @@ var GsWgpu = {
 				endPass();
 				enc.copyBufferToBuffer(this.upload, cmds[i + 1], this.swizzle, 0, cmds[i + 2]);
 				i += 3;
+				break;
+			case this.OP_UPLOAD_TO_CLUT:
+				endPass();
+				enc.copyBufferToBuffer(this.upload, cmds[i + 1], this.clut, cmds[i + 2], cmds[i + 3]);
+				i += 4;
 				break;
 			case this.OP_MEMORY_TO_COPY:
 				endPass();
@@ -243,7 +249,10 @@ var GsWgpu = {
 						pass = enc.beginComputePass();
 					}
 				}
-				if ((cmds[i + 1] & 0xFF) === 3) st.batches++;
+				if ((cmds[i + 1] & 0xFF) === 3) {
+					st.batches++;
+					if (this.debug & 4) { i += 6; break; } // debug: skip draws (CPU-bound speed)
+				}
 				pass.setPipeline((cmds[i + 1] & 0xFF) === 3 ? this.drawPipeline(cmds[i + 1] >>> 8) : this.computePipelines[cmds[i + 1]]);
 				pass.setBindGroup(0, this.computeBindGroup, [cmds[i + 2]]);
 				pass.dispatchWorkgroups(cmds[i + 3], cmds[i + 4], cmds[i + 5]);
@@ -322,10 +331,11 @@ var GsWgpu = {
 			}
 		}
 		const now = performance.now();
+		st.jsMs += now - executeStart;
 		if (this.debug && now - st.since > 2000) {
 			const f = Math.max(st.frames, 1);
-			console.log(`GSH_WebGPU: ${(st.frames * 1000 / (now - st.since)).toFixed(1)} frames/s, per frame: ${(st.executes / f).toFixed(1)} submits, ${(st.batches / f).toFixed(0)} batches, ${(st.prims / f).toFixed(0)} prims, ${(st.uploadBytes / f / 1024).toFixed(0)} KB, compute GPU ${(st.gpuNs / 1e6 / Math.max(st.gpuExecutes, 1)).toFixed(2)} ms per submit (${st.gpuExecutes} sampled)`);
-			Object.assign(st, { frames: 0, executes: 0, batches: 0, prims: 0, uploadBytes: 0, gpuNs: 0, gpuPasses: 0, gpuExecutes: 0, since: now });
+			console.log(`GSH_WebGPU: ${(st.frames * 1000 / (now - st.since)).toFixed(1)} frames/s, per frame: ${(st.executes / f).toFixed(1)} submits, ${(st.batches / f).toFixed(0)} batches, ${(st.prims / f).toFixed(0)} prims, ${(st.uploadBytes / f / 1024).toFixed(0)} KB, JS ${(st.jsMs / f).toFixed(1)} ms, compute GPU ${(st.gpuNs / 1e6 / Math.max(st.gpuExecutes, 1)).toFixed(2)} ms per submit (${st.gpuExecutes} sampled)`);
+			Object.assign(st, { frames: 0, executes: 0, batches: 0, prims: 0, uploadBytes: 0, gpuNs: 0, gpuPasses: 0, gpuExecutes: 0, jsMs: 0, since: now });
 		}
 		if (presented && this.capture?.submits && !this.capture.finishing) this.finishCapture();
 		this.lastExecutePresented = presented;
@@ -476,7 +486,6 @@ fn psm16ToColor(c : u32) -> vec4<f32> {
 @group(0) @binding(3) var<storage, read> swz : array<u32>;
 @group(0) @binding(4) var<storage, read> upload : array<u32>;
 @group(0) @binding(5) var<uniform> P : array<vec4<u32>, 16>;
-
 ${this.wgslMemory("atomicLoad(&mem[i & WORDMASK])")}
 
 fn param(i : u32) -> u32 { return P[i >> 2u][i & 3u]; }
@@ -526,21 +535,28 @@ fn writePixel(psm : u32, bufAddress : u32, bufWidth : u32, x : u32, y : u32, v :
 
 fn uploadByte(byteOffset : u32) -> u32 { return (upload[byteOffset >> 2u] >> ((byteOffset & 3u) * 8u)) & 0xFFu; }
 
-// Host -> local transfer (GSH_VulkanTransferHost): one invocation per pixel of the stream.
+// Host -> local transfers (GSH_VulkanTransferHost), several per dispatch: P = count, table (XFER_WORDS words per
+// transfer: psm, bufAddress, bufWidth, rrw, dsax, dsay, data offset (words), pixel count, first workgroup).
+// One invocation per pixel of the stream.
 @compute @workgroup_size(256)
-fn xferHost(@builtin(global_invocation_id) id : vec3<u32>) {
-	let psm = param(0u);
-	let bufAddress = param(1u);
-	let bufWidth = param(2u);
-	let rrw = param(3u);
-	let dsax = param(4u);
-	let dsay = param(5u);
-	let dataOffset = param(6u);
-	let pixelCount = param(7u);
-	let i = id.x;
+fn xferHost(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index) li : u32) {
+	let count = param(0u);
+	let table = param(1u);
+	var t = 0u;
+	while((t + 1u < count) && (upload[table + (t + 1u) * 9u + 8u] <= wid.x)) { t++; }
+	let x = table + t * 9u;
+	let psm = upload[x + 0u];
+	let bufAddress = upload[x + 1u];
+	let bufWidth = upload[x + 2u];
+	let rrw = upload[x + 3u];
+	let dsax = upload[x + 4u];
+	let dsay = upload[x + 5u];
+	let dataOffset = upload[x + 6u];
+	let pixelCount = upload[x + 7u];
+	let i = (wid.x - upload[x + 8u]) * 256u + li;
 	if(i >= pixelCount) { return; }
-	let x = ((i % rrw) + dsax) % 2048u;
-	let y = ((i / rrw) + dsay) % 2048u;
+	let px = ((i % rrw) + dsax) % 2048u;
+	let py = ((i / rrw) + dsay) % 2048u;
 	var value = 0u;
 	switch(psm) {
 		case 0x01u, 0x09u, 0x31u: {
@@ -552,7 +568,7 @@ fn xferHost(@builtin(global_invocation_id) id : vec3<u32>) {
 		case 0x14u, 0x24u, 0x2Cu: { value = (upload[dataOffset + (i >> 3u)] >> ((i & 7u) * 4u)) & 0xFu; }
 		default: { value = upload[dataOffset + i]; }
 	}
-	writePixel(psm, bufAddress, bufWidth, x, y, value);
+	writePixel(psm, bufAddress, bufWidth, px, py, value);
 }
 
 // Local -> local transfer (GSH_VulkanTransferLocal).
@@ -604,15 +620,17 @@ fn clutLoad(@builtin(local_invocation_index) li : u32) {
 		clut[base + (index & 511u)] = readPixel(cpsm, clutBufPtr, clutBufWidth, x, y);
 	} else {
 		let color = read32(pixelAddress(cpsm, clutBufPtr, clutBufWidth, x, y));
-		clut[base + (index & 511u)] = color & 0xFFFFu;
-		clut[base + ((index + 256u) & 511u)] = color >> 16u;
+		// 32-bit CLUTs are kept as whole colors in the first 256 entries (one read per texel): the GS's two 16-bit
+		// halves (index, index + 256) of a load at index >= 256 swap places.
+		clut[base + (index & 255u)] = select(color, (color >> 16u) | (color << 16u), (index & 256u) != 0u);
 	}
 }
 
 // Draws (see notes/webgpu.md): compute rasterizer working on GS memory, the per-pixel part follows
 // GSH_VulkanDrawDesktop::CreateFragmentShader / GSH_VulkanDrawUtils.
-@group(0) @binding(6) var<storage, read> prims : array<u32>;
-@group(0) @binding(7) var<storage, read> states : array<u32>;
+// Primitives and states as vec4s: one load per 4 words (separately bounds-checked scalar loads aren't merged)
+@group(0) @binding(6) var<storage, read> prims : array<vec4<u32>>;
+@group(0) @binding(7) var<storage, read> states : array<vec4<u32>>;
 
 const PRIM_WORDS = 28u;
 const STATE_WORDS = 40u;
@@ -624,21 +642,18 @@ const PRIM_POINT = 3u;
 
 const TILE_SIZE = ${this.drawConfig.tile}u;   // tile = workgroup = TILE_SIZE x TILE_SIZE pixels
 const GROUP_SIZE = ${this.drawConfig.tile ** 2}u;
-const PRIM_CACHE = ${this.drawConfig.primCache};
-const PIXEL_CACHE = ${this.drawConfig.pixelCache};
-const EXIT = ${this.drawConfig.exit ?? 0}u; // profiling: stop shading at stage EXIT (0 = full)
 
 // Features used by a batch (CGSH_WebGPU::DRAW_FEATURE_*): pipelines are specialized per combination so that
 // the unused paths are compiled out (the shader is big; registers decide the speed). All on = any batch.
 ${this.drawFeatures.map((f) => `override ${f} : bool = true;`).join("\n")}
 
-// The tile's primitives of the current chunk, copied to workgroup memory.
-var<workgroup> primCache : array<u32, ${this.drawConfig.primCache ? this.drawConfig.tile ** 2 * 28 : 1}>;
+// The tile's primitives of the current chunk and their coverage of the tile (bit y * TILE_SIZE + x).
+var<workgroup> chunkPrims : array<u32, ${this.drawConfig.tile ** 2}>;
+var<workgroup> chunkMasks : array<array<u32, ${this.drawConfig.tile ** 2 / 32}>, ${this.drawConfig.tile ** 2}>;
 
-// Word k of primitive p (slot of the chunk when PRIM_CACHE, primitive index otherwise)
+// Word k of primitive p
 fn pw(p : u32, k : u32) -> u32 {
-	if(PRIM_CACHE) { return primCache[p * PRIM_WORDS + k]; }
-	return prims[p * PRIM_WORDS + k];
+	return prims[p * (PRIM_WORDS / 4u) + k / 4u][k % 4u];
 }
 
 // Frame/depth buffer value of the invocation's pixel, kept for the whole batch: within a batch only this
@@ -651,7 +666,8 @@ struct PixelCache {
 	flags : u32,   // 1: fb loaded, 2: z loaded, 4: fb written, 8: z written
 };
 
-fn sw(s : u32, i : u32) -> u32 { return states[s + i]; }
+// Word i of the state at s (= state index * STATE_WORDS / 4)
+fn sw(s : u32, i : u32) -> u32 { return states[s + i / 4u][i % 4u]; }
 fn bits(v : u32, first : u32, count : u32) -> u32 { return extractBits(v, first, count); }
 
 // Edge function (b - a) x (s - a) in 1/16 pixel units. Exact when it fits in 31 bits; beyond that only
@@ -724,9 +740,7 @@ fn texelColor(s : u32, raw : u32) -> vec4<f32> {
 			if((cpsm == PSMCT16) || (cpsm == PSMCT16S)) {
 				return expand16(clut[clutBase + (index & 511u)], tcc, aem, ta0, ta1);
 			}
-			let lo = clut[clutBase + (index & 0xFFu)];
-			let hi = clut[clutBase + (index & 0xFFu) + 256u];
-			return unpackColor(lo | (hi << 16u));
+			return unpackColor(clut[clutBase + (index & 0xFFu)]);
 		}
 	}
 }
@@ -797,12 +811,146 @@ fn readFramePixel(psm : u32, a : u32) -> u32 {
 	}
 }
 
-fn shade(p : u32, px : u32, py : u32, cache : ptr<function, PixelCache>) {
-	if(!PIXEL_CACHE) { (*cache).flags = 0u; }
+// Whether primitive p (index in prims) covers pixel (px, py): same tests as shade(), used to build the
+// tile's coverage masks.
+fn covers(p : u32, px : u32, py : u32) -> bool {
 	let bboxMin = pw(p, 26u);
 	let bboxMax = pw(p, 27u);
-	if((px < (bboxMin & 0xFFFFu)) || (py < (bboxMin >> 16u)) || (px > (bboxMax & 0xFFFFu)) || (py > (bboxMax >> 16u))) { return; }
-	if(EXIT == 1u) { return; }
+	if((px < (bboxMin & 0xFFFFu)) || (py < (bboxMin >> 16u)) || (px > (bboxMax & 0xFFFFu)) || (py > (bboxMax >> 16u))) { return false; }
+	let sx = i32(px) * 16;
+	let sy = i32(py) * 16;
+	let x0 = bitcast<i32>(pw(p, 0u));
+	let y0 = bitcast<i32>(pw(p, 1u));
+	let x1 = bitcast<i32>(pw(p, 8u));
+	let y1 = bitcast<i32>(pw(p, 9u));
+	switch(pw(p, 24u)) {
+		case 0u: {
+			let x2 = bitcast<i32>(pw(p, 16u));
+			let y2 = bitcast<i32>(pw(p, 17u));
+			let area = f32(x1 - x0) * f32(y2 - y0) - f32(y1 - y0) * f32(x2 - x0);
+			if(area == 0.0) { return false; }
+			let o = select(-1, 1, area > 0.0);
+			return edgeCovers(o * edgeFunction(x2 - x1, y2 - y1, sx - x1, sy - y1), o * (x2 - x1), o * (y2 - y1)) &&
+			       edgeCovers(o * edgeFunction(x0 - x2, y0 - y2, sx - x2, sy - y2), o * (x0 - x2), o * (y0 - y2)) &&
+			       edgeCovers(o * edgeFunction(x1 - x0, y1 - y0, sx - x0, sy - y0), o * (x1 - x0), o * (y1 - y0));
+		}
+		case 1u: {
+			return (sx >= min(x0, x1)) && (sx < max(x0, x1)) && (sy >= min(y0, y1)) && (sy < max(y0, y1));
+		}
+		case 2u: {
+			let dx = x1 - x0;
+			let dy = y1 - y0;
+			if(abs(dx) >= abs(dy)) {
+				if((sx < min(x0, x1)) || (sx >= max(x0, x1))) { return false; }
+				let ly = f32(y0) + f32(sx - x0) / f32(dx) * f32(dy);
+				return i32(floor((ly + 8.0) / 16.0)) == i32(py);
+			}
+			if((sy < min(y0, y1)) || (sy >= max(y0, y1))) { return false; }
+			let lx = f32(x0) + f32(sy - y0) / f32(dy) * f32(dx);
+			return i32(floor((lx + 8.0) / 16.0)) == i32(px);
+		}
+		default: { return true; }
+	}
+}
+
+// Edge setup for the tile's coverage mask: value at the tile's first pixel, steps per pixel, threshold
+// (top-left rule: e >= 0 on top/left edges, e > 0 otherwise). Far edges (beyond 2^30) don't change sign
+// within a tile: their steps are 0.
+struct TileEdge {
+	e : i32,
+	stepX : i32,
+	stepY : i32,
+	bias : i32,
+};
+
+fn tileEdge(o : i32, dx : i32, dy : i32, sx : i32, sy : i32) -> TileEdge {
+	var r : TileEdge;
+	let ox = o * dx;
+	let oy = o * dy;
+	r.e = o * edgeFunction(dx, dy, sx, sy);
+	r.stepX = -oy * 16;
+	r.stepY = ox * 16;
+	if(abs(r.e) == 1 && (abs(f32(dx) * f32(sy) - f32(dy) * f32(sx)) > 1073741824.0)) {
+		r.e = r.e << 30u;
+		r.stepX = 0;
+		r.stepY = 0;
+	}
+	r.bias = select(1, 0, (oy < 0) || ((oy == 0) && (ox > 0)));
+	return r;
+}
+
+// Coverage of the tile at (tileX, tileY) by primitive p: bit (y * TILE_SIZE + x) of word bit / 32.
+fn coverageMask(p : u32, tileX : u32, tileY : u32) -> array<u32, ${Math.max(this.drawConfig.tile ** 2 / 32, 1)}> {
+	var mask : array<u32, ${Math.max(this.drawConfig.tile ** 2 / 32, 1)}>;
+	let bboxMin = pw(p, 26u);
+	let bboxMax = pw(p, 27u);
+	// Rows and columns of the tile inside the bounding box
+	let c0 = i32(max(bboxMin & 0xFFFFu, tileX)) - i32(tileX);
+	let c1 = i32(min(bboxMax & 0xFFFFu, tileX + TILE_SIZE - 1u)) - i32(tileX);
+	let r0 = i32(max(bboxMin >> 16u, tileY)) - i32(tileY);
+	let r1 = i32(min(bboxMax >> 16u, tileY + TILE_SIZE - 1u)) - i32(tileY);
+	if((c0 > c1) || (r0 > r1)) { return mask; }
+	let rowBits = ((2u << u32(c1)) - 1u) & ~((1u << u32(c0)) - 1u);
+	let primType = pw(p, 24u);
+	if(primType == PRIM_TRIANGLE) {
+		let x0 = bitcast<i32>(pw(p, 0u));
+		let y0 = bitcast<i32>(pw(p, 1u));
+		let x1 = bitcast<i32>(pw(p, 8u));
+		let y1 = bitcast<i32>(pw(p, 9u));
+		let x2 = bitcast<i32>(pw(p, 16u));
+		let y2 = bitcast<i32>(pw(p, 17u));
+		let area = f32(x1 - x0) * f32(y2 - y0) - f32(y1 - y0) * f32(x2 - x0);
+		if(area == 0.0) { return mask; }
+		let o = select(-1, 1, area > 0.0);
+		let sx = i32(tileX) * 16;
+		let sy = i32(tileY) * 16;
+		let e0 = tileEdge(o, x2 - x1, y2 - y1, sx - x1, sy - y1);
+		let e1 = tileEdge(o, x0 - x2, y0 - y2, sx - x2, sy - y2);
+		let e2 = tileEdge(o, x1 - x0, y1 - y0, sx - x0, sy - y0);
+		for(var r = r0; r <= r1; r++) {
+			var a = e0.e + e0.stepY * r + e0.stepX * c0;
+			var bb = e1.e + e1.stepY * r + e1.stepX * c0;
+			var c = e2.e + e2.stepY * r + e2.stepX * c0;
+			// Edge values are linear along the row: whole row in or out when both ends agree
+			let aEnd = a + e0.stepX * (c1 - c0);
+			let bEnd = bb + e1.stepX * (c1 - c0);
+			let cEnd = c + e2.stepX * (c1 - c0);
+			var bits = 0u;
+			if((min(a, aEnd) >= e0.bias) && (min(bb, bEnd) >= e1.bias) && (min(c, cEnd) >= e2.bias)) {
+				bits = rowBits;
+			} else if((max(a, aEnd) >= e0.bias) && (max(bb, bEnd) >= e1.bias) && (max(c, cEnd) >= e2.bias)) {
+				for(var col = c0; col <= c1; col++) {
+					if((a >= e0.bias) && (bb >= e1.bias) && (c >= e2.bias)) { bits |= 1u << u32(col); }
+					a += e0.stepX;
+					bb += e1.stepX;
+					c += e2.stepX;
+				}
+			}
+			let bit = u32(r) * TILE_SIZE;
+			mask[bit >> 5u] |= bits << (bit & 31u);
+		}
+		return mask;
+	}
+	if(primType == PRIM_SPRITE) {
+		// covers() checks the exact sprite bounds; the bounding box is already exact for sprites
+		for(var r = r0; r <= r1; r++) {
+			let bit = u32(r) * TILE_SIZE;
+			mask[bit >> 5u] |= rowBits << (bit & 31u);
+		}
+		return mask;
+	}
+	for(var r = r0; r <= r1; r++) {
+		for(var col = c0; col <= c1; col++) {
+			if(covers(p, tileX + u32(col), tileY + u32(r))) {
+				let bit = u32(r) * TILE_SIZE + u32(col);
+				mask[bit >> 5u] |= 1u << (bit & 31u);
+			}
+		}
+	}
+	return mask;
+}
+
+fn shade(p : u32, px : u32, py : u32, cache : ptr<function, PixelCache>) {
 	let primType = pw(p, 24u);
 	let sx = i32(px) * 16;
 	let sy = i32(py) * 16;
@@ -811,7 +959,7 @@ fn shade(p : u32, px : u32, py : u32, cache : ptr<function, PixelCache>) {
 	let x1 = bitcast<i32>(pw(p, 8u));
 	let y1 = bitcast<i32>(pw(p, 9u));
 
-	// Weights of vertex 1 and 2 (vertex 0 gets the rest).
+	// Weights of vertex 1 and 2 (vertex 0 gets the rest). The pixel is covered (coverageMask).
 	var w = vec2<f32>(0.0);
 	switch(primType) {
 		case 0u: {
@@ -819,20 +967,14 @@ fn shade(p : u32, px : u32, py : u32, cache : ptr<function, PixelCache>) {
 			let x2 = bitcast<i32>(pw(p, 16u));
 			let y2 = bitcast<i32>(pw(p, 17u));
 			let area = f32(x1 - x0) * f32(y2 - y0) - f32(y1 - y0) * f32(x2 - x0);
-			if(area == 0.0) { return; }
 			let o = select(-1, 1, area > 0.0);
-			let e0 = o * edgeFunction(x2 - x1, y2 - y1, sx - x1, sy - y1);
 			let e1 = o * edgeFunction(x0 - x2, y0 - y2, sx - x2, sy - y2);
 			let e2 = o * edgeFunction(x1 - x0, y1 - y0, sx - x0, sy - y0);
-			if(!edgeCovers(e0, o * (x2 - x1), o * (y2 - y1)) ||
-			   !edgeCovers(e1, o * (x0 - x2), o * (y0 - y2)) ||
-			   !edgeCovers(e2, o * (x1 - x0), o * (y1 - y0))) { return; }
 			let absArea = abs(area);
 			w = vec2<f32>(f32(e1), f32(e2)) / absArea;
 		}
 		case 1u: {
 			if(!F_SPRITE) { return; }
-			if((sx < min(x0, x1)) || (sx >= max(x0, x1)) || (sy < min(y0, y1)) || (sy >= max(y0, y1))) { return; }
 			w = vec2<f32>(f32(sx - x0) / f32(x1 - x0), f32(sy - y0) / f32(y1 - y0));
 		}
 		case 2u: {
@@ -840,26 +982,78 @@ fn shade(p : u32, px : u32, py : u32, cache : ptr<function, PixelCache>) {
 			let dx = x1 - x0;
 			let dy = y1 - y0;
 			if(abs(dx) >= abs(dy)) {
-				if((sx < min(x0, x1)) || (sx >= max(x0, x1))) { return; }
-				let t = f32(sx - x0) / f32(dx);
-				let ly = f32(y0) + t * f32(dy);
-				if(i32(floor((ly + 8.0) / 16.0)) != i32(py)) { return; }
-				w = vec2<f32>(t, 0.0);
+				w = vec2<f32>(f32(sx - x0) / f32(dx), 0.0);
 			} else {
-				if((sy < min(y0, y1)) || (sy >= max(y0, y1))) { return; }
-				let t = f32(sy - y0) / f32(dy);
-				let lx = f32(x0) + t * f32(dx);
-				if(i32(floor((lx + 8.0) / 16.0)) != i32(px)) { return; }
-				w = vec2<f32>(t, 0.0);
+				w = vec2<f32>(f32(sy - y0) / f32(dy), 0.0);
 			}
 		}
 		default: { }
 	}
 
-	if(EXIT == 2u) { (*cache).fb = px; (*cache).flags |= 4u; return; }
-	// Attributes
+	let s = pw(p, 25u) * (STATE_WORDS / 4u);
+	let flags0 = sw(s, 0u);
+	let flags1 = sw(s, 1u);
+	let fbPsm = param(0u);
+	let zbPsm = param(3u);
+
+	// Tests that don't depend on the source color come first (scan mask, depth test, DATE): a fragment failing
+	// them is dropped whatever the alpha test gives, and its texturing is skipped.
+	let scanMask = bits(flags0, 13u, 2u);
+	if(((scanMask == 2u) && ((py & 1u) == 0u)) || ((scanMask == 3u) && ((py & 1u) != 0u))) { return; }
+	let depthTest = bits(flags0, 26u, 2u);
+	if(depthTest == 0u) { return; }
+
+	// Depth
 	let z0 = pw(p, 2u);
 	var z = z0;
+	if((primType == PRIM_TRIANGLE) || (primType == PRIM_LINE)) {
+		var dz = f32(bitcast<i32>(pw(p, 10u) - z0)) * w.x;
+		if(primType == PRIM_TRIANGLE) {
+			dz += f32(bitcast<i32>(pw(p, 18u) - z0)) * w.y;
+		}
+		z = z0 + u32(i32(round(dz)));
+	}
+	var srcDepth = z;
+	switch(zbPsm) {
+		case 0x31u: { srcDepth = min(z, 0xFFFFFFu); }
+		case 0x32u, 0x3Au: { srcDepth = min(z, 0xFFFFu); }
+		default: { }
+	}
+	if(F_DEPTHTEST && (depthTest >= 2u)) {
+		if(((*cache).flags & 2u) == 0u) {
+			switch(zbPsm) {
+				case 0x31u: { (*cache).z = read24((*cache).zbAddress); }
+				case 0x32u, 0x3Au: { (*cache).z = read16((*cache).zbAddress); }
+				default: { (*cache).z = read32((*cache).zbAddress); }
+			}
+			(*cache).flags |= 2u;
+		}
+		var dstDepth = (*cache).z;
+		if((param(1u) == param(4u)) && (((*cache).flags & 4u) != 0u)) {
+			// Depth buffer = frame buffer (depth writes are off then): see the colors written in this batch
+			dstDepth = (*cache).fb;
+			if(zbPsm == PSMZ24) { dstDepth &= 0xFFFFFFu; }
+		}
+		if((depthTest == 2u) && (srcDepth < dstDepth)) { return; }
+		if((depthTest == 3u) && (srcDepth <= dstDepth)) { return; }
+	}
+
+	let is16 = (fbPsm == PSMCT16) || (fbPsm == PSMCT16S) || (fbPsm == PSMZ16S);
+	let is24 = (fbPsm == PSMCT24) || (fbPsm == PSMZ24) || (fbPsm == PSMCT24_UNK);
+	if(((*cache).flags & 1u) == 0u) {
+		(*cache).fb = readFramePixel(fbPsm, (*cache).fbAddress);
+		(*cache).flags |= 1u;
+	}
+	let dstPixel = (*cache).fb;
+
+	// Destination alpha test (DATE)
+	if(F_DATE && (bits(flags1, 2u, 1u) != 0u)) {
+		var alphaBit = (dstPixel & 0x80000000u) != 0u;
+		if(is16) { alphaBit = (dstPixel & 0x8000u) != 0u; }
+		if(!is24 && (alphaBit != (bits(flags1, 3u, 1u) != 0u))) { return; }
+	}
+
+	// Other attributes
 	var color = unpackColor(pw(p, 3u));
 	var st = vec2<f32>(bitcast<f32>(pw(p, 4u)), bitcast<f32>(pw(p, 5u)));
 	var q = bitcast<f32>(pw(p, 6u));
@@ -872,8 +1066,6 @@ fn shade(p : u32, px : u32, py : u32, cache : ptr<function, PixelCache>) {
 		let st1 = vec2<f32>(bitcast<f32>(pw(p, 12u)), bitcast<f32>(pw(p, 13u)));
 		let q1 = bitcast<f32>(pw(p, 14u));
 		let f1 = bitcast<f32>(pw(p, 15u));
-		let dz1 = f32(bitcast<i32>(pw(p, 10u) - z0));
-		var dz = dz1 * w.x;
 		var c = color + (c1 - color) * w.x;
 		var stv = st + (st1 - st) * w.x;
 		var qv = q + (q1 - q) * w.x;
@@ -883,23 +1075,16 @@ fn shade(p : u32, px : u32, py : u32, cache : ptr<function, PixelCache>) {
 			let st2 = vec2<f32>(bitcast<f32>(pw(p, 20u)), bitcast<f32>(pw(p, 21u)));
 			let q2 = bitcast<f32>(pw(p, 22u));
 			let f2 = bitcast<f32>(pw(p, 23u));
-			dz += f32(bitcast<i32>(pw(p, 18u) - z0)) * w.y;
 			c += (c2 - color) * w.y;
 			stv += (st2 - st) * w.y;
 			qv += (q2 - q) * w.y;
 			fv += (f2 - fog) * w.y;
 		}
-		z = z0 + u32(i32(round(dz)));
 		color = c;
 		st = stv;
 		q = qv;
 		fog = fv;
 	}
-
-	if(EXIT == 3u) { (*cache).fb = z ^ bitcast<u32>(st.x + q + fog + color.x); (*cache).flags |= 4u; return; }
-	let s = pw(p, 25u) * STATE_WORDS;
-	let flags0 = sw(s, 0u);
-	let flags1 = sw(s, 1u);
 
 	// Texture function (TFX), in integers like the GS: (Ct * Cf) >> 7
 	var src = vec4<i32>(clamp(color, vec4<f32>(0.0), vec4<f32>(255.0)));
@@ -927,7 +1112,6 @@ fn shade(p : u32, px : u32, py : u32, cache : ptr<function, PixelCache>) {
 		}
 		src = vec4<i32>(rgb, a);
 	}
-	if(EXIT == 4u) { (*cache).fb = u32(src.x); (*cache).flags |= 4u; return; }
 	if(F_FOG && (bits(flags0, 11u, 1u) != 0u)) {
 		let f = i32(clamp(fog, 0.0, 255.0));
 		let fogColor = vec3<i32>(i32(sw(s, 20u) & 0xFFu), i32((sw(s, 20u) >> 8u) & 0xFFu), i32((sw(s, 20u) >> 16u) & 0xFFu));
@@ -937,9 +1121,6 @@ fn shade(p : u32, px : u32, py : u32, cache : ptr<function, PixelCache>) {
 	var writeColor = true;
 	var writeDepth = F_DEPTHWRITE && (bits(flags0, 12u, 1u) != 0u);
 	var writeAlpha = true;
-
-	let scanMask = bits(flags0, 13u, 2u);
-	if(((scanMask == 2u) && ((py & 1u) == 0u)) || ((scanMask == 3u) && ((py & 1u) != 0u))) { return; }
 
 	// Alpha test
 	let alphaTest = select(1u, bits(flags0, 28u, 3u), F_ALPHATEST);
@@ -964,58 +1145,12 @@ fn shade(p : u32, px : u32, py : u32, cache : ptr<function, PixelCache>) {
 		}
 	}
 
-	let fbPsm = param(0u);
-	let zbPsm = param(3u);
-
-	let is16 = (fbPsm == PSMCT16) || (fbPsm == PSMCT16S) || (fbPsm == PSMZ16S);
-	let is24 = (fbPsm == PSMCT24) || (fbPsm == PSMZ24) || (fbPsm == PSMCT24_UNK);
-	if(((*cache).flags & 1u) == 0u) {
-		(*cache).fb = readFramePixel(fbPsm, (*cache).fbAddress);
-		(*cache).flags |= 1u;
-	}
-	let dstPixel = (*cache).fb;
 	var dst : vec4<i32>;
 	if(is16) {
 		dst = vec4<i32>(i32((dstPixel & 0x1Fu) << 3u), i32(((dstPixel >> 5u) & 0x1Fu) << 3u), i32(((dstPixel >> 10u) & 0x1Fu) << 3u), select(0, 0x80, (dstPixel & 0x8000u) != 0u));
 	} else {
 		dst = vec4<i32>(unpackColor(dstPixel));
 		if(is24) { dst.a = 0x80; }
-	}
-
-	if(EXIT == 5u) { (*cache).fb = dstPixel ^ u32(src.x); (*cache).flags |= 4u; return; }
-	// Destination alpha test (DATE)
-	if(F_DATE && (bits(flags1, 2u, 1u) != 0u)) {
-		var alphaBit = (dstPixel & 0x80000000u) != 0u;
-		if(is16) { alphaBit = (dstPixel & 0x8000u) != 0u; }
-		if(!is24 && (alphaBit != (bits(flags1, 3u, 1u) != 0u))) { return; }
-	}
-
-	// Depth test
-	var srcDepth = z;
-	switch(zbPsm) {
-		case 0x31u: { srcDepth = min(z, 0xFFFFFFu); }
-		case 0x32u, 0x3Au: { srcDepth = min(z, 0xFFFFu); }
-		default: { }
-	}
-	let depthTest = bits(flags0, 26u, 2u);
-	if(depthTest == 0u) { return; }
-	if(F_DEPTHTEST && (depthTest >= 2u)) {
-		if(((*cache).flags & 2u) == 0u) {
-			switch(zbPsm) {
-				case 0x31u: { (*cache).z = read24((*cache).zbAddress); }
-				case 0x32u, 0x3Au: { (*cache).z = read16((*cache).zbAddress); }
-				default: { (*cache).z = read32((*cache).zbAddress); }
-			}
-			(*cache).flags |= 2u;
-		}
-		var dstDepth = (*cache).z;
-		if((param(1u) == param(4u)) && (((*cache).flags & 4u) != 0u)) {
-			// Depth buffer = frame buffer (depth writes are off then): see the colors written in this batch
-			dstDepth = (*cache).fb;
-			if(zbPsm == PSMZ24) { dstDepth &= 0xFFFFFFu; }
-		}
-		if((depthTest == 2u) && (srcDepth < dstDepth)) { return; }
-		if((depthTest == 3u) && (srcDepth <= dstDepth)) { return; }
 	}
 
 	// Alpha blending: ((A - B) * C >> 7) + D
@@ -1057,7 +1192,6 @@ fn shade(p : u32, px : u32, py : u32, cache : ptr<function, PixelCache>) {
 		(*cache).z = srcDepth;
 		(*cache).flags |= 10u;
 	}
-	if(!PIXEL_CACHE) { writeBackPixel(cache); }
 }
 
 fn writeBackPixel(cache : ptr<function, PixelCache>) {
@@ -1081,13 +1215,21 @@ fn writeBackPixel(cache : ptr<function, PixelCache>) {
 // One workgroup per tile of the batch's bounding box. CGSH_WebGPU::FlushBatch bins the primitives: the tile's
 // list (in drawing order) is upload[binEntries + upload[binOffsets + tile] .. upload[binOffsets + tile + 1]].
 // Each invocation (= one pixel) shades the tile's primitives in order.
-// P: fbPsm, fbAddress, fbWidth, zbPsm, zbAddress, -, -, originX, originY, maxX, maxY, tilesX, binOffsets, binEntries
-@compute @workgroup_size(${this.drawConfig.tile}, ${this.drawConfig.tile})
-fn draw(@builtin(local_invocation_id) lid : vec3<u32>, @builtin(local_invocation_index) li : u32,
-        @builtin(workgroup_id) wid : vec3<u32>) {
-	let px = param(7u) + wid.x * TILE_SIZE + lid.x;
-	let py = param(8u) + wid.y * TILE_SIZE + lid.y;
-	let tile = wid.y * param(11u) + wid.x;
+// Workgroup i (row-major over a 32768-wide grid) draws tile upload[tileOrder + i] (non-empty tiles, longest lists first).
+// P: fbPsm, fbAddress, fbWidth, zbPsm, zbAddress, -, -, originX, originY, maxX, maxY, tilesX, binOffsets, binEntries,
+// tileOrder, tile count
+// Invocations are mapped to 4 x 4 pixel blocks (16 consecutive invocations = one SIMD16 thread on Intel): small
+// primitives cover fewer threads than with rows of pixels.
+@compute @workgroup_size(${this.drawConfig.tile ** 2})
+fn draw(@builtin(local_invocation_index) li : u32, @builtin(workgroup_id) wid : vec3<u32>) {
+	let lid = vec2<u32>((li & 3u) | ((li >> 2u) & 4u), ((li >> 2u) & 3u) | ((li >> 3u) & 4u)); // 8 x 8 tile
+	let index = wid.y * 32768u + wid.x;
+	if(index >= param(15u)) { return; }
+	let tile = upload[param(14u) + index];
+	let tileX = param(7u) + (tile % param(11u)) * TILE_SIZE;
+	let tileY = param(8u) + (tile / param(11u)) * TILE_SIZE;
+	let px = tileX + lid.x;
+	let py = tileY + lid.y;
 	let begin = upload[param(12u) + tile];
 	let end = upload[param(12u) + tile + 1u];
 	let entries = param(13u);
@@ -1097,23 +1239,22 @@ fn draw(@builtin(local_invocation_id) lid : vec3<u32>, @builtin(local_invocation
 	cache.fbAddress = pixelAddress(fbPsm, param(1u), param(2u), px, py);
 	cache.zbAddress = pixelAddress(zbPsm, param(4u), param(2u), px, py);
 	cache.flags = 0u;
+	let bit = lid.y * TILE_SIZE + lid.x;
 	for(var chunk = begin; chunk < end; chunk += GROUP_SIZE) {
 		let count = min(GROUP_SIZE, end - chunk);
-		if(PRIM_CACHE) {
-			if(li < count) {
-				let b = upload[entries + chunk + li] * PRIM_WORDS;
-				for(var w = 0u; w < PRIM_WORDS; w++) { primCache[li * PRIM_WORDS + w] = prims[b + w]; }
-			}
-			workgroupBarrier();
+		// Each invocation computes the coverage mask of one primitive over the whole tile...
+		if(li < count) {
+			let p = upload[entries + chunk + li];
+			chunkPrims[li] = p;
+			chunkMasks[li] = coverageMask(p, tileX, tileY);
 		}
+		workgroupBarrier();
+		// ...then each invocation shades the primitives covering its pixel, in order.
 		for(var k = 0u; k < count; k++) {
-			if(PRIM_CACHE) {
-				shade(k, px, py, &cache);
-			} else {
-				shade(upload[entries + chunk + k], px, py, &cache);
-			}
+			if((chunkMasks[k][bit >> 5u] & (1u << (bit & 31u))) == 0u) { continue; }
+			shade(chunkPrims[k], px, py, &cache);
 		}
-		if(PRIM_CACHE) { workgroupBarrier(); }
+		workgroupBarrier();
 	}
 	writeBackPixel(&cache);
 }

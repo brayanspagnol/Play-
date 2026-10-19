@@ -59,6 +59,7 @@ public:
 		OP_DISPATCH = 4,           //pipeline, paramsOffset, groupsX, groupsY, groupsZ
 		OP_PRESENT = 5,            //paramsOffset, layerCount
 		OP_READBACK = 6,           //memoryOffset, size, heap pointer
+		OP_UPLOAD_TO_CLUT = 7,     //uploadOffset, clutOffset, size
 	};
 
 	enum PIPELINE : uint32
@@ -75,6 +76,9 @@ public:
 		PRIM_WORDS = 28,  //3 x (x, y (12.4, offset applied), z, rgba, s, t, q, fog), type, state, bbox min, bbox max
 		STATE_WORDS = 40, //see SetRenderingContext
 		DRAW_TILE_SIZE = 8, //pixels per side of a draw shader tile (workgroup), see GsWgpu.drawConfig.tile
+		SUBMIT_PRIMS = 8192, //command lists are submitted when they hold this many primitives (and at flips)
+		DRAW_GROUPS_PER_ROW = 32768, //draw dispatches are 2D past this many workgroups (WebGPU limit 65535 per dimension)
+		CPU_BLOCK_SIZE = 256, //granularity of m_cpuValid
 	};
 
 	//Features of a draw batch, the draw shader is specialized for them (GsWgpu.drawFeatures)
@@ -122,7 +126,10 @@ private:
 	enum
 	{
 		CLUT_CACHE_SIZE = 32,
+		CLUT_SLOTS = 1024, //GsWgpu.CLUT_BUFFER_SIZE / (CLUTENTRYCOUNT * 4)
 		PARAMS_SIZE = 256,
+		MAX_PENDING_XFERS = 64,
+		XFER_WORDS = 9,
 	};
 
 	struct VERTEX_DATA
@@ -160,6 +167,10 @@ private:
 	void Prim_Sprite();
 	void AddPrim(PRIM_TYPE, const VERTEX_DATA*, uint32 vertexCount);
 	void FlushBatch();
+	void FlushTransfers();
+	bool BatchAccesses(uint32, uint32) const;
+	bool LoadClutFromCpu(uint32, const TEX0&, const TEXCLUT&);
+	void InvalidateCpuMemory(uint32, uint32);
 	void CopyMemoryForTexture();
 	void CheckSpriteCachedClutInvalidation(const CGsSpriteRect&);
 
@@ -175,7 +186,7 @@ private:
 	int32 FindCachedClut(const CLUTKEY&) const;
 	void ClearClutCache();
 	static CLUTKEY MakeCachedClutKey(const TEX0&, const TEXCLUT&);
-	void DoClutLoad(uint32 clutIndex, const TEX0&, const TEXCLUT&);
+	uint32 DoClutLoad(const TEX0&, const TEXCLUT&);
 
 	int m_width = 0;
 	int m_height = 0;
@@ -189,11 +200,30 @@ private:
 
 	std::vector<uint8> m_xferBuffer;
 
+public:
+	struct PENDING_XFER
+	{
+		uint32 psm, bufAddress, bufWidth, rrw, dsax, dsay, dataOffset, pixelCount, firstGroup;
+		uint32 start, end; //destination memory range
+		uint32 rrh;
+	};
+private:
+	void WriteCpuMemory(const PENDING_XFER&, uint32);
+	std::vector<PENDING_XFER> m_pendingXfers;
+
+	std::vector<uint8> m_cpuValid; //per CPU_BLOCK_SIZE bytes: m_memoryCache matches GPU memory there
+	std::vector<uint32> m_clutUploads; //CLUTs built on the CPU: slot, then CLUTENTRYCOUNT entries
+	uint32 m_pendingXferGroups = 0;
+	std::vector<uint8> m_pendingXferBlocks; //per CPU_BLOCK_SIZE bytes: written by a pending transfer
+	std::vector<uint32> m_xferBlocks;
+
 	CLUTKEY m_clutStates[CLUT_CACHE_SIZE];
+	uint32 m_clutSlots[CLUT_CACHE_SIZE] = {}; //slot of the CLUT ring holding each cached CLUT
+	uint32 m_nextClutSlot = 0;
 	uint32 m_nextClutCacheIndex = 0;
 	uint32 m_lastClutFillCacheIndex = -1;
 	uint32 m_lastClutFillPointer = 0;
-	uint32 m_clutIndex = 0;
+	uint32 m_clutIndex = 0; //slot used by the next draws
 
 	//Draw context (as GSH_Vulkan)
 	VERTEX m_vtxBuffer[3];
@@ -219,9 +249,14 @@ private:
 	std::vector<uint32> m_prims;
 	std::vector<uint32> m_states;
 	std::vector<uint32> m_binOffsets;
+	std::vector<uint32> m_tileOrder;
 	uint32 m_state[STATE_WORDS] = {};
 	int32 m_stateIndex = -1; //index of m_state in m_states, -1 when not stored yet
 	uint32 m_stateFeatures = 0; //DRAW_FEATURE_* used by m_state
+	uint32 m_stateReadStart = 0; //memory read by m_state's texture
+	uint32 m_stateReadEnd = 0;
+	bool m_stateInBatch = false; //m_state's reads are in m_batchReads
+	std::vector<std::pair<uint32, uint32>> m_batchReads;
 	BATCH m_batch;
 	bool m_memoryCopyActive = false;
 	uint32 m_memoryCopyAddress = 0;
