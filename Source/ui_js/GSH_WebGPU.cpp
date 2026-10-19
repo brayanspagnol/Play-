@@ -1243,16 +1243,24 @@ void CGSH_WebGPU::SetRenderingContext(uint64 primReg)
 		state[STATE_CLAMP + 3] = clamp.GetMaxV();
 		state[STATE_CLUT_BASE] = CGsPixelFormats::IsPsmIDTEX(tex0.nPsm) ? m_clutIndex * CLUTENTRYCOUNT : 0;
 
-		//Sprites sampling the buffer they draw to read a copy of the memory (GSH_Vulkan's textureUseMemoryCopy)
-		if(m_primitiveType == PRIM_SPRITE)
+		//Primitives sampling the buffer they draw to read a copy of the memory (GSH_Vulkan's textureUseMemoryCopy,
+		//there for sprites only: other primitives rely on fragment interlock there; here they would race with the
+		//writes of other tiles)
 		{
+			//Texture vs the frame/depth buffer area this state writes (an upper byte texture under a 24-bit buffer is
+			//never written)
+			uint32 texStart = tex0.GetBufPtr();
+			uint32 texEnd = texStart + AreaSize(tex0.nPsm, tex0.GetBufWidth(), tex0.GetHeight());
+			uint32 height = scissor.scay1 + 1;
 			uint32 frameBufPtr = frame.GetBasePtr();
 			uint32 depthBufPtr = zbuf.GetBasePtr();
 			bool isTexUpperBytePsm = CGsPixelFormats::IsPsmUpperByte(tex0.nPsm);
-			needsTextureCopy |= (tex0.GetBufPtr() == frameBufPtr) && !(isTexUpperBytePsm && CGsPixelFormats::IsPsm24Bits(frame.nPsm));
+			needsTextureCopy |= RangesOverlap(texStart, texEnd, frameBufPtr, frameBufPtr + AreaSize(frame.nPsm, frame.GetWidth(), height)) &&
+			                    !(isTexUpperBytePsm && CGsPixelFormats::IsPsm24Bits(frame.nPsm));
 			if(writeDepth)
 			{
-				needsTextureCopy |= (tex0.GetBufPtr() == depthBufPtr) && !(isTexUpperBytePsm && CGsPixelFormats::IsPsm24Bits(zbuf.nPsm));
+				needsTextureCopy |= RangesOverlap(texStart, texEnd, depthBufPtr, depthBufPtr + AreaSize(zbuf.nPsm | 0x30, frame.GetWidth(), height)) &&
+				                    !(isTexUpperBytePsm && CGsPixelFormats::IsPsm24Bits(zbuf.nPsm));
 			}
 			if(needsTextureCopy)
 			{
@@ -1311,13 +1319,22 @@ void CGSH_WebGPU::SetRenderingContext(uint64 primReg)
 		m_batch.writeStart = m_batch.writeEnd = m_batch.fbAddress;
 		m_batch.zbWriteStart = m_batch.zbWriteEnd = m_batch.zbAddress;
 	}
-	//Memory this state can write (grows with the scissor)
+	//Memory this state can write (grows with the scissor). If the batch's earlier primitives read textures there,
+	//later primitives writing it would race with those reads (other tiles): start a new batch.
 	uint32 height = scissor.scay1 + 1;
-	m_batch.writeEnd = std::max(m_batch.writeEnd, m_batch.fbAddress + AreaSize(fbPsm, frame.GetWidth(), height));
-	if(writeDepth)
+	uint32 writeEnd = std::max(m_batch.writeEnd, m_batch.fbAddress + AreaSize(fbPsm, frame.GetWidth(), height));
+	uint32 zbWriteEnd = writeDepth ? std::max(m_batch.zbWriteEnd, m_batch.zbAddress + AreaSize(zbPsm, frame.GetWidth(), height)) : m_batch.zbWriteEnd;
+	auto readsOverlap = [&](uint32 start, uint32 end) {
+		return std::any_of(m_batchReads.begin(), m_batchReads.end(),
+		                   [&](const auto& range) { return RangesOverlap(start, end, range.first, range.second); });
+	};
+	if(((writeEnd != m_batch.writeEnd) && readsOverlap(m_batch.writeStart, writeEnd)) ||
+	   ((zbWriteEnd != m_batch.zbWriteEnd) && readsOverlap(m_batch.zbWriteStart, zbWriteEnd)))
 	{
-		m_batch.zbWriteEnd = std::max(m_batch.zbWriteEnd, m_batch.zbAddress + AreaSize(zbPsm, frame.GetWidth(), height));
+		FlushBatch();
 	}
+	m_batch.writeEnd = std::max(m_batch.writeEnd, writeEnd);
+	m_batch.zbWriteEnd = std::max(m_batch.zbWriteEnd, zbWriteEnd);
 
 	if(memcmp(state, m_state, sizeof(state)) != 0)
 	{

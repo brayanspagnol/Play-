@@ -1091,7 +1091,14 @@ fn shade(p : u32, px : u32, py : u32, cache : ptr<function, PixelCache>) {
 
 	let is16 = (fbPsm == PSMCT16) || (fbPsm == PSMCT16S) || (fbPsm == PSMZ16S);
 	let is24 = (fbPsm == PSMCT24) || (fbPsm == PSMZ24) || (fbPsm == PSMCT24_UNK);
-	if(((*cache).flags & 1u) == 0u) {
+	// The frame buffer value is only read when the result depends on it (DATE, blending, alpha test keeping
+	// the destination alpha, partial write mask, 24-bit: the alpha byte stays); otherwise the write replaces the
+	// whole pixel.
+	let writeMask = sw(s, 16u);
+	let needDst = (F_DATE && (bits(flags1, 2u, 1u) != 0u)) || (F_BLEND && (bits(flags0, 15u, 1u) != 0u)) ||
+	              (F_ALPHATEST && (bits(flags1, 0u, 2u) == 3u)) ||
+	              is24 || (writeMask != select(0xFFFFFFFFu, 0xFFFFu, is16));
+	if(needDst && (((*cache).flags & 1u) == 0u)) {
 		(*cache).fb = readFramePixel(fbPsm, (*cache).fbAddress);
 		(*cache).flags |= 1u;
 	}
@@ -1234,10 +1241,9 @@ fn shade(p : u32, px : u32, py : u32, cache : ptr<function, PixelCache>) {
 		} else {
 			pixel = u32(outColor.r) | (u32(outColor.g) << 8u) | (u32(outColor.b) << 16u) | (u32(outColor.a) << 24u);
 		}
-		let writeMask = sw(s, 16u);
 		pixel = (pixel & writeMask) | (dstPixel & ~writeMask);
 		(*cache).fb = pixel;
-		(*cache).flags |= 4u;
+		(*cache).flags |= 5u; // written, and now known
 	}
 	if(writeDepth) {
 		(*cache).z = srcDepth;
