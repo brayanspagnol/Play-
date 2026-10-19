@@ -30,6 +30,7 @@ CVu1Thread::CVu1Thread(CVpu& vpu, CVif& vif, CGIF& gif)
 
 CVu1Thread::~CVu1Thread()
 {
+	DropOverflow();
 	{
 		std::lock_guard lock(m_mutex);
 		m_quit = true;
@@ -74,9 +75,12 @@ uint8* CVu1Thread::Reserve(uint32 payloadSize)
 #endif
 		CTimelineTimer timer(TLT_RINGFULL);
 		std::unique_lock lock(m_mutex);
+		//A consumer stalled on everything published waits for the VM thread (SIGNAL ack): waiting here would deadlock
+		auto stuck = [&]() { return m_idle && m_stalled && (m_stalledPublishedPos == m_publishedPos); };
 		m_producerWaiting = true;
-		m_idleCondition.wait(lock, [&]() { return (RING_SIZE - (m_writePos - m_readPos)) >= needed; });
+		m_idleCondition.wait(lock, [&]() { return ((RING_SIZE - (m_writePos - m_readPos)) >= needed) || stuck(); });
 		m_producerWaiting = false;
+		if((RING_SIZE - (m_writePos - m_readPos)) < needed) return nullptr;
 	}
 	if(wrap)
 	{
@@ -103,33 +107,75 @@ void CVu1Thread::Commit(const MESSAGE_HEADER& header)
 	}
 }
 
+void CVu1Thread::Push(const MESSAGE_HEADER& header, const void* payload)
+{
+	FlushOverflow();
+	if(m_overflow.empty())
+	{
+		if(auto message = Reserve(header.size))
+		{
+			if(header.size != 0) memcpy(message + sizeof(MESSAGE_HEADER), payload, header.size);
+			Commit(header);
+			return;
+		}
+	}
+	//ponytail: unbounded while the stall lasts; stalling the VIF1/GIF DMAs (like hardware) would bound it
+	std::vector<uint8> message(sizeof(MESSAGE_HEADER) + header.size);
+	memcpy(message.data(), &header, sizeof(MESSAGE_HEADER));
+	if(header.size != 0) memcpy(message.data() + sizeof(MESSAGE_HEADER), payload, header.size);
+	m_overflow.push_back(std::move(message));
+}
+
+void CVu1Thread::FlushOverflow()
+{
+	while(!m_overflow.empty())
+	{
+		auto& message = m_overflow.front();
+		MESSAGE_HEADER header;
+		memcpy(&header, message.data(), sizeof(MESSAGE_HEADER));
+		auto dst = Reserve(header.size);
+		if(!dst) return;
+		if(header.size != 0) memcpy(dst + sizeof(MESSAGE_HEADER), message.data() + sizeof(MESSAGE_HEADER), header.size);
+		Commit(header);
+		m_overflow.pop_front();
+	}
+}
+
+void CVu1Thread::DropOverflow()
+{
+	for(const auto& message : m_overflow)
+	{
+		MESSAGE_HEADER header;
+		memcpy(&header, message.data(), sizeof(MESSAGE_HEADER));
+		if(header.type != MESSAGE_FUNCTION) continue;
+		FunctionType* function = nullptr;
+		memcpy(&function, message.data() + sizeof(MESSAGE_HEADER), sizeof(function));
+		delete function;
+	}
+	m_overflow.clear();
+}
+
 void CVu1Thread::PushVifData(const uint8* data, uint32 size, bool tagIncluded)
 {
-	auto message = Reserve(size);
-	memcpy(message + sizeof(MESSAGE_HEADER), data, size);
-	Commit({MESSAGE_VIFDATA, size, tagIncluded ? 1U : 0U, 0});
+	Push({MESSAGE_VIFDATA, size, tagIncluded ? 1U : 0U, 0}, data);
 }
 
 void CVu1Thread::PushPath3(const uint8* data, uint32 size)
 {
 	//VIF1 data consumed before this transfer started goes first
 	if(m_flushHandler) m_flushHandler();
-	auto message = Reserve(size);
-	memcpy(message + sizeof(MESSAGE_HEADER), data, size);
-	Commit({MESSAGE_PATH3, size, 0, 0});
+	Push({MESSAGE_PATH3, size, 0, 0}, data);
 }
 
 void CVu1Thread::PushStartMicroProgram(uint32 address)
 {
-	Reserve(0);
-	Commit({MESSAGE_STARTMICRO, 0, address, 0});
+	Push({MESSAGE_STARTMICRO, 0, address, 0}, nullptr);
 }
 
 void CVu1Thread::PushFunction(FunctionType function)
 {
-	auto message = Reserve(sizeof(FunctionType*));
-	*reinterpret_cast<FunctionType**>(message + sizeof(MESSAGE_HEADER)) = new FunctionType(std::move(function));
-	Commit({MESSAGE_FUNCTION, sizeof(FunctionType*), 0, 0});
+	auto pointer = new FunctionType(std::move(function));
+	Push({MESSAGE_FUNCTION, sizeof(FunctionType*), 0, 0}, &pointer);
 }
 
 void CVu1Thread::RunSync(FunctionType function)
@@ -145,24 +191,51 @@ void CVu1Thread::RunSync(FunctionType function)
 void CVu1Thread::Sync(SYNC_REASON reason)
 {
 	if(m_flushHandler) m_flushHandler();
-	std::unique_lock lock(m_mutex);
-	auto isDone = [&]() {
-		uint64 published = m_publishedPos;
-		return m_idle && ((m_readPos == published) || (m_stalled && (m_stalledPublishedPos == published)));
-	};
-	if(isDone()) return;
-	PROFILE_COUNT(PCNT_VU1_SYNC, 1);
+	while(true)
+	{
+		FlushOverflow();
+		std::unique_lock lock(m_mutex);
+		auto isDone = [&]() {
+			uint64 published = m_publishedPos;
+			return m_idle && ((m_readPos == published) || (m_stalled && (m_stalledPublishedPos == published)));
+		};
+		if(!isDone())
+		{
+			PROFILE_COUNT(PCNT_VU1_SYNC, 1);
 #ifdef PROFILE
-	static const char* const zoneNames[SYNC_MAX] = {"SYNC_OTHER", "SYNC_VBLANK", "SYNC_GIFFIFO", "SYNC_GSREAD", "SYNC_VU1MEM", "SYNC_VU1REG", "SYNC_ROW"};
-	CProfilerZone profilerZone(CProfiler::GetInstance().RegisterZone(zoneNames[reason]));
+			static const char* const zoneNames[SYNC_MAX] = {"SYNC_OTHER", "SYNC_VBLANK", "SYNC_GIFFIFO", "SYNC_GSREAD", "SYNC_VU1MEM", "SYNC_VU1REG", "SYNC_ROW"};
+			CProfilerZone profilerZone(CProfiler::GetInstance().RegisterZone(zoneNames[reason]));
 #endif
-	CTimelineTimer timer(TLT_VU1SYNC);
-	m_idleCondition.wait(lock, isDone);
+			CTimelineTimer timer(TLT_VU1SYNC);
+			m_idleCondition.wait(lock, isDone);
+		}
+		//Idle with overflow left: the ring is empty now, push it
+		if(m_overflow.empty() || m_stalled) return;
+	}
+}
+
+bool CVu1Thread::IsDrained()
+{
+	Sync();
+	std::lock_guard lock(m_mutex);
+	return m_overflow.empty() && !m_stalled && (m_readPos == m_publishedPos);
+}
+
+void CVu1Thread::Wake()
+{
+	std::lock_guard lock(m_mutex);
+	m_wakeRequested = true;
+	if(!m_stalled) return;
+	//Sync must wait for the retry
+	m_stalled = false;
+	m_idle = false;
+	m_workCondition.notify_one();
 }
 
 void CVu1Thread::WaitFor(const std::function<bool()>& done, SYNC_REASON reason)
 {
 	if(done()) return;
+	FlushOverflow();
 	std::unique_lock lock(m_mutex);
 	auto isDone = [&]() {
 		uint64 published = m_publishedPos;
@@ -189,6 +262,7 @@ std::unique_lock<std::mutex> CVu1Thread::SyncAndLockGif(SYNC_REASON reason)
 void CVu1Thread::SyncAndDiscard()
 {
 	Sync();
+	DropOverflow();
 	std::unique_lock lock(m_mutex);
 	m_discard = true;
 	m_workCondition.notify_all();
@@ -265,13 +339,14 @@ void CVu1Thread::SleepStalled(std::unique_lock<std::mutex>& lock, uint64 publish
 	m_stalledPublishedPos = published;
 	m_idleCondition.notify_all();
 	m_sleeping = true;
-	if(m_publishedPos == published)
 	{
 #ifdef PROFILE
 		CProfilerZone profilerZone(CProfiler::GetInstance().RegisterZone("STALLED"));
 #endif
-		m_workCondition.wait_for(lock, std::chrono::milliseconds(1));
+		//No timed retry: resuming on its own would race with what the VM thread does after Sync returned
+		m_workCondition.wait(lock, [&]() { return m_quit || m_discard || m_wakeRequested || (m_publishedPos != published); });
 	}
+	m_wakeRequested = false;
 	m_sleeping = false;
 }
 
@@ -307,6 +382,7 @@ void CVu1Thread::ThreadProc()
 			}
 			m_currentStarted = false;
 			m_path3Queue.clear();
+			m_stalled = false;
 			m_discard = false;
 			m_idleCondition.notify_all();
 			continue;

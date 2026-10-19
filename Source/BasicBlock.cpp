@@ -180,7 +180,7 @@ void CBasicBlock::Compile()
 		cacheKey.hints = m_blockCompileHints;
 		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000) | (IsSuperBlock() ? 0x20000000 : 0) | (UsesBlockChaining() ? 0x10000000 : 0) | ((g_jitPageAccess != ~0U) ? (0x08000000 | (g_jitPageAccess & 0x3FF)) : 0);
 		cacheKey.hash[0] = xxHash.low64;
-		cacheKey.hash[1] = xxHash.high64;
+		cacheKey.hash[1] = xxHash.high64 ^ BlockCache::CODEGEN_VERSION;
 
 		thread_local std::vector<uint8> cachedCode;
 		if(BlockCache::Find(cacheKey, cachedCode))

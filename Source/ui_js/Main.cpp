@@ -561,14 +561,15 @@ int stateStatus()
 }
 
 //VU1 on its own thread (on by default), applied at the next vblank
-//GS renderer workarounds by name (bench/debug switch). "gowShuffle": see CGSH_OpenGL::IsUnsupportedChannelShuffleWrite.
+//GS renderer options by name (bench/debug switch). "fbAlias" (on by default): PSMCT16 draws over
+//PSMCT32 frame buffers, destination alpha test and unclamped additive blend, see CGSH_OpenGL::SyncFramebufferAlias.
 bool setGsHack(std::string name, bool enabled)
 {
 	if(g_gsWebGpu) return false;
 	auto gs = static_cast<CGSH_OpenGLJs*>(g_virtualMachine->GetGSHandler());
-	if(name == "gowShuffle")
+	if(name == "fbAlias")
 	{
-		gs->SetChannelShuffleHack(enabled);
+		gs->SetFramebufferAliasing(enabled);
 		return true;
 	}
 	return false;

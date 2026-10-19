@@ -185,6 +185,8 @@ CSubSystem::~CSubSystem()
 {
 	if(m_vu1Thread)
 	{
+		//Stalled data would never let the function below run
+		m_vu1Thread->SyncAndDiscard();
 		//Destroy the VU1 thread's executor on its thread
 		m_vu1Thread->RunSync([this]() {
 			if(m_vu1Threaded)
@@ -688,6 +690,8 @@ uint32 CSubSystem::IOPortWriteHandler(uint32 nAddress, uint32 nData)
 		if(m_gs != NULL)
 		{
 			m_gs->WritePrivRegister(nAddress, nData);
+			//CSR write may acknowledge the SIGNAL a stalled VU1 thread waits for
+			if(m_vu1Threaded) m_vu1Thread->Wake();
 		}
 	}
 	else
@@ -834,6 +838,11 @@ void CSubSystem::SyncVu1(CVu1Thread::SYNC_REASON reason)
 	if(m_vu1Threaded) m_vu1Thread->Sync(reason);
 }
 
+bool CSubSystem::IsVu1Drained()
+{
+	return !m_vu1Threaded || m_vu1Thread->IsDrained();
+}
+
 void CSubSystem::WaitVu1(const std::function<bool()>& done, CVu1Thread::SYNC_REASON reason)
 {
 	if(m_vu1Threaded) m_vu1Thread->WaitFor(done, reason);
@@ -902,7 +911,8 @@ bool CSubSystem::SetVu1Threaded(bool threaded)
 	}
 	else
 	{
-		m_vu1Thread->Sync();
+		//Data left in the ring (VU1 stalled on the GIF) must go through the back first: try again later
+		if(!m_vu1Thread->IsDrained()) return false;
 		static_cast<CVuExecutor*>(m_vu1InactiveExecutor.get())->DropBlocks();
 		SwapVu1Executors();
 		frontVif.CopyRowFrom(*m_vif1Back);
