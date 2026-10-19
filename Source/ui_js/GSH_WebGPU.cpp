@@ -212,8 +212,12 @@ bool CGSH_WebGPU::Flush()
 	m_upload.clear();
 	m_prims.clear();
 	m_states.clear();
+	m_stateAreas.clear();
+	m_stateFormats.clear();
 	m_stateIndex = -1;
 	m_batch.primStart = 0;
+	m_batch.stateStart = 0;
+	m_decodeTexels = 0;
 	return gpuBusy;
 }
 
@@ -933,6 +937,7 @@ enum
 	STATE_MIP_L = 22,
 	STATE_MIP_K = 23,
 	STATE_MIP_BUFS = 24, //(address, width) x 6
+	STATE_TEX_DECODED = 36, //1 + offset of the decoded texture in the decoded texture buffer, 0: not decoded
 };
 
 enum
@@ -1640,7 +1645,10 @@ void CGSH_WebGPU::AddPrim(PRIM_TYPE type, const VERTEX_DATA* vertices, uint32 ve
 	{
 		m_stateIndex = m_states.size() / STATE_WORDS;
 		m_states.insert(m_states.end(), std::begin(m_state), std::end(m_state));
+		m_stateAreas.push_back(0);
+		m_stateFormats.push_back(m_stateFeatures & DRAW_FEATURE_TEXFORMATS);
 	}
+	m_stateAreas[m_stateIndex] += static_cast<uint64>(maxX - minX + 1) * (maxY - minY + 1);
 	if(!m_stateInBatch)
 	{
 		m_stateInBatch = true;
@@ -1770,6 +1778,8 @@ void CGSH_WebGPU::FlushBatch()
 		}
 	}
 
+	DecodeBatchTextures();
+
 	uint32 paramsOffset = 0;
 	auto params = AllocParams(paramsOffset);
 	params[0] = m_batch.fbPsm;
@@ -1794,6 +1804,9 @@ void CGSH_WebGPU::FlushBatch()
 	m_drawCallCount++;
 
 	m_batch.primStart = primEnd;
+	//Next primitives get new state records (their decoded textures are the next batch's)
+	m_batch.stateStart = m_states.size() / STATE_WORDS;
+	m_stateIndex = -1;
 	m_batch.minX = m_batch.minY = ~0U;
 	m_batch.maxX = m_batch.maxY = 0;
 	m_batch.features = 0;
@@ -1804,4 +1817,77 @@ void CGSH_WebGPU::FlushBatch()
 	{
 		Flush();
 	}
+}
+
+//Textures the batch reads a lot are decoded first, by a dispatch before the draw: texels as 32-bit colors (CLUT and
+//TEXA applied) in the decoded texture buffer, where the draw shader reads them with one load instead of swizzle table,
+//GS memory and CLUT reads. The batch can't write them (see SetRenderingContext), so they stay valid for its whole
+//dispatch. Only level 0 of repeat/clamp textures read from GS memory (their coordinates stay in the texture).
+void CGSH_WebGPU::DecodeBatchTextures()
+{
+	if(!(m_batch.features & DRAW_FEATURE_TEXTURE)) return;
+	static const uint32 keyWords[] = {STATE_TEX_PSM, STATE_CLUT_PSM, STATE_TEX_BUFADDR, STATE_TEX_BUFWIDTH, STATE_TEX_WIDTH,
+	                                  STATE_TEX_HEIGHT, STATE_TEX_CSA, STATE_TEX_A0, STATE_TEX_A1, STATE_CLUT_BASE};
+	struct TEXTURE
+	{
+		uint32 state; //first state record using it
+		uint64 area;  //bounding box area of the primitives using it
+		uint32 offset;
+	};
+	std::vector<TEXTURE> textures;
+	uint32 stateEnd = m_states.size() / STATE_WORDS;
+	std::vector<int32> stateTexture(stateEnd - m_batch.stateStart, -1);
+	auto sameTexture = [&](const uint32* a, const uint32* b) {
+		if(((a[STATE_FLAGS0] ^ b[STATE_FLAGS0]) & (1 << 2)) != 0) return false; //AEM
+		return std::all_of(std::begin(keyWords), std::end(keyWords), [&](uint32 w) { return a[w] == b[w]; });
+	};
+	for(uint32 i = m_batch.stateStart; i < stateEnd; i++)
+	{
+		const uint32* state = m_states.data() + i * STATE_WORDS;
+		uint32 flags0 = state[STATE_FLAGS0];
+		bool decodable = (flags0 & 1) && !(flags0 & (1 << 6)) && (state[STATE_TEX_MIPLEVEL] == 0) &&
+		                 (((flags0 >> 7) & 3) <= 1) && (((flags0 >> 9) & 3) <= 1) && !(state[STATE_FLAGS1] & FLAGS1_MEMORY_COPY);
+		if(!decodable) continue;
+		auto texture = std::find_if(textures.begin(), textures.end(),
+		                            [&](const TEXTURE& t) { return sameTexture(m_states.data() + t.state * STATE_WORDS, state); });
+		if(texture == textures.end())
+		{
+			texture = textures.insert(textures.end(), {i, 0, 0});
+		}
+		texture->area += m_stateAreas[i];
+		stateTexture[i - m_batch.stateStart] = texture - textures.begin();
+	}
+	//Worth it when the primitives cover more pixels than the texture has texels
+	uint32 jobCount = 0;
+	uint32 groups = 0;
+	m_decodeJobs.clear();
+	for(auto& texture : textures)
+	{
+		const uint32* state = m_states.data() + texture.state * STATE_WORDS;
+		uint32 texels = state[STATE_TEX_WIDTH] * state[STATE_TEX_HEIGHT];
+		if((texture.area < texels) || ((m_decodeTexels + texels) > TEX_DECODE_TEXELS)) continue;
+		texture.offset = m_decodeTexels + 1;
+		m_decodeTexels += texels;
+		m_decodeJobs.insert(m_decodeJobs.end(), {texture.state, texture.offset - 1, state[STATE_TEX_WIDTH], texels, groups});
+		groups += (texels + 255) / 256;
+		jobCount++;
+	}
+	if(jobCount == 0) return;
+	uint32 formats = 0;
+	for(uint32 i = m_batch.stateStart; i < stateEnd; i++)
+	{
+		int32 texture = stateTexture[i - m_batch.stateStart];
+		uint32 offset = (texture >= 0) ? textures[texture].offset : 0;
+		m_states[i * STATE_WORDS + STATE_TEX_DECODED] = offset;
+		if(offset == 0) formats |= m_stateFormats[i];
+	}
+	m_batch.features = (m_batch.features & ~DRAW_FEATURE_TEXFORMATS) | formats | DRAW_FEATURE_TEXDECODED;
+
+	uint32 tableOffset = AllocUpload(m_decodeJobs.size() * sizeof(uint32), 4);
+	memcpy(m_upload.data() + tableOffset, m_decodeJobs.data(), m_decodeJobs.size() * sizeof(uint32));
+	uint32 paramsOffset = 0;
+	auto params = AllocParams(paramsOffset);
+	params[0] = jobCount;
+	params[1] = tableOffset / 4;
+	Dispatch(PIPELINE_TEX_DECODE, paramsOffset, groups);
 }

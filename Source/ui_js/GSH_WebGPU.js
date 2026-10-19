@@ -17,21 +17,23 @@ var GsWgpu = {
 	RAMSIZE: 0x400000,
 	CLUT_BUFFER_SIZE: 1024 * 512 * 4, // CGSH_WebGPU::CLUT_SLOTS slots
 	SWIZZLE_TABLES_SIZE: 45056 * 4,
+	TEX_DECODE_SIZE: 0x400000 * 4, // CGSH_WebGPU::TEX_DECODE_TEXELS
 	PARAMS_SIZE: 256,
 
 	device: null,
 	errorCount: 0,
 	debug: 0,
 	// Per-interval counters, logged every 2 s when debug is set (CGSH_WebGPU::SetDebug)
-	stats: { frames: 0, executes: 0, batches: 0, prims: 0, uploadBytes: 0, gpuNs: 0, gpuPasses: 0, gpuExecutes: 0, jsMs: 0, since: 0 },
+	stats: { frames: 0, executes: 0, batches: 0, prims: 0, uploadBytes: 0, gpuNs: 0, gpuPasses: 0, gpuExecutes: 0, jsMs: 0, waitMs: 0, since: 0 },
 	MAX_TIMED_PASSES: 512,
 	MAX_FRAMES_IN_FLIGHT: 2,
 	// Draw shader variant: tile = workgroup side in pixels.
 	// Bit i of a draw's feature mask (CGSH_WebGPU::DRAW_FEATURE_*) = override constant drawFeatures[i]
 	drawFeatures: ["F_TEXTURE", "F_LINEAR", "F_MIPLOD", "F_CLUT32", "F_MEMCOPY", "F_BLEND", "F_FOG", "F_ALPHATEST",
 		"F_DATE", "F_DEPTHTEST", "F_DEPTHWRITE", "F_TRIANGLE", "F_SPRITE", "F_LINE", "F_TEX32", "F_TEX16", "F_TEX8", "F_TEX4",
-		"F_CLUT16"],
-	drawConfig: { tile: 8 }, // tile must match CGSH_WebGPU::DRAW_TILE_SIZE
+		"F_CLUT16", "F_TEXDEC"],
+	// tile must match CGSH_WebGPU::DRAW_TILE_SIZE; noDecode (debug, A/B): ignore the decoded textures
+	drawConfig: { tile: 8, noDecode: false },
 	framesInFlight: 0,
 	waitingForGpu: false,
 
@@ -80,6 +82,7 @@ var GsWgpu = {
 		this.clut = d.createBuffer({ label: "CLUT", size: this.CLUT_BUFFER_SIZE, usage: B.STORAGE | B.COPY_SRC | B.COPY_DST });
 		this.swizzle = d.createBuffer({ label: "Swizzle tables", size: this.SWIZZLE_TABLES_SIZE, usage: B.STORAGE | B.COPY_SRC | B.COPY_DST });
 		this.readback = d.createBuffer({ label: "Readback", size: this.RAMSIZE, usage: B.MAP_READ | B.COPY_DST });
+		this.texCache = d.createBuffer({ label: "Decoded textures", size: this.TEX_DECODE_SIZE, usage: B.STORAGE });
 
 		const S = GPUShaderStage;
 		this.computeLayout = d.createBindGroupLayout({
@@ -92,6 +95,7 @@ var GsWgpu = {
 				{ binding: 5, visibility: S.COMPUTE, buffer: { type: "uniform", hasDynamicOffset: true } },
 				{ binding: 6, visibility: S.COMPUTE, buffer: { type: "read-only-storage" } },
 				{ binding: 7, visibility: S.COMPUTE, buffer: { type: "read-only-storage" } },
+				{ binding: 8, visibility: S.COMPUTE, buffer: { type: "storage" } },
 			],
 		});
 		this.presentLayout = d.createBindGroupLayout({
@@ -106,7 +110,7 @@ var GsWgpu = {
 		const computePipelineLayout = this.computePipelineLayout = d.createPipelineLayout({ bindGroupLayouts: [this.computeLayout] });
 		this.drawPipelines = new Map();
 		// Index = CGSH_WebGPU::PIPELINE
-		this.computePipelines = ["xferHost", "xferLocal", "clutLoad", "draw"].map((entryPoint) =>
+		this.computePipelines = ["xferHost", "xferLocal", "clutLoad", "draw", "texDecode"].map((entryPoint) =>
 			d.createComputePipeline({ label: entryPoint, layout: computePipelineLayout, compute: { module: computeModule, entryPoint } }));
 
 		this.format = navigator.gpu.getPreferredCanvasFormat();
@@ -140,6 +144,7 @@ var GsWgpu = {
 	// Upload arena, primitives and states of a command list; grown (and the bind groups remade) on demand.
 	// Draw pipeline specialized for a feature mask, compiled in the background; the general one meanwhile.
 	drawPipeline(features) {
+		if (this.drawConfig.noDecode) features = (features | 0x7C008) & ~(1 << 19); // all texture formats, no TEXDECODED
 		const pipeline = this.drawPipelines.get(features);
 		if (pipeline) return pipeline;
 		if (pipeline === undefined && this.drawConfig.specialize !== false) {
@@ -177,6 +182,7 @@ var GsWgpu = {
 				{ binding: 5, resource: { buffer: this.upload, size: this.PARAMS_SIZE } },
 				{ binding: 6, resource: { buffer: this.prims } },
 				{ binding: 7, resource: { buffer: this.states } },
+				{ binding: 8, resource: { buffer: this.texCache } },
 			],
 		});
 		this.presentBindGroup = this.device.createBindGroup({
@@ -253,6 +259,9 @@ var GsWgpu = {
 				if ((cmds[i + 1] & 0xFF) === 3) {
 					st.batches++;
 					if (this.debug & 4) { i += 6; break; } // debug: skip draws (CPU-bound speed)
+				} else if (cmds[i + 1] === 4 && this.drawConfig.noDecode) {
+					i += 6;
+					break;
 				}
 				pass.setPipeline((cmds[i + 1] & 0xFF) === 3 ? this.drawPipeline(cmds[i + 1] >>> 8) : this.computePipelines[cmds[i + 1]]);
 				pass.setBindGroup(0, this.computeBindGroup, [cmds[i + 2]]);
@@ -323,11 +332,13 @@ var GsWgpu = {
 				this.framesInFlight--;
 				if (this.waitingForGpu && this.framesInFlight < this.MAX_FRAMES_IN_FLIGHT) {
 					this.waitingForGpu = false;
+					st.waitMs += performance.now() - this.waitStart;
 					this.callWasm(this.resumeFn, this.gs);
 				}
 			});
 			if (this.framesInFlight >= this.MAX_FRAMES_IN_FLIGHT && !readback) {
 				this.waitingForGpu = true;
+				this.waitStart = performance.now();
 				gpuBusy = 1;
 			}
 		}
@@ -335,8 +346,8 @@ var GsWgpu = {
 		st.jsMs += now - executeStart;
 		if (this.debug && now - st.since > 2000) {
 			const f = Math.max(st.frames, 1);
-			console.log(`GSH_WebGPU: ${(st.frames * 1000 / (now - st.since)).toFixed(1)} frames/s, per frame: ${(st.executes / f).toFixed(1)} submits, ${(st.batches / f).toFixed(0)} batches, ${(st.prims / f).toFixed(0)} prims, ${(st.uploadBytes / f / 1024).toFixed(0)} KB, JS ${(st.jsMs / f).toFixed(1)} ms, compute GPU ${(st.gpuNs / 1e6 / Math.max(st.gpuExecutes, 1)).toFixed(2)} ms per submit (${st.gpuExecutes} sampled)`);
-			Object.assign(st, { frames: 0, executes: 0, batches: 0, prims: 0, uploadBytes: 0, gpuNs: 0, gpuPasses: 0, gpuExecutes: 0, jsMs: 0, since: now });
+			console.log(`GSH_WebGPU: ${(st.frames * 1000 / (now - st.since)).toFixed(1)} frames/s, per frame: ${(st.executes / f).toFixed(1)} submits, ${(st.batches / f).toFixed(0)} batches, ${(st.prims / f).toFixed(0)} prims, ${(st.uploadBytes / f / 1024).toFixed(0)} KB, JS ${(st.jsMs / f).toFixed(1)} ms, waiting for the GPU ${(st.waitMs / f).toFixed(1)} ms, compute GPU ${(st.gpuNs / 1e6 / Math.max(st.gpuExecutes, 1)).toFixed(2)} ms per submit (${st.gpuExecutes} sampled)`);
+			Object.assign(st, { frames: 0, executes: 0, batches: 0, prims: 0, uploadBytes: 0, gpuNs: 0, gpuPasses: 0, gpuExecutes: 0, jsMs: 0, waitMs: 0, since: now });
 		}
 		if (presented && this.capture?.submits && !this.capture.finishing) this.finishCapture();
 		this.lastExecutePresented = presented;
@@ -656,6 +667,9 @@ fn clutLoad(@builtin(local_invocation_index) li : u32) {
 // Primitives and states as vec4s: one load per 4 words (separately bounds-checked scalar loads aren't merged)
 @group(0) @binding(6) var<storage, read> prims : array<vec4<u32>>;
 @group(0) @binding(7) var<storage, read> states : array<vec4<u32>>;
+// Decoded textures (texDecode): 32-bit colors, rows of the texture's width
+@group(0) @binding(8) var<storage, read_write> texCache : array<u32>;
+const TEX_DECODE_MASK = ${this.TEX_DECODE_SIZE / 4 - 1}u;
 
 const PRIM_WORDS = 28u;
 const STATE_WORDS = 40u;
@@ -810,6 +824,10 @@ fn fetchTexel(s : u32, iuv : vec2<i32>, level : u32, bufAddress : u32, bufWidth 
 	let size = vec2<i32>(i32(sw(s, 6u)), i32(sw(s, 7u)));
 	let u = clampTexCoord(bits(flags0, 7u, 2u), iuv.x, size.x, i32(sw(s, 12u)), i32(sw(s, 14u)));
 	let v = clampTexCoord(bits(flags0, 9u, 2u), iuv.y, size.y, i32(sw(s, 13u)), i32(sw(s, 15u)));
+	if(F_TEXDEC) {
+		let decoded = sw(s, 36u); // STATE_TEX_DECODED (level 0, repeat or clamp: u, v are in the texture)
+		if(decoded != 0u) { return unpackColor(texCache[(decoded - 1u + u32(v) * u32(size.x) + u32(u)) & TEX_DECODE_MASK]); }
+	}
 	let fromCopy = bits(sw(s, 1u), 4u, 1u) != 0u;
 	let raw = readTexel(fromCopy, sw(s, 2u), bufAddress, bufWidth, u32(u) >> level, u32(v) >> level);
 	return texelColor(s, raw);
@@ -930,6 +948,22 @@ fn tileEdge(o : i32, dx : i32, dy : i32, sx : i32, sy : i32) -> TileEdge {
 	return r;
 }
 
+// Columns of row r of the tile inside the edge (bit c: e + stepY * r + stepX * c >= bias). The edge value is linear along
+// the row, so the columns inside are the ones past a threshold: estimated in floats, then made exact with the integer
+// values on both sides of it (the estimate is off by less than one column whenever the threshold is in the tile).
+fn edgeColumns(edge : TileEdge, r : i32) -> u32 {
+	let a = edge.e + edge.stepY * r;
+	if(edge.stepX == 0) { return select(0u, 0xFFFFFFFFu, a >= edge.bias); }
+	var c = i32(clamp(ceil((f32(edge.bias) - f32(a)) / f32(edge.stepX)), -1.0, f32(TILE_SIZE)));
+	// c = first column inside (stepX > 0) or first column outside (stepX < 0)
+	let inside = edge.stepX > 0;
+	if((a + edge.stepX * (c - 1) >= edge.bias) == inside) { c -= 1; }
+	if((a + edge.stepX * c >= edge.bias) != inside) { c += 1; }
+	c = clamp(c, 0, i32(TILE_SIZE));
+	let below = (1u << u32(c)) - 1u; // columns before c
+	return select(below, ~below, inside);
+}
+
 // Coverage of the tile at (tileX, tileY) by primitive p: bit (y * TILE_SIZE + x) of word bit / 32.
 fn coverageMask(p : u32, tileX : u32, tileY : u32) -> array<u32, ${Math.max(this.drawConfig.tile ** 2 / 32, 1)}> {
 	var mask : array<u32, ${Math.max(this.drawConfig.tile ** 2 / 32, 1)}>;
@@ -959,24 +993,7 @@ fn coverageMask(p : u32, tileX : u32, tileY : u32) -> array<u32, ${Math.max(this
 		let e1 = tileEdge(o, x0 - x2, y0 - y2, sx - x2, sy - y2);
 		let e2 = tileEdge(o, x1 - x0, y1 - y0, sx - x0, sy - y0);
 		for(var r = r0; r <= r1; r++) {
-			var a = e0.e + e0.stepY * r + e0.stepX * c0;
-			var bb = e1.e + e1.stepY * r + e1.stepX * c0;
-			var c = e2.e + e2.stepY * r + e2.stepX * c0;
-			// Edge values are linear along the row: whole row in or out when both ends agree
-			let aEnd = a + e0.stepX * (c1 - c0);
-			let bEnd = bb + e1.stepX * (c1 - c0);
-			let cEnd = c + e2.stepX * (c1 - c0);
-			var bits = 0u;
-			if((min(a, aEnd) >= e0.bias) && (min(bb, bEnd) >= e1.bias) && (min(c, cEnd) >= e2.bias)) {
-				bits = rowBits;
-			} else if((max(a, aEnd) >= e0.bias) && (max(bb, bEnd) >= e1.bias) && (max(c, cEnd) >= e2.bias)) {
-				for(var col = c0; col <= c1; col++) {
-					if((a >= e0.bias) && (bb >= e1.bias) && (c >= e2.bias)) { bits |= 1u << u32(col); }
-					a += e0.stepX;
-					bb += e1.stepX;
-					c += e2.stepX;
-				}
-			}
+			let bits = rowBits & edgeColumns(e0, r) & edgeColumns(e1, r) & edgeColumns(e2, r);
 			let bit = u32(r) * TILE_SIZE;
 			mask[bit >> 5u] |= bits << (bit & 31u);
 		}
@@ -1314,6 +1331,28 @@ fn draw(@builtin(local_invocation_index) li : u32, @builtin(workgroup_id) wid : 
 		workgroupBarrier();
 	}
 	writeBackPixel(&cache);
+}
+
+
+// Texture decoding (CGSH_WebGPU::DecodeBatchTextures): one invocation per texel. P = job count, table (per job: state
+// index, offset in texCache, width, texel count, first workgroup).
+@compute @workgroup_size(256)
+fn texDecode(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_index) li : u32) {
+	let count = param(0u);
+	let table = param(1u);
+	var t = 0u;
+	var hi = count - 1u;
+	while(t < hi) {
+		let mid = (t + hi + 1u) >> 1u;
+		if(upload[table + mid * 5u + 4u] <= wid.x) { t = mid; } else { hi = mid - 1u; }
+	}
+	let job = table + t * 5u;
+	let i = (wid.x - upload[job + 4u]) * 256u + li;
+	if(i >= upload[job + 3u]) { return; }
+	let width = upload[job + 2u];
+	let s = upload[job] * (STATE_WORDS / 4u);
+	let c = vec4<u32>(texelColor(s, readTexel(false, sw(s, 2u), sw(s, 4u), sw(s, 5u), i % width, i / width)));
+	texCache[(upload[job + 1u] + i) & TEX_DECODE_MASK] = c.r | (c.g << 8u) | (c.b << 16u) | (c.a << 24u);
 }
 `;
 	},

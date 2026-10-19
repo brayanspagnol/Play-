@@ -68,6 +68,7 @@ public:
 		PIPELINE_XFER_LOCAL = 1,
 		PIPELINE_CLUT_LOAD = 2,
 		PIPELINE_DRAW = 3,
+		PIPELINE_TEX_DECODE = 4,
 	};
 
 	//Layouts shared with the draw shader (GSH_WebGPU.js)
@@ -79,6 +80,7 @@ public:
 		SUBMIT_PRIMS = 8192, //command lists are submitted when they hold this many primitives (and at flips)
 		DRAW_GROUPS_PER_ROW = 32768, //draw dispatches are 2D past this many workgroups (WebGPU limit 65535 per dimension)
 		CPU_BLOCK_SIZE = 256, //granularity of m_cpuValid
+		TEX_DECODE_TEXELS = 0x400000, //size of the decoded texture buffer in texels (GsWgpu.TEX_DECODE_SIZE / 4)
 	};
 
 	//Features of a draw batch, the draw shader is specialized for them (GsWgpu.drawFeatures)
@@ -104,6 +106,11 @@ public:
 		DRAW_FEATURE_TEX8 = 1 << 16,
 		DRAW_FEATURE_TEX4 = 1 << 17,
 		DRAW_FEATURE_CLUT16 = 1 << 18,
+		//Some of the batch's textures are read decoded (see DecodeBatchTextures); the texture format bits above are then
+		//only those of the textures read from GS memory
+		DRAW_FEATURE_TEXDECODED = 1 << 19,
+		DRAW_FEATURE_TEXFORMATS = DRAW_FEATURE_CLUT32 | DRAW_FEATURE_TEX32 | DRAW_FEATURE_TEX16 | DRAW_FEATURE_TEX8 |
+		                          DRAW_FEATURE_TEX4 | DRAW_FEATURE_CLUT16,
 	};
 
 	enum PRIM_TYPE : uint32
@@ -161,6 +168,7 @@ private:
 		uint32 zbWriteStart = 0;
 		uint32 zbWriteEnd = 0;
 		uint32 primStart = 0;
+		uint32 stateStart = 0; //state records are per batch: the batch's are [stateStart, end of m_states)
 		uint32 minX = ~0U, minY = ~0U, maxX = 0, maxY = 0;
 		uint32 features = 0;
 	};
@@ -174,6 +182,7 @@ private:
 	void Prim_Sprite();
 	void AddPrim(PRIM_TYPE, const VERTEX_DATA*, uint32 vertexCount);
 	void FlushBatch();
+	void DecodeBatchTextures();
 	void FlushTransfers();
 	bool BatchAccesses(uint32, uint32) const;
 	bool LoadClutFromCpu(uint32, const TEX0&, const TEXCLUT&);
@@ -255,6 +264,10 @@ private:
 	//Primitives and states of the current command list, batches of primitives (see notes/webgpu.md)
 	std::vector<uint32> m_prims;
 	std::vector<uint32> m_states;
+	std::vector<uint64> m_stateAreas; //per state record: sum of its primitives' bounding box areas
+	std::vector<uint32> m_stateFormats; //per state record: its DRAW_FEATURE_TEXFORMATS bits
+	std::vector<uint32> m_decodeJobs;
+	uint32 m_decodeTexels = 0; //decoded texture buffer used by the current command list
 	std::vector<uint32> m_binOffsets;
 	std::vector<uint32> m_tileOrder;
 	uint32 m_state[STATE_WORDS] = {};
