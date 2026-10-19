@@ -167,9 +167,5 @@
 		<Patch Address="0x0017A1FC" Value="0x24020001" Description="Vsync wait (0x17A1D0): 2000-iteration delay between polls of the vsync counter cut to 1." />
 		<Patch Address="0x0017A230" Value="0x24020001" Description="Same delay count, reloaded in the poll loop's delay slot." />
 		<Patch Address="0x0017A35C" Value="0x24020001" Description="Wait while the flag at 0x2AC7D0 is 1: 20000-iteration delay between polls cut to 1." />
-		<IdleLoopBlock Address="0x0017A220" Description="Vsync counter poll (with the patches above): ~15% of EE time spinning in combat." />
-		<IdleLoopBlock Address="0x0017A348" Description="Flag 0x2AC7D0 poll, loop entry." />
-		<IdleLoopBlock Address="0x0017A350" Description="Flag 0x2AC7D0 poll, first check." />
-		<IdleLoopBlock Address="0x0026C0E0" Description="Boot and loading: poll for the end of a SIF RPC, FlushCache syscall and a status check per pass." />
 	</GameConfig>
 </GameConfigs>
