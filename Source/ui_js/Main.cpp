@@ -233,6 +233,8 @@ static std::atomic<int> g_hashRequest = 0;
 static int g_hashRemaining = 0;
 static std::mutex g_hashMutex;
 static std::string g_hashResult;
+//Same points: VU0/VU1 state, data and micro memory (VU code changes rarely show in EE state)
+static std::string g_vuHashResult;
 
 //Benchmark over a deterministic stretch of emulated time: wall ms between vblanks [from, to) after the next state load
 static std::atomic<int> g_timeFrom = 0;
@@ -270,6 +272,15 @@ static void HashVmState()
 	g_hashResult += string_format("%s%08X:%04llX.%04llX.%04llX.%04llX.%04llX", g_hashResult.empty() ? "" : " ", ee.m_EE.m_State.nPC,
 	                              h(&ee.m_EE.m_State, sizeof(MIPSSTATE)), h(ee.m_ram, PS2::EE_RAM_SIZE), h(ee.m_spr, PS2::EE_SPR_SIZE),
 	                              h(&iop.m_cpu.m_State, sizeof(MIPSSTATE)), h(iop.m_ram, PS2::IOP_RAM_SIZE));
+	g_vuHashResult += string_format("%s%04llX.%04llX.%04llX.%04llX.%04llX.%04llX", g_vuHashResult.empty() ? "" : " ",
+	                                h(&ee.m_VU0.m_State, sizeof(MIPSSTATE)), h(ee.m_vuMem0, PS2::VUMEM0SIZE), h(ee.m_microMem0, PS2::MICROMEM0SIZE),
+	                                h(&ee.m_VU1.m_State, sizeof(MIPSSTATE)), h(ee.m_vuMem1, PS2::VUMEM1SIZE), h(ee.m_microMem1, PS2::MICROMEM1SIZE));
+}
+
+std::string vuHashResult()
+{
+	std::lock_guard<std::mutex> lock(g_hashMutex);
+	return g_vuHashResult;
 }
 
 //Debug: EE MIPSSTATE as hex words (compare two builds)
@@ -506,6 +517,7 @@ void eeHashAfterLoad(int vblanks)
 {
 	std::lock_guard<std::mutex> lock(g_hashMutex);
 	g_hashResult.clear();
+	g_vuHashResult.clear();
 	g_hashRequest = vblanks;
 }
 
@@ -812,6 +824,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("eeTimeVblank", &eeTimeVblank);
 	function("setEeContextPromotion", &setEeContextPromotion);
 	function("eeHashResult", &eeHashResult);
+	function("vuHashResult", &vuHashResult);
 	function("eeDumpRequest", &eeDumpRequest);
 	function("eeStateDump", &eeStateDump);
 	function("setEeBatchSize", &setEeBatchSize);
