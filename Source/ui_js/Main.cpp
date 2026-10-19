@@ -826,6 +826,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("setVu1Threaded", &setVu1Threaded);
 	function("setGsHack", &setGsHack);
 	function("setEeFrequencyScale", &setEeFrequencyScale);
+	function("blockCacheSalt", &BlockCache::GetSalt);
 	function("blockCacheEnable", &BlockCache::SetEnabled);
 	function("blockCacheClear", &BlockCache::Clear);
 	function("blockCacheLoad", &blockCacheLoad);

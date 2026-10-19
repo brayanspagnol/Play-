@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <vector>
 #include "Types.h"
 
@@ -35,6 +36,14 @@ namespace BlockCache
 	//Returns the number of entries accepted.
 	uint32 Load(const uint8* data, size_t size);
 	bool Find(const KEY&, std::vector<uint8>& code);
+	//Like Find, but entries that came from Load() are instantiated in groups: the first hit in a group
+	//compiles one module holding the whole group (entries loaded next to each other were compiled next to
+	//each other, so they tend to run together), later hits only take a function out of it. Returns a
+	//function table index of the calling thread (0: not found; codeSize is set when found). The
+	//instances live in the calling thread's JS realm, like every other JIT function.
+	int FindFunction(const KEY&, size_t& codeSize);
+	//"<source hash>-<layout>": changes only when cached code could be different (see CMakeLists.txt)
+	std::string GetSalt();
 	void Add(const KEY&, const void* code, size_t size);
 	std::vector<uint8> TakePending();
 	size_t GetPendingSize();

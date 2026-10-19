@@ -182,6 +182,14 @@ void CBasicBlock::Compile()
 		cacheKey.hash[0] = xxHash.low64;
 		cacheKey.hash[1] = xxHash.high64 ^ BlockCache::CODEGEN_VERSION;
 
+		size_t cachedSize = 0;
+		int cachedFunction = BlockCache::FindFunction(cacheKey, cachedSize);
+		if(cachedFunction != 0)
+		{
+			//Already in a module with the rest of its group (and never batched again)
+			m_function = CMemoryFunction::FromWasmFunction(cachedFunction, cachedSize);
+			return;
+		}
 		thread_local std::vector<uint8> cachedCode;
 		if(BlockCache::Find(cacheKey, cachedCode))
 		{
