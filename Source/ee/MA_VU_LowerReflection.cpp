@@ -279,6 +279,7 @@ void CMA_VU::CLower::ReflOpAffWrItBv(VUINSTRUCTION*, CMIPS*, uint32, uint32 opco
 
 	operandSet.writeI = it;
 	operandSet.branchValue = true;
+	operandSet.readClipFlags = true; //(FCGET)
 }
 
 void CMA_VU::CLower::ReflOpAffWrItBvRdFmac(VUINSTRUCTION*, CMIPS*, uint32, uint32 opcode, OPERANDSET& operandSet)
@@ -410,6 +411,7 @@ void CMA_VU::CLower::ReflOpAffWrVi1Bv(VUINSTRUCTION*, CMIPS*, uint32, uint32 opc
 {
 	operandSet.writeI = 1;
 	operandSet.branchValue = true;
+	operandSet.readClipFlags = true; //(FCEQ, FCAND, FCOR)
 }
 
 // clang-format off

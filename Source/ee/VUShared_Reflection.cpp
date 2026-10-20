@@ -376,7 +376,7 @@ void VUShared::ReflOpAffWrCfRdFsFt(VUINSTRUCTION*, CMIPS*, uint32, uint32 opcode
 	auto ft = static_cast<uint8>((opcode >> 16) & 0x001F);
 	auto fs = static_cast<uint8>((opcode >> 11) & 0x001F);
 
-	//TODO: Write CF
+	operandSet.writeClipFlags = true;
 	operandSet.readF0 = fs;
 	operandSet.readElemF0 = dest;
 	operandSet.readF1 = ft;

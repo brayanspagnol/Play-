@@ -15,6 +15,10 @@
 #include <emmintrin.h>
 #endif
 
+#ifdef __wasm_simd128__
+#include <wasm_simd128.h>
+#endif
+
 #ifdef _MSC_VER
 #define FRAMEWORK_SAFE_BUFFERS __declspec(safebuffers)
 #else
@@ -167,6 +171,13 @@ protected:
 		inline uint32 GetRemainingDmaTransferSize() const
 		{
 			return m_endAddress - m_nextAddress;
+		}
+
+		//The GetAvailableReadBytes() bytes left are contiguous at GetDirectPointer(): no tag to skip, and
+		//the buffer (if partly read) was loaded from the current source
+		inline bool CanReadDirect() const
+		{
+			return !m_tagIncluded && ((m_bufferPosition == BUFFERSIZE) || ((m_nextAddress - m_startAddress) >= BUFFERSIZE));
 		}
 
 		inline void Read(void* buffer, uint32 size)
@@ -591,6 +602,127 @@ protected:
 		return success;
 	}
 
+#ifdef __wasm_simd128__
+	static constexpr uint32 UnpackElementSize(uint8 dataType)
+	{
+		//S-32, S-16, S-8, -, V2-32, V2-16, V2-8, -, V3-32, V3-16, V3-8, -, V4-32, V4-16, V4-8, V4-5 (0: invalid)
+		constexpr uint8 sizes[16] = {4, 2, 1, 0, 8, 4, 2, 0, 12, 6, 3, 0, 16, 8, 4, 2};
+		return sizes[dataType & 0x0F];
+	}
+
+	//One unpacked vector, same values as Unpack_ReadValue (missing fields are 0)
+	template <uint8 dataType, bool usn>
+	static inline v128_t Unpack_LoadSimd(const uint8* src)
+	{
+		auto extend16 = [](v128_t v) { return usn ? wasm_u32x4_extend_low_u16x8(v) : wasm_i32x4_extend_low_i16x8(v); };
+		auto extend8 = [&](v128_t v) { return extend16(usn ? wasm_u16x8_extend_low_u8x16(v) : wasm_i16x8_extend_low_i8x16(v)); };
+		const v128_t zero = wasm_i32x4_const_splat(0);
+		switch(dataType)
+		{
+		case 0x00:
+			return wasm_v128_load32_splat(src);
+		case 0x01:
+		{
+			uint16 value;
+			memcpy(&value, src, 2);
+			return wasm_i32x4_splat(usn ? static_cast<int32>(value) : static_cast<int32>(static_cast<int16>(value)));
+		}
+		case 0x02:
+			return wasm_i32x4_splat(usn ? static_cast<int32>(src[0]) : static_cast<int32>(static_cast<int8>(src[0])));
+		case 0x04:
+			return wasm_v128_load64_zero(src);
+		case 0x05:
+			return extend16(wasm_v128_load32_zero(src));
+		case 0x06:
+			return extend8(wasm_v128_load16_lane(src, zero, 0));
+		case 0x08:
+			return wasm_v128_load32_lane(src + 8, wasm_v128_load64_zero(src), 2);
+		case 0x09:
+			return extend16(wasm_v128_load16_lane(src + 4, wasm_v128_load32_zero(src), 2));
+		case 0x0A:
+			return extend8(wasm_v128_load8_lane(src + 2, wasm_v128_load16_lane(src, zero, 0), 2));
+		case 0x0C:
+			return wasm_v128_load(src);
+		case 0x0D:
+			return extend16(wasm_v128_load64_zero(src));
+		case 0x0E:
+			return extend8(wasm_v128_load32_zero(src));
+		case 0x0F:
+		default:
+		{
+			uint16 value;
+			memcpy(&value, src, 2);
+			return wasm_u32x4_make(((value >> 0) & 0x1F) << 3, ((value >> 5) & 0x1F) << 3, ((value >> 10) & 0x1F) << 3, ((value >> 15) & 0x01) << 7);
+		}
+		}
+	}
+
+	//count consecutive vectors read and written (no skipping or filling between them), same results
+	//as count iterations of the loop in Unpack. writeTick: m_writeTick of the first one.
+	template <uint8 dataType, bool useMask, uint8 mode, bool usn>
+	void UnpackRunSimd(const uint8* src, uint32 count, uint32 dstAddr, uint8* vuMem, uint32 vuMemSize, uint32 writeTick)
+	{
+		constexpr uint32 elementSize = UnpackElementSize(dataType);
+		v128_t row = wasm_v128_load(m_R);
+		v128_t dataLanes[4], rowLanes[4], colLanes[4], keepLanes[4];
+		if(useMask)
+		{
+			for(uint32 col = 0; col < 4; col++)
+			{
+				uint32 colMask = GetColMaskOp(col);
+				auto lanes = [&](uint32 op) {
+					auto lane = [&](uint32 i) { return (((colMask >> (i * 2)) & 3) == op) ? -1 : 0; };
+					return wasm_i32x4_make(lane(0), lane(1), lane(2), lane(3));
+				};
+				dataLanes[col] = lanes(MASK_DATA);
+				rowLanes[col] = lanes(MASK_ROW);
+				colLanes[col] = wasm_v128_and(lanes(MASK_COL), wasm_i32x4_splat(m_C[col]));
+				keepLanes[col] = lanes(MASK_MASK);
+			}
+		}
+		for(uint32 i = 0; i < count; i++)
+		{
+			v128_t value = Unpack_LoadSimd<dataType, usn>(src);
+			src += elementSize;
+			uint8* dst = vuMem + dstAddr;
+			dstAddr = (dstAddr + 0x10) & (vuMemSize - 1);
+			if(!useMask)
+			{
+				if(mode == MODE_OFFSET)
+				{
+					value = wasm_i32x4_add(value, row);
+				}
+				else if(mode == MODE_DIFFERENCE)
+				{
+					row = wasm_i32x4_add(value, row);
+					value = row;
+				}
+				wasm_v128_store(dst, value);
+			}
+			else
+			{
+				uint32 col = std::min<uint32>(writeTick + i, 3);
+				if(mode == MODE_OFFSET)
+				{
+					value = wasm_i32x4_add(value, row);
+				}
+				else if(mode == MODE_DIFFERENCE)
+				{
+					value = wasm_i32x4_add(value, row);
+					row = wasm_v128_bitselect(value, row, dataLanes[col]);
+				}
+				v128_t result = wasm_v128_or(wasm_v128_or(wasm_v128_and(value, dataLanes[col]), wasm_v128_and(row, rowLanes[col])), colLanes[col]);
+				result = wasm_v128_bitselect(wasm_v128_load(dst), result, keepLanes[col]);
+				wasm_v128_store(dst, result);
+			}
+		}
+		if(mode == MODE_DIFFERENCE)
+		{
+			wasm_v128_store(m_R, row);
+		}
+	}
+#endif
+
 	template <uint8 dataType, bool clGreaterEqualWl, bool useMask, uint8 mode, bool usn>
 	void Unpack(StreamType& stream, CODE nCommand, uint32 nDstAddr)
 	{
@@ -631,6 +763,35 @@ protected:
 
 		while(currentNum != 0)
 		{
+#ifdef __wasm_simd128__
+			//Whole run of vectors that are read and written, straight from the source
+			if constexpr(UnpackElementSize(dataType) != 0)
+			{
+				constexpr uint32 elementSize = UnpackElementSize(dataType);
+				bool readPhase = clGreaterEqualWl ? (m_readTick < wl) : (m_writeTick < cl);
+				if(readPhase && stream.CanReadDirect())
+				{
+					uint32 count = clGreaterEqualWl ? (wl - m_readTick) : (cl - m_writeTick);
+					count = std::min<uint32>(count, currentNum);
+					count = std::min<uint32>(count, stream.GetAvailableReadBytes() / elementSize);
+					if(count != 0)
+					{
+						UnpackRunSimd<dataType, useMask, mode, usn>(stream.GetDirectPointer(), count, nDstAddr, vuMem, vuMemSize, m_writeTick);
+						stream.Skip(count * elementSize);
+						currentNum -= count;
+						m_writeTick = std::min<uint32>(m_writeTick + count, wl);
+						m_readTick = std::min<uint32>(m_readTick + count, cl);
+						if(clGreaterEqualWl ? (m_readTick == cl) : (m_writeTick == wl))
+						{
+							m_writeTick = 0;
+							m_readTick = 0;
+						}
+						nDstAddr = (nDstAddr + (count * 0x10)) & (vuMemSize - 1);
+						continue;
+					}
+				}
+			}
+#endif
 			bool mustWrite = false;
 			uint128 writeValue;
 			memset(&writeValue, 0, sizeof(writeValue));
