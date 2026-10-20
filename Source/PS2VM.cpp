@@ -613,6 +613,8 @@ bool CPS2VM::LoadVMState(const fs::path& statePath)
 			//Audio of the blocks before the load goes out first
 			m_spuRenderThread->Drain();
 			m_spuRenderThread->RequestResync();
+			//Drop the partial output buffer from before the load (at most one sound handler write)
+			m_currentSpuBlock = 0;
 			m_ee->m_gs->LoadState(archive);
 			LoadVmTimingState(archive);
 

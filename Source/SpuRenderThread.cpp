@@ -85,6 +85,8 @@ void CSpuRenderThread::Resync()
 	m_dirtyStart = ~0U;
 	m_dirtyEnd = 0;
 	m_resyncPending = false;
+	//Partial output buffer from before a reset or load
+	m_currentBlock = 0;
 }
 
 void CSpuRenderThread::SyncBack()
