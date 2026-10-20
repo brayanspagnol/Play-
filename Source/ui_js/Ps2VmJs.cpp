@@ -14,6 +14,8 @@ extern "C" void SWL_Proxy(uint32, uint32, CMIPS*);
 extern "C" void SWR_Proxy(uint32, uint32, CMIPS*);
 extern "C" void SDL_Proxy(uint32, uint64, CMIPS*);
 extern "C" void SDR_Proxy(uint32, uint64, CMIPS*);
+extern "C" void EeAutoIdleCheck(CMIPS*);
+extern "C" void EeAutoIdleTaint(CMIPS*);
 
 //Memory access helpers only reach the context through the memory map handlers, which may touch the
 //ranges registered in RegisterVolatileContextRanges below and nothing else (FUNCTION_EFFECT_NONE)
@@ -45,6 +47,8 @@ static const struct
         {reinterpret_cast<uintptr_t>(&SWR_Proxy), "_SWR_Proxy", "viii", EFFECT_NONE},
         {reinterpret_cast<uintptr_t>(&SDL_Proxy), "_SDL_Proxy", "viji", EFFECT_NONE},
         {reinterpret_cast<uintptr_t>(&SDR_Proxy), "_SDR_Proxy", "viji", EFFECT_NONE},
+        {reinterpret_cast<uintptr_t>(&EeAutoIdleCheck), "_EeAutoIdleCheck", "vi", EFFECT_ALL},
+        {reinterpret_cast<uintptr_t>(&EeAutoIdleTaint), "_EeAutoIdleTaint", "vi", EFFECT_ALL},
 };
 
 //What the EE memory map handlers (I/O, write watch) may read or write in the CPU context:

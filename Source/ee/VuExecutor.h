@@ -1,6 +1,8 @@
 #pragma once
 
 #include <map>
+#include <memory>
+#include <unordered_map>
 #include <vector>
 #include "../GenericMipsExecutor.h"
 #include "VuBasicBlock.h"
@@ -24,6 +26,9 @@ public:
 	//Drops every compiled block (keeps the per game settings)
 	void DropBlocks();
 	void ClearActiveBlocksInRange(uint32, uint32, bool) override;
+#ifdef __EMSCRIPTEN__
+	int Execute(int) override;
+#endif
 
 protected:
 	typedef std::multimap<CachedBlockKey, BasicBlockPtr> CachedBlockMap;
@@ -63,4 +68,42 @@ protected:
 	std::map<std::pair<uint32, CachedBlockKey>, std::vector<CVuBasicBlock::SUPERBLOCK_PART>> m_superBlockPlans;
 	//Differential test: standalone reference blocks the superblocks are compared against
 	std::map<uint32, BasicBlockPtr> m_referenceBlocks;
+
+#ifdef __EMSCRIPTEN__
+	//Block sets per micro memory contents. Writes to micro memory (MPG, EE stores, state loads) don't
+	//drop blocks: they mark pages dirty, and before the next run the executor switches to the block set
+	//of the new contents (key: hash of the per page hashes), which is empty the first time those
+	//contents are seen. Games that swap a few microprograms in and out (GTA SA: several per frame)
+	//then find all their blocks again. (Block links are no-ops in WebAssembly, blocks share nothing
+	//else that depends on other blocks.)
+	struct BLOCK_SET
+	{
+		std::unique_ptr<CBasicBlock*[]> table;
+		BlockStore blocks;
+	};
+	struct KEY_HASHER
+	{
+		size_t operator()(const uint128& key) const
+		{
+			return static_cast<size_t>(key.nD0);
+		}
+	};
+	enum
+	{
+		BLOCK_SET_PAGE_SIZE = 0x100,
+		MAX_BLOCK_SETS = 64,
+	};
+
+	void ResetBlockSets();
+	void SelectBlockSet();
+
+	std::unordered_map<uint128, BLOCK_SET, KEY_HASHER> m_blockSets;
+	//Module batching (see CBasicBlock::BatchModules): new blocks wait here
+	std::vector<std::weak_ptr<CBasicBlock>> m_batchPending;
+	std::vector<uint128> m_pageHashes;
+	std::vector<bool> m_dirtyPages;
+	bool m_contentsChanged = true;
+	bool m_hasCurrentKey = false;
+	uint128 m_currentKey = {};
+#endif
 };

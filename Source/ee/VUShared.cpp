@@ -273,7 +273,7 @@ void VUShared::TestSZFlags(CMipsJitter* codeGen, uint8 dest, size_t regOffset, u
 		PushLatestFlagPipelineValue(g_pipeInfoSticky, codeGen);
 
 		codeGen->Or();
-		QueueInFlagPipeline(g_pipeInfoSticky, codeGen, LATENCY_MAC, relativePipeTime);
+		QueueInFlagPipeline(g_pipeInfoSticky, codeGen, LATENCY_MAC, relativePipeTime, (compileHints & COMPILEHINT_SKIP_STICKY_UPDATE) != 0);
 	}
 
 	if((compileHints & COMPILEHINT_SKIP_FMAC_UPDATE) == 0)
@@ -795,7 +795,7 @@ void VUShared::ADDAq(CMipsJitter* codeGen, uint8 dest, uint8 fs, uint32 relative
 	          true, relativePipeTime, compileHints);
 }
 
-void VUShared::CLIP(CMipsJitter* codeGen, uint8 nFs, uint8 nFt, uint32 relativePipeTime)
+void VUShared::CLIP(CMipsJitter* codeGen, uint8 nFs, uint8 nFt, uint32 relativePipeTime, uint32 compileHints)
 {
 	//Load previous value
 	{
@@ -843,7 +843,7 @@ void VUShared::CLIP(CMipsJitter* codeGen, uint8 nFs, uint8 nFt, uint32 relativeP
 	//Combine with previous value
 	codeGen->Or();
 
-	QueueInFlagPipeline(g_pipeInfoClip, codeGen, LATENCY_MAC, relativePipeTime);
+	QueueInFlagPipeline(g_pipeInfoClip, codeGen, LATENCY_MAC, relativePipeTime, (compileHints & COMPILEHINT_SKIP_CLIP_UPDATE) != 0);
 }
 
 void VUShared::DIV(CMipsJitter* codeGen, uint8 nFs, uint8 nFsf, uint8 nFt, uint8 nFtf, uint32 relativePipeTime)
@@ -1877,6 +1877,8 @@ void VUShared::CheckFlagPipeline(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* cod
 	}
 }
 
+extern bool g_vuDiffMode;
+bool g_vuSkipFlagWrites = true; //Module.setVuSkipFlagWrites
 int g_vuExperiment = 0; //Debug: drop parts of the optimized VU codegen to measure their cost (results become wrong)
 
 namespace
@@ -1933,9 +1935,17 @@ void VUShared::PushLatestFlagPipelineValue(const FLAG_PIPEINFO& pipeInfo, CMipsJ
 	codeGen->LoadFromRefIdx();
 }
 
-void VUShared::QueueInFlagPipeline(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* codeGen, uint32 latency, uint32 relativePipeTime)
+void VUShared::QueueInFlagPipeline(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* codeGen, uint32 latency, uint32 relativePipeTime, bool skipWrite)
 {
 	SetFlagForwardValue(pipeInfo, codeGen);
+
+	//Nothing reads this entry; the next instruction that needs the latest value gets it from the forwarding scratch
+	//(Not in the VU differential test, which compares the pipelines with the reference code's)
+	if(skipWrite && g_vuSkipFlagWrites && g_flagForwardingEnabled && !g_vuDiffMode && (GetFlagScratchIndex(pipeInfo) >= 0))
+	{
+		codeGen->PullTop();
+		return;
+	}
 
 	uint32 valueCursor = codeGen->GetTopCursor();
 

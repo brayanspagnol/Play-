@@ -173,6 +173,7 @@ private:
 		void SetBitPosition(unsigned int);
 		unsigned int GetSize() const;
 		unsigned int GetAvailableBits() const;
+		unsigned int ReadAlignedBytes(uint8*, unsigned int);
 
 		void Reset();
 		void SaveState(const char*, Framework::CZipArchiveWriter&);

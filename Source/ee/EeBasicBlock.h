@@ -9,6 +9,10 @@ public:
 
 	void SetFpRoundingMode(Jitter::CJitter::ROUNDINGMODE);
 	void SetIsIdleLoopBlock();
+	void SetIsAutoIdleLoopBlock();
+	void SetIsAutoIdleTaintBlock();
+
+	static bool IsCodeIdleLoopBlock(CMIPS&, uint32 begin, uint32 end);
 
 	//Tier-2 region: the tier-1 blocks in parts (parts[0] starts at this block's begin) compiled into one
 	//function with direct jumps between them (see CompileRange). Empty: an ordinary block.
@@ -24,11 +28,12 @@ protected:
 	void CompileEpilog(CMipsJitter*, bool) override;
 
 private:
-	bool IsCodeIdleLoopBlock() const;
 
 	static constexpr auto DEFAULT_FP_ROUNDING_MODE = Jitter::CJitter::ROUND_TRUNCATE;
 	Jitter::CJitter::ROUNDINGMODE m_fpRoundingMode = DEFAULT_FP_ROUNDING_MODE;
 
 	bool m_isIdleLoopBlock = false;
 	std::vector<SUPERBLOCK_PART> m_regionParts;
+	bool m_isAutoIdleLoopBlock = false;
+	bool m_isAutoIdleTaintBlock = false;
 };

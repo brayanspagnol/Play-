@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <emscripten/threading.h>
 #include "gs/GSH_OpenGL/GSH_OpenGL.h"
 
@@ -25,7 +26,22 @@ public:
 	void ReleaseImpl() override;
 	void PresentBackbuffer() override;
 
+	//Frame skip (0 = off): after each drawn frame, the next `count` frames are neither drawn nor presented.
+	//Only host rendering is skipped: GS registers, transfers and memory stay exact, so emulation is unchanged
+	//(except for games that read rendered pixels back, which then see the last drawn frame).
+	void SetFrameSkip(int count);
+	uint32 GetSkippedFrames() const;
+
+protected:
+	void FlipImpl(const DISPLAY_INFO&) override;
+
 private:
+	std::atomic<int> m_frameSkip = 0;
+	std::atomic<uint32> m_skippedFrames = 0;
+	uint32 m_skipLeft = 0;
+	uint32 m_lastDisplayPtr = ~0U;
+	uint32 m_flipsSinceSwap = 0;
+
 	int m_width = 0;
 	int m_height = 0;
 	EMSCRIPTEN_WEBGL_CONTEXT_HANDLE m_context = 0;

@@ -1,4 +1,5 @@
 #include "GSH_OpenGLJs.h"
+#include <algorithm>
 #include <cassert>
 #include <emscripten/em_js.h>
 #include <emscripten/html5_webgl.h>
@@ -76,4 +77,48 @@ void CGSH_OpenGLJs::SetOutput(int width, int height, PRESENTATION_MODE mode)
 void CGSH_OpenGLJs::PresentBackbuffer()
 {
 	GsJs_Present();
+}
+
+void CGSH_OpenGLJs::SetFrameSkip(int count)
+{
+	m_frameSkip = std::max(count, 0);
+}
+
+uint32 CGSH_OpenGLJs::GetSkippedFrames() const
+{
+	return m_skippedFrames;
+}
+
+//GS thread, at each flip. A game frame ends when the game shows another buffer (double buffering, the usual
+//case); for games that keep one display buffer, every flip ends one. The drawing state changes only at those
+//boundaries, so a shown frame is never partly drawn: a skipped frame's buffer (stale) is not presented and the
+//page keeps the previous picture.
+void CGSH_OpenGLJs::FlipImpl(const DISPLAY_INFO& dispInfo)
+{
+	uint32 displayPtr = dispInfo.layers[0].bufPtr;
+	bool swapped = (displayPtr != m_lastDisplayPtr);
+	m_lastDisplayPtr = displayPtr;
+	m_flipsSinceSwap = swapped ? 0 : std::min<uint32>(m_flipsSinceSwap + 1, 1000);
+	bool boundary = swapped || (m_flipsSinceSwap > 4);
+	bool drawn = m_drawEnabled;
+	if(boundary)
+	{
+		uint32 skip = m_frameSkip.load(std::memory_order_relaxed);
+		if(skip == 0)
+			m_skipLeft = 0;
+		else if(m_skipLeft != 0)
+			m_skipLeft--;
+		else if(drawn)
+			m_skipLeft = skip;
+		m_drawEnabled = (m_skipLeft == 0);
+	}
+	if(drawn)
+	{
+		CGSH_OpenGL::FlipImpl(dispInfo);
+	}
+	else
+	{
+		m_skippedFrames++;
+		CGSHandler::FlipImpl(dispInfo);
+	}
 }

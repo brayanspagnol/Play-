@@ -163,4 +163,9 @@
 	<GameConfig Executable="SLES_525.41;1" Title="Grand Theft Auto: San Andreas (Europe)">
 		<IdleLoopBlock Address="0x0034DFD8" Description="Polling loop waiting for the render queue (interrupt-driven counters), ~75% of EE time in cutscenes/gameplay." />
 	</GameConfig>
+	<GameConfig Executable="SCUS_973.99;1" Title="God of War">
+		<Patch Address="0x0017A1FC" Value="0x24020001" Description="Vsync wait (0x17A1D0): 2000-iteration delay between polls of the vsync counter cut to 1." />
+		<Patch Address="0x0017A230" Value="0x24020001" Description="Same delay count, reloaded in the poll loop's delay slot." />
+		<Patch Address="0x0017A35C" Value="0x24020001" Description="Wait while the flag at 0x2AC7D0 is 1: 20000-iteration delay between polls cut to 1." />
+	</GameConfig>
 </GameConfigs>

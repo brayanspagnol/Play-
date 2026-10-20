@@ -13,6 +13,7 @@
 #include "string_format.h"
 #include "BlockCache.h"
 #include "ee/Vpu.h"
+#include "ee/VUShared.h"
 #include <future>
 #include <mutex>
 #include <set>
@@ -234,6 +235,8 @@ static std::atomic<int> g_hashRequest = 0;
 static int g_hashRemaining = 0;
 static std::mutex g_hashMutex;
 static std::string g_hashResult;
+//Same points: VU0/VU1 state, data and micro memory (VU code changes rarely show in EE state)
+static std::string g_vuHashResult;
 
 //Benchmark over a deterministic stretch of emulated time: wall ms between vblanks [from, to) after the next state load
 static std::atomic<int> g_timeFrom = 0;
@@ -302,6 +305,29 @@ static void HashVmState()
 	g_hashResult += string_format("%s%08X:%04llX.%04llX.%04llX.%04llX.%04llX", g_hashResult.empty() ? "" : " ", ee.m_EE.m_State.nPC,
 	                              h(&ee.m_EE.m_State, sizeof(MIPSSTATE)), h(ee.m_ram, PS2::EE_RAM_SIZE), h(ee.m_spr, PS2::EE_SPR_SIZE),
 	                              h(&iop.m_cpu.m_State, sizeof(MIPSSTATE)), h(iop.m_ram, PS2::IOP_RAM_SIZE));
+	//(Then EE, VU0, VU1 states without the flag pipeline entries, which skipped flag writes change
+	//without changing any value a program can read)
+	auto hm = [&h](const MIPSSTATE& state) {
+		MIPSSTATE copy = state;
+		auto raw = reinterpret_cast<uint8*>(&copy);
+		for(const auto* pipe : {&VUShared::g_pipeInfoMac, &VUShared::g_pipeInfoSticky, &VUShared::g_pipeInfoClip})
+		{
+			memset(raw + pipe->index, 0, sizeof(uint32));
+			memset(raw + pipe->valueArray, 0, sizeof(uint32) * FLAG_PIPELINE_SLOTS);
+			memset(raw + pipe->timeArray, 0, sizeof(uint32) * FLAG_PIPELINE_SLOTS);
+		}
+		return h(&copy, sizeof(MIPSSTATE));
+	};
+	g_vuHashResult += string_format("%s%04llX.%04llX.%04llX.%04llX.%04llX.%04llX/%04llX.%04llX.%04llX", g_vuHashResult.empty() ? "" : " ",
+	                                h(&ee.m_VU0.m_State, sizeof(MIPSSTATE)), h(ee.m_vuMem0, PS2::VUMEM0SIZE), h(ee.m_microMem0, PS2::MICROMEM0SIZE),
+	                                h(&ee.m_VU1.m_State, sizeof(MIPSSTATE)), h(ee.m_vuMem1, PS2::VUMEM1SIZE), h(ee.m_microMem1, PS2::MICROMEM1SIZE),
+	                                hm(ee.m_EE.m_State), hm(ee.m_VU0.m_State), hm(ee.m_VU1.m_State));
+}
+
+std::string vuHashResult()
+{
+	std::lock_guard<std::mutex> lock(g_hashMutex);
+	return g_vuHashResult;
 }
 
 //Debug: EE MIPSSTATE as hex words (compare two builds)
@@ -425,6 +451,21 @@ void setVuJitOptions(bool promotion, bool diff, bool names)
 }
 
 extern bool g_vuSuperBlocks;
+extern bool g_vuBlockChaining;
+
+//VU block chaining (blocks tail call the next one), used for new blocks from now on
+void setVuBlockChaining(bool enabled)
+{
+	g_vuBlockChaining = enabled;
+}
+
+extern bool g_vuSkipFlagWrites;
+
+//VU status/clip flag pipeline writes nothing reads skipped (default on), used for new blocks from now on
+void setVuSkipFlagWrites(bool enabled)
+{
+	g_vuSkipFlagWrites = enabled;
+}
 
 //VU superblocks (several VU blocks compiled into one function), used for new blocks from now on
 void setVuSuperBlocks(bool enabled)
@@ -544,6 +585,19 @@ std::string eeRegionStats()
 	return result + string_format("%llu %u", static_cast<unsigned long long>(g_eeDispatchCount), g_eeRegionJitRuns);
 }
 
+//Automatic EE wait loop detection (see CEeExecutor): on/off, and the detected loops with their counters
+extern bool g_eeAutoIdle;
+std::string EeAutoIdleStats(bool);
+void setEeAutoIdle(bool enabled)
+{
+	g_eeAutoIdle = enabled;
+}
+
+std::string eeAutoIdleStats(bool reset)
+{
+	return EeAutoIdleStats(reset);
+}
+
 extern std::mutex g_eeDumpMutex;
 extern std::set<uint32> g_eeDumpRequest;
 extern std::map<uint32, std::string> g_eeDumpResult;
@@ -574,6 +628,7 @@ void eeHashAfterLoad(int vblanks)
 {
 	std::lock_guard<std::mutex> lock(g_hashMutex);
 	g_hashResult.clear();
+	g_vuHashResult.clear();
 	g_hashRequest = vblanks;
 }
 
@@ -667,6 +722,18 @@ void setGsOptions(int resolutionFactor, bool forceBilinear, bool widescreen, int
 	config.SetPreferenceInteger(PREF_CGSHANDLER_PRESENTATION_MODE, presentationMode);
 	auto gs = static_cast<CGSH_OpenGLJs*>(g_virtualMachine->GetGSHandler());
 	gs->SetOutput((widescreen ? 854 : 640) * resolutionFactor, 480 * resolutionFactor, static_cast<CGSHandler::PRESENTATION_MODE>(presentationMode));
+}
+
+//Frame skip for slow machines (0 = off, n = n frames skipped after each drawn one), see CGSH_OpenGLJs.
+void setFrameSkip(int count)
+{
+	static_cast<CGSH_OpenGLJs*>(g_virtualMachine->GetGSHandler())->SetFrameSkip(std::clamp(count, 0, 3));
+}
+
+//Frames not drawn because of the frame skip since start (cumulative).
+uint32 getSkippedFrames()
+{
+	return static_cast<CGSH_OpenGLJs*>(g_virtualMachine->GetGSHandler())->GetSkippedFrames();
 }
 
 //Replaces the keyboard/gamepad bindings: keys = [[KeyboardEvent.code, PS2 button, positive], ...]
@@ -810,6 +877,13 @@ void pauseVm()
 	EM_ASM({ Module["audioSetPaused"](true); });
 }
 
+//Continues a VM held by pauseVm without rebooting it (e.g. the page held the game while a boot intro played).
+void resumeVm()
+{
+	EM_ASM({ Module["audioSetPaused"](false); });
+	g_virtualMachine->Resume();
+}
+
 void bootElf(std::string path)
 {
 	EM_ASM({ Module["audioSetPaused"](false); });
@@ -860,6 +934,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("bootElf", &bootElf);
 	function("bootDiscImage", &bootDiscImage);
 	function("pauseVm", &pauseVm);
+	function("resumeVm", &resumeVm);
 	function("setDiscImageUrl", &Js_SetDiscImageUrl);
 	function("getFrames", &getFrames);
 	function("clearStats", &clearStats);
@@ -883,8 +958,13 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("eeRegionStats", &eeRegionStats);
 	function("setEeRegionHotSamples", &setEeRegionHotSamples);
 	function("setEeRegionPromotion", &setEeRegionPromotion);
-	function("eeHashResult", &eeHashResult);
 	function("eeEdgeProfile", &eeEdgeProfile);
+	function("setEeAutoIdle", &setEeAutoIdle);
+	function("eeAutoIdleStats", &eeAutoIdleStats);
+	function("eeHashResult", &eeHashResult);
+	function("vuHashResult", &vuHashResult);
+	function("setVuBlockChaining", &setVuBlockChaining);
+	function("setVuSkipFlagWrites", &setVuSkipFlagWrites);
 	function("eeDumpRequest", &eeDumpRequest);
 	function("eeStateDump", &eeStateDump);
 	function("setEeBatchSize", &setEeBatchSize);
@@ -894,6 +974,8 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("stateStatus", &stateStatus);
 	function("setFrameLimit", &setFrameLimit);
 	function("setGsOptions", &setGsOptions);
+	function("setFrameSkip", &setFrameSkip);
+	function("getSkippedFrames", &getSkippedFrames);
 	function("setInputBindings", &setInputBindings);
 	function("setGamepadEnabled", &setGamepadEnabled);
 	function("setVu1Threaded", &setVu1Threaded);

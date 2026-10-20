@@ -1189,7 +1189,16 @@ void CVif::SkipUnpack(StreamType& stream, CODE nCommand)
 	}
 
 	uint32 currentNum = (m_NUM == 0) ? 256 : m_NUM;
-	if(clGreaterEqualWl)
+	if((cl == wl) && (m_readTick == m_writeTick) && (m_readTick < wl))
+	{
+		//cl == wl (no skipped ticks): the vectors are contiguous, consume them in one step.
+		//Same result as the loop below, which goes one cycle group (often a single vector) at a time.
+		uint32 count = std::min<uint32>(currentNum, stream.GetAvailableReadBytes() / elementSize);
+		stream.Skip(count * elementSize);
+		currentNum -= count;
+		m_readTick = m_writeTick = (m_readTick + count) % wl;
+	}
+	else if(clGreaterEqualWl)
 	{
 		//Groups of cl ticks: wl vectors read, then (cl - wl) skipped without data
 		while(currentNum != 0)
@@ -1214,25 +1223,45 @@ void CVif::SkipUnpack(StreamType& stream, CODE nCommand)
 			}
 		}
 	}
-	while(!clGreaterEqualWl && (currentNum != 0))
+	else
 	{
-		bool mustRead = clGreaterEqualWl ? (m_readTick < wl) : (m_writeTick < cl);
-		if(mustRead)
+		//cl < wl (filling write): each group of wl ticks reads a vector on its first cl ticks only.
+		//Computed in one step; same end state as Unpack's loop, which goes one vector at a time
+		//(a read tick with no data left stops it).
+		if((m_writeTick >= wl) && (currentNum != 0))
 		{
-			if(stream.GetAvailableReadBytes() < elementSize) break;
-			stream.Skip(elementSize);
-		}
-		if(mustRead || !clGreaterEqualWl)
-		{
+			//Out of range tick: no read, wraps to the next group
 			currentNum--;
-		}
-
-		m_writeTick = std::min<uint32>(m_writeTick + 1, wl);
-		m_readTick = std::min<uint32>(m_readTick + 1, cl);
-		if(clGreaterEqualWl ? (m_readTick == cl) : (m_writeTick == wl))
-		{
 			m_writeTick = 0;
 			m_readTick = 0;
+		}
+		//Read ticks among the ticks [0, x) of a run of groups starting at a group boundary
+		auto readsBefore = [cl, wl](uint64 x) { return (x / wl) * cl + std::min<uint64>(x % wl, cl); };
+		uint32 start = m_writeTick;
+		uint64 steps = currentNum;
+		if(cl != 0)
+		{
+			//Tick of the first read without data
+			uint64 stallRead = readsBefore(start) + (stream.GetAvailableReadBytes() / elementSize);
+			uint64 stallTick = (stallRead / cl) * wl + (stallRead % cl);
+			steps = std::min<uint64>(steps, stallTick - start);
+		}
+		uint64 reads = readsBefore(start + steps) - readsBefore(start);
+		if(reads != 0) stream.Skip(static_cast<uint32>(reads * elementSize));
+		currentNum -= static_cast<uint32>(steps);
+		if(steps != 0)
+		{
+			uint64 end = start + steps;
+			if(end >= wl)
+			{
+				m_writeTick = static_cast<uint32>(end % wl);
+				m_readTick = std::min<uint32>(m_writeTick, cl);
+			}
+			else
+			{
+				m_writeTick = static_cast<uint32>(end);
+				m_readTick = static_cast<uint32>(std::min<uint64>(m_readTick + steps, cl));
+			}
 		}
 	}
 
