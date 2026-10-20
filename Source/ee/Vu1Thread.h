@@ -102,7 +102,7 @@ private:
 
 	enum
 	{
-		RING_SIZE = 0x1000000,
+		RING_SIZE = 0x400000,
 	};
 
 	uint8* Reserve(uint32);

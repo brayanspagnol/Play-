@@ -72,7 +72,7 @@ CSubSystem::CSubSystem(uint8* iopRam, CIopBios& iopBios)
 	m_vif1Back = std::make_unique<CVif1>(1, *m_vpu1, m_gif, m_intc, m_ram, m_spr);
 
 	//Setup link between EE's VU context and VU0's VU context
-	m_vu0StateChangedConnection = m_vpu0->VuStateChanged.Connect([this](CVpu::VU_STATE newState) { Vu0StateChanged(newState); });
+	m_vpu0->VuStateChanged = [this](CVpu::VU_STATE newState) { Vu0StateChanged(newState); };
 
 	m_vu1InterruptTriggeredConnection = m_vpu1->VuInterruptTriggered.Connect(
 	    [this]() {

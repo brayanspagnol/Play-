@@ -48,7 +48,8 @@ public:
 		CMIPS* context;
 	};
 
-	typedef Framework::CSignal<void(VU_STATE)> VuStateChangedEvent;
+	//Plain function, not a signal: called at every microprogram start and end (VU0 macro mode calls are frequent)
+	typedef std::function<void(VU_STATE)> VuStateChangedEvent;
 	typedef Framework::CSignal<void()> VuInterruptTriggeredEvent;
 
 	CVpu(unsigned int, const VPUINIT&, CGIF&, CINTC&, uint8*, uint8*);

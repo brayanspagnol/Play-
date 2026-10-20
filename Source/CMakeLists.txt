@@ -257,6 +257,8 @@ set(COMMON_SRC_FILES
 	FrameDump.h
 	FrameLimiter.cpp
 	FrameLimiter.h
+	SpuRenderThread.cpp
+	SpuRenderThread.h
 	ScreenPositionListener.h
 	InputConfig.cpp
 	InputConfig.h

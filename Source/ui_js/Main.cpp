@@ -247,6 +247,8 @@ static std::atomic<double> g_timeResult = -1;
 static void OnVmStateLoaded()
 {
 	g_hashRemaining = g_hashRequest.exchange(0);
+	//Audio output over ~5 s (fits in the hash window at 50 and 60 Hz)
+	if(g_hashRemaining != 0) CSH_WebAudio::ArmPcmHash(220000);
 	g_vblanksSinceLoad = (g_timeTo > 0) ? 0 : -1;
 }
 
@@ -631,6 +633,11 @@ void setVu1Threaded(bool enabled)
 	g_virtualMachine->SetVu1Threaded(enabled);
 }
 
+void setSpuThreaded(bool enabled)
+{
+	g_virtualMachine->SetSpuThreaded(enabled);
+}
+
 void setFrameLimit(bool enabled)
 {
 	CAppConfig::GetInstance().SetPreferenceBoolean(PREF_PS2_LIMIT_FRAMERATE, enabled);
@@ -889,6 +896,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("setEeAutoIdle", &setEeAutoIdle);
 	function("eeAutoIdleStats", &eeAutoIdleStats);
 	function("eeHashResult", &eeHashResult);
+	function("audioPcmHash", &CSH_WebAudio::GetPcmHash);
 	function("vuHashResult", &vuHashResult);
 	function("setVuBlockChaining", &setVuBlockChaining);
 	function("setVuSkipFlagWrites", &setVuSkipFlagWrites);
@@ -906,6 +914,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("setInputBindings", &setInputBindings);
 	function("setGamepadEnabled", &setGamepadEnabled);
 	function("setVu1Threaded", &setVu1Threaded);
+	function("setSpuThreaded", &setSpuThreaded);
 	function("setGsHack", &setGsHack);
 	function("setEeFrequencyScale", &setEeFrequencyScale);
 	function("blockCacheEnable", &BlockCache::SetEnabled);

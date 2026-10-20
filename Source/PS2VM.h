@@ -16,6 +16,7 @@
 #include "iop/Iop_SubSystem.h"
 #include "sound/SoundHandler.h"
 #include "FrameLimiter.h"
+#include "SpuRenderThread.h"
 #include "Profiler.h"
 
 class CPS2VM : public CVirtualMachine
@@ -77,6 +78,8 @@ public:
 	//The game config can turn it off for a game (<Vu1Threaded Enabled="false"/>).
 	void SetVu1Threaded(bool);
 	void SetGameAllowsVu1Threaded(bool);
+	//SPU2 audio rendered on its own thread (see SpuRenderThread.h). Applied by the VM thread at the next SPU update.
+	void SetSpuThreaded(bool);
 
 	static fs::path GetStateDirectoryPath();
 	fs::path GenerateStatePath(unsigned int) const;
@@ -209,6 +212,10 @@ private:
 	int m_currentSpuBlock = 0;
 	int m_spuBlockCount = 0;
 	CSoundHandler* m_soundHandler = nullptr;
+	//Declared after m_iop: destroyed first
+	std::unique_ptr<CSpuRenderThread> m_spuRenderThread;
+	std::atomic<bool> m_spuThreadedPreference = true;
+	bool m_spuThreaded = false;
 
 	CScreenPositionListener* m_gunListener = nullptr;
 	CScreenPositionListener* m_touchListener = nullptr;

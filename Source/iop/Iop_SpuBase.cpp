@@ -592,6 +592,7 @@ uint32 CSpuBase::ReceiveDma(uint8* buffer, uint32 blockSize, uint32 blockAmount,
 			blockAmount = std::min<uint32>(blockAmount, 0x10);
 			for(unsigned int i = 0; i < blockAmount; i++)
 			{
+				if(m_ramObserver) m_ramObserver->OnRamRead(m_transferAddr, blockSize);
 				memcpy(buffer, m_ram + m_transferAddr, blockSize);
 				m_transferAddr += blockSize;
 				m_transferAddr &= m_ramSize - 1;
@@ -606,10 +607,12 @@ uint32 CSpuBase::ReceiveDma(uint8* buffer, uint32 blockSize, uint32 blockAmount,
 		assert((m_ctrl & CONTROL_DMA) == CONTROL_DMA_WRITE);
 		unsigned int blocksTransfered = 0;
 		m_sampleCache->ClearRange(m_transferAddr, blockSize * blockAmount);
+		if(m_ramObserver) m_ramObserver->OnRamClear(m_transferAddr, blockSize * blockAmount);
 		for(unsigned int i = 0; i < blockAmount; i++)
 		{
 			uint32 copySize = std::min<uint32>(m_ramSize - m_transferAddr, blockSize);
 			memcpy(m_ram + m_transferAddr, buffer, copySize);
+			if(m_ramObserver) m_ramObserver->OnRamWrite(m_transferAddr, copySize);
 			m_transferAddr += blockSize;
 			m_transferAddr &= m_ramSize - 1;
 			buffer += blockSize;
@@ -632,6 +635,7 @@ uint32 CSpuBase::ReceiveDma(uint8* buffer, uint32 blockSize, uint32 blockAmount,
 
 		uint32 dstAddr = m_soundInputDataAddr + m_blockWritePtr;
 		memcpy(m_ram + dstAddr, buffer, blockAmount * blockSize);
+		if(m_ramObserver) m_ramObserver->OnRamWrite(dstAddr, blockAmount * blockSize);
 		m_blockWritePtr += blockAmount * blockSize;
 
 		return blockAmount;
@@ -647,6 +651,11 @@ void CSpuBase::WriteWord(uint16 value)
 	assert((m_transferAddr + 1) < m_ramSize);
 	*reinterpret_cast<uint16*>(&m_ram[m_transferAddr]) = value;
 	m_sampleCache->ClearRange(m_transferAddr, 2);
+	if(m_ramObserver)
+	{
+		m_ramObserver->OnRamWrite(m_transferAddr, 2);
+		m_ramObserver->OnRamClear(m_transferAddr, 2);
+	}
 	m_transferAddr += 2;
 }
 
@@ -716,13 +725,26 @@ void CSpuBase::MixSamples(int32 inputSample, int32 volumeLevel, int16* output)
 
 void CSpuBase::Render(int16* samples, unsigned int sampleCount)
 {
+	if(samples)
+	{
+		RenderImpl<true>(samples, sampleCount);
+	}
+	else
+	{
+		RenderImpl<false>(samples, sampleCount);
+	}
+}
+
+template <bool decode>
+void CSpuBase::RenderImpl(int16* samples, unsigned int sampleCount)
+{
 	bool updateReverb = m_reverbEnabled && (m_ctrl & CONTROL_REVERB) && (m_reverbWorkAddrStart < m_reverbWorkAddrEnd);
 	bool irqEnabled = (m_ctrl & CONTROL_IRQ);
 
 	int16* samplesBase = samples;
 	assert((sampleCount & 0x01) == 0);
 	unsigned int ticks = sampleCount / 2;
-	memset(samples, 0, sizeof(int16) * sampleCount);
+	if(decode) memset(samples, 0, sizeof(int16) * sampleCount);
 
 	for(unsigned int j = 0; j < ticks; j++)
 	{
@@ -734,7 +756,7 @@ void CSpuBase::Render(int16* samples, unsigned int sampleCount)
 			auto& reader(m_reader[i]);
 			if(channel.status == KEY_ON)
 			{
-				reader.SetParamsRead(channel.address, channel.repeat);
+				reader.SetParamsRead<decode>(channel.address, channel.repeat);
 				reader.ClearEndFlag();
 				channel.status = ATTACK;
 				channel.adsrVolume = 0;
@@ -756,14 +778,14 @@ void CSpuBase::Render(int16* samples, unsigned int sampleCount)
 				reader.SetRepeat(channel.repeat);
 			}
 
-			int32 readSample = reader.GetSample();
+			int32 readSample = reader.GetSample<decode>();
 			channel.current = reader.GetCurrent();
 
 			UpdateAdsr(channel);
 			channel.volumeLeftAbs = ComputeChannelVolume(channel.volumeLeft, channel.volumeLeftAbs);
 			channel.volumeRightAbs = ComputeChannelVolume(channel.volumeRight, channel.volumeRightAbs);
 
-			if(readSample == 0) continue;
+			if(!decode || (readSample == 0)) continue;
 
 			//Mix in adsrVolume
 			int32 inputSample = (readSample * static_cast<int32>(channel.adsrVolume >> 16)) / static_cast<int32>(MAX_ADSR_VOLUME >> 16);
@@ -787,11 +809,18 @@ void CSpuBase::Render(int16* samples, unsigned int sampleCount)
 		if(!m_blockReader.CanReadSamples() && (m_blockWritePtr == SOUND_INPUT_DATA_SIZE))
 		{
 			//We're ready to consume some data
-			m_blockReader.FillBlock(m_ram + m_soundInputDataAddr);
+			if(decode)
+				m_blockReader.FillBlock(m_ram + m_soundInputDataAddr);
+			else
+				m_blockReader.SkipFillBlock();
 			m_blockWritePtr = 0;
 		}
 
-		if(m_blockReader.CanReadSamples())
+		if(!decode && m_blockReader.CanReadSamples())
+		{
+			m_blockReader.SkipSamples();
+		}
+		else if(m_blockReader.CanReadSamples())
 		{
 			int32 blockSamples[2] = {};
 			m_blockReader.GetSamples(blockSamples);
@@ -836,10 +865,13 @@ void CSpuBase::Render(int16* samples, unsigned int sampleCount)
 		//Update reverb
 		if(updateReverb)
 		{
-			UpdateReverb(reverbSample, samples);
+			if(decode)
+				UpdateReverb(reverbSample, samples);
+			else
+				SkipReverb();
 		}
 
-		samples += 2;
+		if(decode) samples += 2;
 	}
 
 	if(irqEnabled && m_irqWatcher->HasPendingIrq(m_spuNumber))
@@ -848,7 +880,7 @@ void CSpuBase::Render(int16* samples, unsigned int sampleCount)
 	}
 	m_irqWatcher->ClearIrqPending(m_spuNumber);
 
-	if(m_volumeAdjust != 1.0f)
+	if(decode && (m_volumeAdjust != 1.0f))
 	{
 		for(int i = 0; i < sampleCount; i++)
 		{
@@ -857,6 +889,73 @@ void CSpuBase::Render(int16* samples, unsigned int sampleCount)
 			samplesBase[i] = static_cast<int16>(adjustedSample);
 		}
 	}
+}
+
+void CSpuBase::SkipReverb()
+{
+	//Same state changes as UpdateReverb, without the RAM accesses
+	if(m_reverbTicks & 1)
+	{
+		m_reverbCurrAddr += 2;
+		if(m_reverbCurrAddr >= m_reverbWorkAddrEnd)
+		{
+			m_reverbCurrAddr = m_reverbWorkAddrStart;
+		}
+	}
+	m_reverbTicks++;
+}
+
+void CSpuBase::SetRamObserver(CSpuRamObserver* ramObserver)
+{
+	m_ramObserver = ramObserver;
+}
+
+void CSpuBase::CopyState(const CSpuBase& src, bool keepDecodeState)
+{
+	auto ram = m_ram;
+	auto sampleCache = m_sampleCache;
+	auto irqWatcher = m_irqWatcher;
+	auto ramObserver = m_ramObserver;
+	//Only the decoder fields of these copies are used
+	CSampleReader readers[MAX_CHANNEL];
+	CBlockSampleReader blockReader;
+	if(keepDecodeState)
+	{
+		std::copy(std::begin(m_reader), std::end(m_reader), std::begin(readers));
+		blockReader = m_blockReader;
+	}
+	*this = src;
+	m_ram = ram;
+	m_sampleCache = sampleCache;
+	m_irqWatcher = irqWatcher;
+	m_ramObserver = ramObserver;
+	for(unsigned int i = 0; i < MAX_CHANNEL; i++)
+	{
+		auto& reader = m_reader[i];
+		reader.SetMemory(m_ram, m_ramSize);
+		reader.SetSampleCache(m_sampleCache);
+		reader.SetIrqWatcher(m_irqWatcher);
+		if(keepDecodeState) reader.TakeDecodeState(readers[i]);
+	}
+	if(keepDecodeState) m_blockReader.CopyBlockBuffer(blockReader);
+}
+
+void CSpuBase::CopyDecodeState(const CSpuBase& src)
+{
+	for(unsigned int i = 0; i < MAX_CHANNEL; i++)
+	{
+		m_reader[i].TakeDecodeState(src.m_reader[i]);
+	}
+	m_blockReader.CopyBlockBuffer(src.m_blockReader);
+}
+
+bool CSpuBase::GetReverbWriteRange(uint32& start, uint32& end) const
+{
+	bool updateReverb = m_reverbEnabled && (m_ctrl & CONTROL_REVERB) && (m_reverbWorkAddrStart < m_reverbWorkAddrEnd);
+	if(!updateReverb) return false;
+	start = std::min(m_reverbWorkAddrStart, m_reverbCurrAddr);
+	end = m_reverbWorkAddrEnd;
+	return true;
 }
 
 uint32 CSpuBase::GetAdsrDelta(unsigned int index) const
@@ -1323,12 +1422,31 @@ void CSpuBase::CSampleReader::SetParams(uint32 address, uint32 repeat)
 	m_nextValid = false;
 	m_done = false;
 	m_didChangeRepeat = false;
+	m_paramsGen++;
 }
 
+template <bool decode>
 void CSpuBase::CSampleReader::SetParamsRead(uint32 address, uint32 repeat)
 {
 	SetParams(address, repeat);
-	AdvanceBuffer();
+	AdvanceBuffer<decode>();
+}
+
+void CSpuBase::CSampleReader::TakeDecodeState(const CSampleReader& src)
+{
+	if(src.m_paramsGen == m_paramsGen)
+	{
+		memcpy(m_buffer, src.m_buffer, sizeof(m_buffer));
+		m_s1 = src.m_s1;
+		m_s2 = src.m_s2;
+	}
+	else
+	{
+		//Restarted by SetParamsNoRead (key off right after key on)
+		memset(m_buffer, 0, sizeof(m_buffer));
+		m_s1 = 0;
+		m_s2 = 0;
+	}
 }
 
 void CSpuBase::CSampleReader::SetParamsNoRead(uint32 address, uint32 repeat)
@@ -1343,9 +1461,20 @@ void CSpuBase::CSampleReader::SetPitch(uint32 baseSamplingRate, uint16 pitch)
 	UpdateSampleStep();
 }
 
+template <bool decode>
 int32 CSpuBase::CSampleReader::GetSample()
 {
 	uint32 srcSampleIdx = m_srcSampleIdx / PITCH_BASE;
+	if(!decode)
+	{
+		m_srcSampleIdx += m_sampleStep;
+		if(srcSampleIdx >= BUFFER_SAMPLES)
+		{
+			m_srcSampleIdx -= BUFFER_SAMPLES * PITCH_BASE;
+			AdvanceBuffer<false>();
+		}
+		return 0;
+	}
 	int32 srcSampleAlpha = m_srcSampleIdx % PITCH_BASE;
 	int32 currentSample = m_buffer[srcSampleIdx];
 	int32 nextSample = m_buffer[srcSampleIdx + 1];
@@ -1355,22 +1484,23 @@ int32 CSpuBase::CSampleReader::GetSample()
 	if(srcSampleIdx >= BUFFER_SAMPLES)
 	{
 		m_srcSampleIdx -= BUFFER_SAMPLES * PITCH_BASE;
-		AdvanceBuffer();
+		AdvanceBuffer<true>();
 	}
 	return resultSample;
 }
 
+template <bool decode>
 void CSpuBase::CSampleReader::AdvanceBuffer()
 {
 	if(m_nextValid)
 	{
-		memmove(m_buffer, m_buffer + BUFFER_SAMPLES, sizeof(int16) * BUFFER_SAMPLES);
-		UnpackSamples(m_buffer + BUFFER_SAMPLES);
+		if(decode) memmove(m_buffer, m_buffer + BUFFER_SAMPLES, sizeof(int16) * BUFFER_SAMPLES);
+		UnpackSamples<decode>(m_buffer + BUFFER_SAMPLES);
 	}
 	else
 	{
-		UnpackSamples(m_buffer);
-		UnpackSamples(m_buffer + BUFFER_SAMPLES);
+		UnpackSamples<decode>(m_buffer);
+		UnpackSamples<decode>(m_buffer + BUFFER_SAMPLES);
 		m_nextValid = true;
 	}
 }
@@ -1380,6 +1510,7 @@ void CSpuBase::CSampleReader::UpdateSampleStep()
 	m_sampleStep = m_srcSamplingRate / m_dstSamplingRate;
 }
 
+template <bool decode>
 void CSpuBase::CSampleReader::UnpackSamples(int16* dst)
 {
 	int32 workBuffer[BUFFER_SAMPLES];
@@ -1401,7 +1532,11 @@ void CSpuBase::CSampleReader::UnpackSamples(int16* dst)
 		cacheKey.s2 = 0;
 	}
 
-	if(auto cacheItem = m_sampleCache->GetItem(cacheKey))
+	if(!decode)
+	{
+		//Header only: the flags below drive the voice position
+	}
+	else if(auto cacheItem = m_sampleCache->GetItem(cacheKey))
 	{
 		memcpy(dst, cacheItem->samples, sizeof(int16) * BUFFER_SAMPLES);
 		m_s1 = cacheItem->outS1;
@@ -1584,6 +1719,21 @@ void CSpuBase::CBlockSampleReader::FillBlock(const uint8* block)
 {
 	memcpy(m_blockBuffer, block, SOUND_INPUT_DATA_SIZE);
 	m_srcSampleIdx = 0;
+}
+
+void CSpuBase::CBlockSampleReader::SkipFillBlock()
+{
+	m_srcSampleIdx = 0;
+}
+
+void CSpuBase::CBlockSampleReader::SkipSamples()
+{
+	m_srcSampleIdx += m_sampleStep;
+}
+
+void CSpuBase::CBlockSampleReader::CopyBlockBuffer(const CBlockSampleReader& src)
+{
+	memcpy(m_blockBuffer, src.m_blockBuffer, sizeof(m_blockBuffer));
 }
 
 void CSpuBase::CBlockSampleReader::GetSamples(int32 samples[2])

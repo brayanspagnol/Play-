@@ -61,6 +61,19 @@ namespace Iop
 		bool m_irqPending[MAX_CORES] = {};
 	};
 
+	//Sees every SPU RAM access made outside of Render (DMA, PIO), see CSpuRenderThread
+	class CSpuRamObserver
+	{
+	public:
+		virtual ~CSpuRamObserver() = default;
+		//Sample cache range invalidation (replayed as is: the cache keys on block start addresses)
+		virtual void OnRamClear(uint32 address, uint32 size) = 0;
+		//Called after the bytes were written to SPU RAM
+		virtual void OnRamWrite(uint32 address, uint32 size) = 0;
+		//Called before the bytes are read from SPU RAM
+		virtual void OnRamRead(uint32 address, uint32 size) = 0;
+	};
+
 	class CSpuBase
 	{
 	public:
@@ -271,7 +284,19 @@ namespace Iop
 
 		uint32 ReceiveDma(uint8*, uint32, uint32, uint32);
 
+		//With a null buffer, only advances what the emulated machine can see (voice positions, end flags,
+		//envelopes, IRQs, input block positions) and skips sample decoding, mixing and reverb.
 		void Render(int16*, unsigned int);
+
+		void SetRamObserver(CSpuRamObserver*);
+		//Takes every register and voice position from the source but keeps this object's memory pointers,
+		//and either keeps (keepDecodeState) or takes the decoder state (ADPCM history, decoded samples,
+		//input block). A voice restarted outside of Render on the source gets a cleared decoder.
+		void CopyState(const CSpuBase&, bool keepDecodeState);
+		//Takes only the decoder state from the source (same rule for restarted voices)
+		void CopyDecodeState(const CSpuBase&);
+		//SPU RAM range the reverb of the next Render may write, false if reverb is off
+		bool GetReverbWriteRange(uint32& start, uint32& end) const;
 
 		static bool g_reverbParamIsAddress[REVERB_PARAM_COUNT];
 
@@ -312,9 +337,12 @@ namespace Iop
 			void LoadState(const CRegisterState&);
 			void SaveState(CRegisterState&) const;
 
+			template <bool decode>
 			void SetParamsRead(uint32, uint32);
 			void SetParamsNoRead(uint32, uint32);
 			void SetPitch(uint32, uint16);
+			//decode == false: advances the position only (returns 0)
+			template <bool decode>
 			int32 GetSample();
 			uint32 GetRepeat() const;
 			void SetRepeat(uint32);
@@ -327,11 +355,15 @@ namespace Iop
 			bool DidChangeRepeat() const;
 			void ClearDidChangeRepeat();
 
+			void TakeDecodeState(const CSampleReader&);
+
 		private:
 			static constexpr int BUFFER_SAMPLES = 28;
 
 			void SetParams(uint32, uint32);
+			template <bool decode>
 			void UnpackSamples(int16*);
+			template <bool decode>
 			void AdvanceBuffer();
 			void UpdateSampleStep();
 
@@ -354,6 +386,8 @@ namespace Iop
 			bool m_nextValid;
 			bool m_endFlag;
 			bool m_didChangeRepeat;
+			//Incremented by SetParams: tells a copy whether the voice was restarted
+			uint32 m_paramsGen = 0;
 
 			static_assert((sizeof(decltype(m_buffer)) % 16) == 0, "sizeof(m_buffer) must be a multiple of 16 (needed for saved state).");
 			static_assert(CSampleReader::BUFFER_SAMPLES == CSpuSampleCache::BUFFER_SAMPLES, "Buffer sample size must match cache sample size.");
@@ -372,6 +406,10 @@ namespace Iop
 
 			void FillBlock(const uint8*);
 			void GetSamples(int32[2]);
+			//Same positions as FillBlock/GetSamples without the data
+			void SkipFillBlock();
+			void SkipSamples();
+			void CopyBlockBuffer(const CBlockSampleReader&);
 
 		private:
 			void UpdateSampleStep();
@@ -390,7 +428,10 @@ namespace Iop
 		};
 
 		void UpdateAdsr(CHANNEL&);
+		template <bool decode>
+		void RenderImpl(int16*, unsigned int);
 		void UpdateReverb(int16[2], int16*);
+		void SkipReverb();
 		uint32 GetAdsrDelta(unsigned int) const;
 		float GetReverbSample(uint32) const;
 		void SetReverbSample(uint32, float);
@@ -431,6 +472,7 @@ namespace Iop
 		CBlockSampleReader m_blockReader;
 		uint32 m_soundInputDataAddr = 0;
 		uint32 m_blockWritePtr = 0;
+		CSpuRamObserver* m_ramObserver = nullptr;
 
 		static_assert((sizeof(decltype(m_reverb)) % 16) == 0, "sizeof(m_reverb) must be a multiple of 16 (needed for saved state).");
 	};

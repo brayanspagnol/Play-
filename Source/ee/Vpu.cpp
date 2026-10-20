@@ -99,7 +99,7 @@ void CVpu::Execute(int32 quota)
 	case MIPS_EXCEPTION_VU_EBIT:
 		//E bit encountered
 		m_vuState = VU_STATE_READY;
-		VuStateChanged(m_vuState);
+		if(VuStateChanged) VuStateChanged(m_vuState);
 		break;
 	case MIPS_EXCEPTION_VU_TBIT:
 	case MIPS_EXCEPTION_VU_DBIT:
@@ -111,7 +111,7 @@ void CVpu::Execute(int32 quota)
 			if(mustBreak)
 			{
 				m_vuState = VU_STATE_STOPPED;
-				VuStateChanged(m_vuState);
+				if(VuStateChanged) VuStateChanged(m_vuState);
 				VuInterruptTriggered();
 			}
 			else
@@ -297,7 +297,7 @@ void CVpu::ExecuteMicroProgram(uint32 nAddress)
 
 	assert(m_vuState != VU_STATE_RUNNING);
 	m_vuState = VU_STATE_RUNNING;
-	VuStateChanged(m_vuState);
+	if(VuStateChanged) VuStateChanged(m_vuState);
 	for(unsigned int i = 0; m_runToCompletion || (i < 100); i++)
 	{
 		Execute(5000);

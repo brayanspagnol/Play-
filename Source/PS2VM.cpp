@@ -488,6 +488,8 @@ void CPS2VM::ValidateThreadContext()
 void CPS2VM::CreateVM()
 {
 	m_iop = std::make_unique<Iop::CSubSystem>(true);
+	m_spuRenderThread = std::make_unique<CSpuRenderThread>(m_iop->m_spuCore0, m_iop->m_spuCore1, m_iop->m_spuRam, PS2::SPU_RAM_SIZE,
+	                                                       BLOCK_SIZE, MAX_BLOCK_COUNT, DST_SAMPLE_RATE);
 	auto iopOs = dynamic_cast<CIopBios*>(m_iop->m_bios.get());
 
 	m_ee = std::make_unique<Ee::CSubSystem>(m_iop->m_ram, *iopOs);
@@ -508,6 +510,7 @@ void CPS2VM::ResetVM()
 
 	m_ee->Reset(m_eeRamSize);
 	m_iop->Reset();
+	m_spuRenderThread->RequestResync();
 
 	if(m_ee->m_gs != NULL)
 	{
@@ -574,6 +577,7 @@ bool CPS2VM::SaveVMState(const fs::path& statePath)
 
 		m_ee->SyncVu1();
 		m_ee->SaveState(archive);
+		m_spuRenderThread->SyncBack();
 		m_iop->SaveState(archive);
 		m_ee->m_gs->SaveState(archive);
 		SaveVmTimingState(archive);
@@ -606,6 +610,9 @@ bool CPS2VM::LoadVMState(const fs::path& statePath)
 			m_ee->SyncVu1();
 			m_ee->LoadState(archive);
 			m_iop->LoadState(archive);
+			//Audio of the blocks before the load goes out first
+			m_spuRenderThread->Drain();
+			m_spuRenderThread->RequestResync();
 			m_ee->m_gs->LoadState(archive);
 			LoadVmTimingState(archive);
 
@@ -728,6 +735,7 @@ void CPS2VM::ReloadSpuBlockCountImpl()
 void CPS2VM::DestroySoundHandlerImpl()
 {
 	if(m_soundHandler == nullptr) return;
+	if(m_spuRenderThread) m_spuRenderThread->Drain();
 	delete m_soundHandler;
 	m_soundHandler = nullptr;
 }
@@ -815,6 +823,20 @@ void CPS2VM::UpdateSpu()
 #ifdef PROFILE
 	CProfilerZone profilerZone(m_spuProfilerZone);
 #endif
+
+	bool spuThreaded = m_spuThreadedPreference;
+	if(spuThreaded != m_spuThreaded)
+	{
+		//Off: the VM's cores and RAM take the replicas' decoder state and reverb writes back
+		if(!spuThreaded) m_spuRenderThread->SyncBack();
+		m_spuRenderThread->RequestResync();
+		m_spuThreaded = spuThreaded;
+	}
+	if(m_spuThreaded)
+	{
+		m_spuRenderThread->RenderBlock(m_soundHandler, m_spuBlockCount);
+		return;
+	}
 
 	unsigned int blockOffset = (BLOCK_SIZE * m_currentSpuBlock);
 	int16* samplesSpu0 = m_samples + blockOffset;
@@ -907,6 +929,7 @@ void CPS2VM::ReloadExecutable(const char* executablePath, const CPS2OS::Argument
 	{
 		//SPU RAM is not cleared by a LoadExecPS2 operation, we must keep its contents
 		//Deus Ex uses SPU RAM to keep game state in between executable reloads
+		m_spuRenderThread->SyncBack();
 		auto savedSpuRam = std::vector<uint8>(PS2::SPU_RAM_SIZE);
 		memcpy(savedSpuRam.data(), m_iop->m_spuRam, PS2::SPU_RAM_SIZE);
 		ResetVM();
@@ -938,6 +961,11 @@ void CPS2VM::SetVu1Threaded(bool threaded)
 void CPS2VM::SetGameAllowsVu1Threaded(bool allowed)
 {
 	m_gameAllowsVu1Threaded = allowed;
+}
+
+void CPS2VM::SetSpuThreaded(bool threaded)
+{
+	m_spuThreadedPreference = threaded;
 }
 
 void CPS2VM::OnCrtModeChange()

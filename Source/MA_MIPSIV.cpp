@@ -115,12 +115,55 @@ static const uint64 g_LDMaskLeft[8] =
 };
 // clang-format on
 
+//Unaligned accesses always call these proxies, so look up the page table first (same pages and
+//semantics as the JIT's inline accesses), then fall back to the memory map. Not with a TLB: its
+//translation can differ from the page table's fixed mapping.
+template <typename T>
+static T* GetPageRef(CMIPS* context, void** pageTable, uint32 address)
+{
+	if(!pageTable || context->m_TLBExceptionChecker) return nullptr;
+	auto page = reinterpret_cast<uint8*>(pageTable[address / MIPS_PAGE_SIZE]);
+	return page ? reinterpret_cast<T*>(page + (address & (MIPS_PAGE_SIZE - 1))) : nullptr;
+}
+
+static uint32 GetWordFast(CMIPS* context, uint32 address)
+{
+	if(auto ref = GetPageRef<uint32>(context, context->m_pageLookup, address)) return *ref;
+	return MemoryUtils_GetWordProxy(context, address);
+}
+
+static uint64 GetDoubleFast(CMIPS* context, uint32 address)
+{
+	if(auto ref = GetPageRef<uint64>(context, context->m_pageLookup, address)) return *ref;
+	return MemoryUtils_GetDoubleProxy(context, address);
+}
+
+static void SetWordFast(CMIPS* context, uint32 value, uint32 address)
+{
+	if(auto ref = GetPageRef<uint32>(context, context->m_pageLookupWrite, address))
+	{
+		*ref = value;
+		return;
+	}
+	MemoryUtils_SetWordProxy(context, value, address);
+}
+
+static void SetDoubleFast(CMIPS* context, uint64 value, uint32 address)
+{
+	if(auto ref = GetPageRef<uint64>(context, context->m_pageLookupWrite, address))
+	{
+		*ref = value;
+		return;
+	}
+	MemoryUtils_SetDoubleProxy(context, value, address);
+}
+
 extern "C" uint32 LWL_Proxy(uint32 address, uint32 rt, CMIPS* context)
 {
 	uint32 alignedAddress = address & ~0x03;
 	uint32 byteOffset = address & 0x03;
 	uint32 accessType = 3 - byteOffset;
-	uint32 memory = MemoryUtils_GetWordProxy(context, alignedAddress);
+	uint32 memory = GetWordFast(context, alignedAddress);
 	memory <<= accessType * 8;
 	rt &= g_LWMaskRight[byteOffset];
 	rt |= memory;
@@ -132,7 +175,7 @@ extern "C" uint32 LWR_Proxy(uint32 address, uint32 rt, CMIPS* context)
 	uint32 alignedAddress = address & ~0x03;
 	uint32 byteOffset = address & 0x03;
 	uint32 accessType = 3 - byteOffset;
-	uint32 memory = MemoryUtils_GetWordProxy(context, alignedAddress);
+	uint32 memory = GetWordFast(context, alignedAddress);
 	memory >>= byteOffset * 8;
 	rt &= g_LWMaskLeft[accessType];
 	rt |= memory;
@@ -144,7 +187,7 @@ extern "C" uint64 LDL_Proxy(uint32 address, uint64 rt, CMIPS* context)
 	uint32 alignedAddress = address & ~0x07;
 	uint32 byteOffset = address & 0x07;
 	uint32 accessType = 7 - byteOffset;
-	uint64 memory = MemoryUtils_GetDoubleProxy(context, alignedAddress);
+	uint64 memory = GetDoubleFast(context, alignedAddress);
 	memory <<= accessType * 8;
 	rt &= g_LDMaskRight[byteOffset];
 	rt |= memory;
@@ -156,7 +199,7 @@ extern "C" uint64 LDR_Proxy(uint32 address, uint64 rt, CMIPS* context)
 	uint32 alignedAddress = address & ~0x07;
 	uint32 byteOffset = address & 0x07;
 	uint32 accessType = 7 - byteOffset;
-	uint64 memory = MemoryUtils_GetDoubleProxy(context, alignedAddress);
+	uint64 memory = GetDoubleFast(context, alignedAddress);
 	memory >>= byteOffset * 8;
 	rt &= g_LDMaskLeft[accessType];
 	rt |= memory;
@@ -169,10 +212,10 @@ extern "C" void SWL_Proxy(uint32 address, uint32 rt, CMIPS* context)
 	uint32 byteOffset = address & 0x03;
 	uint32 accessType = 3 - byteOffset;
 	rt >>= accessType * 8;
-	uint32 memory = MemoryUtils_GetWordProxy(context, alignedAddress);
+	uint32 memory = GetWordFast(context, alignedAddress);
 	memory &= g_LWMaskLeft[byteOffset];
 	memory |= rt;
-	MemoryUtils_SetWordProxy(context, memory, alignedAddress);
+	SetWordFast(context, memory, alignedAddress);
 }
 
 extern "C" void SWR_Proxy(uint32 address, uint32 rt, CMIPS* context)
@@ -181,10 +224,10 @@ extern "C" void SWR_Proxy(uint32 address, uint32 rt, CMIPS* context)
 	uint32 byteOffset = address & 0x03;
 	uint32 accessType = 3 - byteOffset;
 	rt <<= byteOffset * 8;
-	uint32 memory = MemoryUtils_GetWordProxy(context, alignedAddress);
+	uint32 memory = GetWordFast(context, alignedAddress);
 	memory &= g_LWMaskRight[accessType];
 	memory |= rt;
-	MemoryUtils_SetWordProxy(context, memory, alignedAddress);
+	SetWordFast(context, memory, alignedAddress);
 }
 
 extern "C" void SDL_Proxy(uint32 address, uint64 rt, CMIPS* context)
@@ -193,10 +236,10 @@ extern "C" void SDL_Proxy(uint32 address, uint64 rt, CMIPS* context)
 	uint32 byteOffset = address & 0x07;
 	uint32 accessType = 7 - byteOffset;
 	rt >>= accessType * 8;
-	uint64 memory = MemoryUtils_GetDoubleProxy(context, alignedAddress);
+	uint64 memory = GetDoubleFast(context, alignedAddress);
 	memory &= g_LDMaskLeft[byteOffset];
 	memory |= rt;
-	MemoryUtils_SetDoubleProxy(context, memory, alignedAddress);
+	SetDoubleFast(context, memory, alignedAddress);
 }
 
 extern "C" void SDR_Proxy(uint32 address, uint64 rt, CMIPS* context)
@@ -205,10 +248,10 @@ extern "C" void SDR_Proxy(uint32 address, uint64 rt, CMIPS* context)
 	uint32 byteOffset = address & 0x07;
 	uint32 accessType = 7 - byteOffset;
 	rt <<= byteOffset * 8;
-	uint64 memory = MemoryUtils_GetDoubleProxy(context, alignedAddress);
+	uint64 memory = GetDoubleFast(context, alignedAddress);
 	memory &= g_LDMaskRight[accessType];
 	memory |= rt;
-	MemoryUtils_SetDoubleProxy(context, memory, alignedAddress);
+	SetDoubleFast(context, memory, alignedAddress);
 }
 
 CMA_MIPSIV::CMA_MIPSIV(MIPS_REGSIZE nRegSize)
