@@ -394,13 +394,14 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 	int liveExperiment = g_vuExperiment;
 	//Variants alternate (reference, promoted, promoted + superblocks, reference, ...). Each starts from
 	//freshly instantiated blocks, so it first runs for a while to let the engine tier the code up.
-	static const char* variantNames[3] = {"reference", "promoted", "superblocks"};
+	//(With experiment bits set, the third variant is "promoted + experiment" instead of superblocks)
+	const char* variantNames[3] = {"reference", "promoted", (g_vuReplayExperiment != 0) ? "experiment" : "superblocks"};
 	for(int round = 0; round < 9; round++)
 	{
 		int variant = round % 3;
 		g_vuContextPromotion = (variant != 0);
-		g_vuSuperBlocks = (variant == 2);
-		g_vuExperiment = (variant != 0) ? g_vuReplayExperiment : 0;
+		g_vuSuperBlocks = (variant == 2) && (g_vuReplayExperiment == 0);
+		g_vuExperiment = (variant == 2) ? g_vuReplayExperiment : 0;
 		static_cast<CVuExecutor*>(m_ctx->m_executor.get())->DropBlocks();
 		std::vector<uint64> hashes;
 		for(const auto& capture : g_vuCaptures) hashes.push_back(runCapture(capture, true));

@@ -4,6 +4,7 @@
 #include "MemoryUtils.h"
 #include "Vpu.h"
 #include "VUShared.h"
+#include "../Ps2Const.h"
 #include <algorithm>
 #include <cstring>
 
@@ -729,12 +730,22 @@ void CVuBasicBlock::ComputeSkipFlagsHints(const std::vector<uint32>& fmacStallDe
 	//Take into account the instructions that come after this block (up to 4 cycles later)
 	uint32 extendedMaxPipeTime = maxPipeTime + VUShared::LATENCY_MAC;
 
-	std::vector<uint32> flagsResults;
-	flagsResults.resize(extendedMaxPipeTime);
-	std::fill(flagsResults.begin(), flagsResults.end(), g_undefinedMACflagsResult);
-
-	std::vector<bool> resultUsed;
-	resultUsed.resize(maxInstructions);
+	//MAC and status (sticky) flags are written by the same instructions and read by the same ones
+	//(status readers also read the MAC flags), clip flags by CLIP and FCxxx. A result that no reader
+	//can see (a newer one is visible before any read and by the end of the block) needs no pipeline write.
+	enum
+	{
+		FLAGS_MAC,
+		FLAGS_CLIP,
+		FLAGS_MAX,
+	};
+	std::vector<uint32> flagsResults[FLAGS_MAX];
+	std::vector<bool> resultUsed[FLAGS_MAX];
+	for(uint32 kind = 0; kind < FLAGS_MAX; kind++)
+	{
+		flagsResults[kind].resize(extendedMaxPipeTime, g_undefinedMACflagsResult);
+		resultUsed[kind].resize(maxInstructions);
+	}
 
 	uint32 relativePipeTime = 0;
 	for(uint32 address = m_begin; address <= m_end; address += 8)
@@ -753,20 +764,25 @@ void CVuBasicBlock::ComputeSkipFlagsHints(const std::vector<uint32>& fmacStallDe
 
 		relativePipeTime += fmacStallDelays[instructionIndex];
 
-		if(hiOps.writeMACflags)
+		const bool writes[FLAGS_MAX] = {hiOps.writeMACflags, hiOps.writeClipFlags};
+		const bool reads[FLAGS_MAX] = {loOps.readMACflags, loOps.readClipFlags};
+		for(uint32 kind = 0; kind < FLAGS_MAX; kind++)
 		{
-			//Make this result available
-			std::fill(
-			    flagsResults.begin() + relativePipeTime + VUShared::LATENCY_MAC,
-			    flagsResults.end(), instructionIndex);
-		}
-
-		if(loOps.readMACflags)
-		{
-			uint32 pipeTimeForResult = flagsResults[relativePipeTime];
-			if(pipeTimeForResult != g_undefinedMACflagsResult)
+			if(writes[kind])
 			{
-				resultUsed[pipeTimeForResult] = true;
+				//Make this result available
+				std::fill(
+				    flagsResults[kind].begin() + relativePipeTime + VUShared::LATENCY_MAC,
+				    flagsResults[kind].end(), instructionIndex);
+			}
+
+			if(reads[kind])
+			{
+				uint32 pipeTimeForResult = flagsResults[kind][relativePipeTime];
+				if(pipeTimeForResult != g_undefinedMACflagsResult)
+				{
+					resultUsed[kind][pipeTimeForResult] = true;
+				}
 			}
 		}
 
@@ -774,22 +790,32 @@ void CVuBasicBlock::ComputeSkipFlagsHints(const std::vector<uint32>& fmacStallDe
 	}
 
 	//Simulate usage from outside our block
-	for(uint32 relativePipeTime = maxPipeTime; relativePipeTime < extendedMaxPipeTime; relativePipeTime++)
+	for(uint32 kind = 0; kind < FLAGS_MAX; kind++)
 	{
-		uint32 pipeTimeForResult = flagsResults[relativePipeTime];
-		if(pipeTimeForResult != g_undefinedMACflagsResult)
+		for(uint32 relativePipeTime = maxPipeTime; relativePipeTime < extendedMaxPipeTime; relativePipeTime++)
 		{
-			resultUsed[pipeTimeForResult] = true;
+			uint32 pipeTimeForResult = flagsResults[kind][relativePipeTime];
+			if(pipeTimeForResult != g_undefinedMACflagsResult)
+			{
+				resultUsed[kind][pipeTimeForResult] = true;
+			}
 		}
 	}
+
+	//Status/clip: VU1 only. VU0's flag pipelines are copied into the EE context (macro mode), and
+	//the EE state must stay byte identical (state hashes, save states)
+	bool vu1 = (m_cacheVariant & PS2::MICROMEM1SIZE) != 0;
 
 	//Flag unused results
 	for(uint32 instructionIndex = 0; instructionIndex < maxInstructions; instructionIndex++)
 	{
-		bool used = resultUsed[instructionIndex];
-		if(!used)
+		if(!resultUsed[FLAGS_MAC][instructionIndex])
 		{
-			hints[instructionIndex] |= VUShared::COMPILEHINT_SKIP_FMAC_UPDATE;
+			hints[instructionIndex] |= VUShared::COMPILEHINT_SKIP_FMAC_UPDATE | (vu1 ? VUShared::COMPILEHINT_SKIP_STICKY_UPDATE : 0);
+		}
+		if(vu1 && !resultUsed[FLAGS_CLIP][instructionIndex])
+		{
+			hints[instructionIndex] |= VUShared::COMPILEHINT_SKIP_CLIP_UPDATE;
 		}
 	}
 }

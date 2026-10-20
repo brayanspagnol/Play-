@@ -71,6 +71,8 @@ namespace VUShared
 		bool readP;
 		bool readMACflags;
 		bool writeMACflags;
+		bool readClipFlags;
+		bool writeClipFlags;
 
 		//When set, means that a branch following the instruction will be
 		//able to use the integer value directly
@@ -98,6 +100,10 @@ namespace VUShared
 		COMPILEHINT_SKIP_FMAC_UPDATE = (1 << 0),
 		COMPILEHINT_USE_ACCURATE_ADDI = (1 << 1), //For decompression in Tri-Ace games
 		COMPILEHINT_NO_CLAMPING = (1 << 2),
+		//No reader can see the result: the status (sticky) / clip flag pipeline write can be skipped
+		//(only with flag forwarding, which keeps the latest value for the next instruction)
+		COMPILEHINT_SKIP_STICKY_UPDATE = (1 << 3),
+		COMPILEHINT_SKIP_CLIP_UPDATE = (1 << 4),
 	};
 
 	static bool UseClamping(uint32 compileHints)
@@ -154,7 +160,7 @@ namespace VUShared
 	void ADDAbc(CMipsJitter*, uint8, uint8, uint8, uint8, uint32, uint32);
 	void ADDAi(CMipsJitter*, uint8, uint8, uint32, uint32);
 	void ADDAq(CMipsJitter*, uint8, uint8, uint32, uint32);
-	void CLIP(CMipsJitter*, uint8, uint8, uint32);
+	void CLIP(CMipsJitter*, uint8, uint8, uint32, uint32 compileHints = 0);
 	void DIV(CMipsJitter*, uint8, uint8, uint8, uint8, uint32);
 	void FTOI0(CMipsJitter*, uint8, uint8, uint8);
 	void FTOI4(CMipsJitter*, uint8, uint8, uint8);
@@ -236,7 +242,7 @@ namespace VUShared
 	void CheckPipeline(const REGISTER_PIPEINFO&, CMipsJitter*, uint32);
 	void QueueInPipeline(const REGISTER_PIPEINFO&, CMipsJitter*, uint32, uint32);
 	void CheckFlagPipeline(const FLAG_PIPEINFO&, CMipsJitter*, uint32);
-	void QueueInFlagPipeline(const FLAG_PIPEINFO&, CMipsJitter*, uint32, uint32);
+	void QueueInFlagPipeline(const FLAG_PIPEINFO&, CMipsJitter*, uint32, uint32, bool skipWrite = false);
 	void ResetFlagPipeline(const FLAG_PIPEINFO&, CMipsJitter*);
 	//Pushes the latest value queued in a flag pipeline (values[index - 1])
 	void PushLatestFlagPipelineValue(const FLAG_PIPEINFO&, CMipsJitter*);

@@ -476,7 +476,7 @@ void CMA_VU::CUpper::FTOI15()
 //07
 void CMA_VU::CUpper::CLIP()
 {
-	VUShared::CLIP(m_codeGen, m_nFS, m_nFT, m_relativePipeTime);
+	VUShared::CLIP(m_codeGen, m_nFS, m_nFT, m_relativePipeTime, m_compileHints);
 }
 
 //08

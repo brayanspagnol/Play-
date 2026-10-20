@@ -18,6 +18,7 @@
 #include "AsyncCompile.h"
 #include "xxhash.h"
 #include "Jitter_CodeGen_Wasm.h"
+#include "WasmModuleBuilder.h"
 #include "string_format.h"
 
 //VU blocks keep context symbols (VF/VI registers, flags, pipeline state) in wasm locals.
@@ -133,10 +134,54 @@ bool g_eeContextPromotion = false;
 
 extern uint32 g_jitPageAccess;
 
+bool CBasicBlock::UsesModuleBatching() const
+{
+	return ((m_category == BLOCK_CATEGORY_PS2_EE) || (m_category == BLOCK_CATEGORY_PS2_VU)) && (g_eeBatchSize != 0);
+}
+
+#if defined(__EMSCRIPTEN__) && !defined(AOT_USE_CACHE)
+std::vector<std::shared_ptr<CBasicBlock>> CBasicBlock::BatchModules(std::vector<std::weak_ptr<CBasicBlock>>& pending)
+{
+	std::vector<std::shared_ptr<CBasicBlock>> blocks;
+	std::vector<CWasmModuleBuilder::MODULE_BYTES> modules;
+	for(const auto& weakBlock : pending)
+	{
+		auto block = weakBlock.lock();
+		if(!block || block->GetBatchModule().empty()) continue;
+		modules.push_back({block->GetBatchModule().data(), static_cast<uint32>(block->GetBatchModule().size())});
+		blocks.push_back(std::move(block));
+	}
+	pending.clear();
+	if(blocks.empty()) return blocks;
+	auto batch = CWasmModuleBuilder::BuildBatchModule(modules);
+	auto fctIds = batch.empty() ? std::vector<int>() : CMemoryFunction::CreateWasmBatch(batch.data(), batch.size(), static_cast<uint32>(blocks.size()));
+	if(fctIds.empty())
+	{
+		for(auto& block : blocks) block->GetBatchModule() = std::vector<uint8>();
+		blocks.clear();
+		return blocks;
+	}
+	for(uint32 i = 0; i < blocks.size(); i++)
+	{
+		blocks[i]->ReplaceWasmFunction(fctIds[i]);
+	}
+	return blocks;
+}
+#endif
+
+//VU block chaining (Module.setVuBlockChaining), read when blocks are compiled
+bool g_vuBlockChaining = true;
+extern bool g_vuDiffMode;
+
 bool CBasicBlock::UsesBlockChaining() const
 {
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
-	return g_eeBlockChaining && (m_context.m_blockFnLookup != nullptr) && !IsEmpty();
+	if(m_category == BLOCK_CATEGORY_PS2_VU)
+	{
+		//(The differential test runs blocks through CBasicBlock::Execute)
+		return g_vuBlockChaining && !g_vuDiffMode && (m_cacheVariant != 0) && !IsEmpty();
+	}
+	return g_eeBlockChaining && (m_category == BLOCK_CATEGORY_PS2_EE) && (m_context.m_blockFnLookup != nullptr) && !IsEmpty();
 #else
 	return false;
 #endif
@@ -199,7 +244,8 @@ void CBasicBlock::Compile()
 			CProfilerZone profilerZone(compileWasmZone);
 #endif
 			m_function = CMemoryFunction(cachedCode.data(), cachedCode.size());
-			if((m_category == BLOCK_CATEGORY_PS2_EE) && (g_eeBatchSize != 0)) m_batchModule = cachedCode;
+			m_chainFunctionIndex = GetFunctionIndex();
+			if(UsesModuleBatching()) m_batchModule = cachedCode;
 			return;
 		}
 	}
@@ -278,6 +324,9 @@ void CBasicBlock::Compile()
 		CProfilerZone profilerZone(compileWasmZone);
 #endif
 		m_function = CMemoryFunction(stream.GetBuffer(), stream.GetSize());
+#if defined(__EMSCRIPTEN__) && !defined(AOT_USE_CACHE)
+		m_chainFunctionIndex = GetFunctionIndex();
+#endif
 	}
 #ifdef PROFILE
 	{
@@ -292,7 +341,7 @@ void CBasicBlock::Compile()
 	}
 #endif
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
-	if((m_category == BLOCK_CATEGORY_PS2_EE) && (g_eeBatchSize != 0) && !IsEmpty() && !m_diffExecute)
+	if(UsesModuleBatching() && !IsEmpty() && !m_diffExecute)
 	{
 		m_batchModule.assign(stream.GetBuffer(), stream.GetBuffer() + stream.GetSize());
 	}
@@ -563,6 +612,21 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 		jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
 		jitter->PushCst(0);
 		jitter->BeginIf(Jitter::CONDITION_EQ);
+		if(m_category == BLOCK_CATEGORY_PS2_VU)
+		{
+			//VU: m_blockFnLookup is the executor's block table (CBasicBlock*, one per word; the
+			//empty block compiles missing ones), the function index is read from the block
+			jitter->PushRelRef(offsetof(CMIPS, m_blockFnLookup));
+			jitter->PushRel(offsetof(CMIPS, m_State.nPC));
+			jitter->PushCst(m_cacheVariant - 1); //VU memory size
+			jitter->And();
+			jitter->Srl(2);
+			jitter->LoadRefFromRefIdx();
+			jitter->PushCst(GetChainFunctionIndexOffset() / 4);
+			jitter->LoadFromRefIdx();
+			jitter->JumpToIndirect();
+		}
+		else
 		{
 			jitter->PushRelRef(offsetof(CMIPS, m_blockFnLookup));
 			jitter->PushRel(offsetof(CMIPS, m_State.nPC));
@@ -580,6 +644,16 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 		jitter->EndIf();
 	}
 }
+
+#if defined(__EMSCRIPTEN__) && !defined(AOT_USE_CACHE)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Winvalid-offsetof"
+size_t CBasicBlock::GetChainFunctionIndexOffset()
+{
+	return offsetof(CBasicBlock, m_chainFunctionIndex);
+}
+#pragma clang diagnostic pop
+#endif
 
 bool CBasicBlock::MaySetDelayedJump() const
 {
@@ -691,6 +765,7 @@ void CBasicBlock::SubmitAsyncJob(CMipsJitter* jitter, bool hot)
 void CBasicBlock::SetCompiledFunction(CMemoryFunction&& function)
 {
 	m_function = std::move(function);
+	m_chainFunctionIndex = GetFunctionIndex();
 	m_interpreterProgram.reset();
 	m_asyncJob.reset();
 }
@@ -920,6 +995,9 @@ void CBasicBlock::CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& other)
 #endif
 #ifndef AOT_USE_CACHE
 	m_function = other->m_function.CreateInstance();
+#if defined(__EMSCRIPTEN__)
+	m_chainFunctionIndex = GetFunctionIndex();
+#endif
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
 	if(!other->m_refFunction.IsEmpty())
 	{

@@ -118,6 +118,7 @@ public:
 	void ReplaceWasmFunction(int fctId)
 	{
 		m_function.ReplaceWasmFunction(fctId);
+		m_chainFunctionIndex = GetFunctionIndex();
 		m_batchModule = std::vector<uint8>();
 	}
 	//Async compile (AsyncCompile.h): the job of a block that still runs in the interpreter (null otherwise)
@@ -127,6 +128,11 @@ public:
 	}
 	//Takes the compiled function of a block that ran in the interpreter
 	void SetCompiledFunction(CMemoryFunction&&);
+	//Moves the pending blocks' own modules into one batch module (fewer, larger modules: better code
+	//locality in the browser's JIT). Returns the blocks that now call a batched function.
+	static std::vector<std::shared_ptr<CBasicBlock>> BatchModules(std::vector<std::weak_ptr<CBasicBlock>>&);
+	//Offset of m_chainFunctionIndex (index of the compiled function, read by VU block chaining)
+	static size_t GetChainFunctionIndexOffset();
 	//Index of the compiled function in the wasm function table
 	uint32 GetFunctionIndex() const
 	{
@@ -152,6 +158,7 @@ protected:
 	std::vector<uint8> m_batchModule;
 #endif
 	bool UsesContextPromotion() const;
+	bool UsesModuleBatching() const;
 	bool MaySetDelayedJump() const;
 	virtual bool IsSuperBlock() const
 	{
@@ -211,6 +218,7 @@ protected:
 #endif
 
 private:
+	uint32 m_chainFunctionIndex = 0;
 	uint32 m_recycleCount = 0;
 	BlockOutLinkPointer m_outLinks[LINK_SLOT_MAX];
 	uint32 m_linkBlockTrampolineOffset[LINK_SLOT_MAX];
