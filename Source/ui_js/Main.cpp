@@ -13,6 +13,7 @@
 #include "string_format.h"
 #include "BlockCache.h"
 #include "ee/Vpu.h"
+#include "ee/VUShared.h"
 #include <future>
 #include <mutex>
 #include <set>
@@ -272,9 +273,23 @@ static void HashVmState()
 	g_hashResult += string_format("%s%08X:%04llX.%04llX.%04llX.%04llX.%04llX", g_hashResult.empty() ? "" : " ", ee.m_EE.m_State.nPC,
 	                              h(&ee.m_EE.m_State, sizeof(MIPSSTATE)), h(ee.m_ram, PS2::EE_RAM_SIZE), h(ee.m_spr, PS2::EE_SPR_SIZE),
 	                              h(&iop.m_cpu.m_State, sizeof(MIPSSTATE)), h(iop.m_ram, PS2::IOP_RAM_SIZE));
-	g_vuHashResult += string_format("%s%04llX.%04llX.%04llX.%04llX.%04llX.%04llX", g_vuHashResult.empty() ? "" : " ",
+	//(Then EE, VU0, VU1 states without the flag pipeline entries, which skipped flag writes change
+	//without changing any value a program can read)
+	auto hm = [&h](const MIPSSTATE& state) {
+		MIPSSTATE copy = state;
+		auto raw = reinterpret_cast<uint8*>(&copy);
+		for(const auto* pipe : {&VUShared::g_pipeInfoMac, &VUShared::g_pipeInfoSticky, &VUShared::g_pipeInfoClip})
+		{
+			memset(raw + pipe->index, 0, sizeof(uint32));
+			memset(raw + pipe->valueArray, 0, sizeof(uint32) * FLAG_PIPELINE_SLOTS);
+			memset(raw + pipe->timeArray, 0, sizeof(uint32) * FLAG_PIPELINE_SLOTS);
+		}
+		return h(&copy, sizeof(MIPSSTATE));
+	};
+	g_vuHashResult += string_format("%s%04llX.%04llX.%04llX.%04llX.%04llX.%04llX/%04llX.%04llX.%04llX", g_vuHashResult.empty() ? "" : " ",
 	                                h(&ee.m_VU0.m_State, sizeof(MIPSSTATE)), h(ee.m_vuMem0, PS2::VUMEM0SIZE), h(ee.m_microMem0, PS2::MICROMEM0SIZE),
-	                                h(&ee.m_VU1.m_State, sizeof(MIPSSTATE)), h(ee.m_vuMem1, PS2::VUMEM1SIZE), h(ee.m_microMem1, PS2::MICROMEM1SIZE));
+	                                h(&ee.m_VU1.m_State, sizeof(MIPSSTATE)), h(ee.m_vuMem1, PS2::VUMEM1SIZE), h(ee.m_microMem1, PS2::MICROMEM1SIZE),
+	                                hm(ee.m_EE.m_State), hm(ee.m_VU0.m_State), hm(ee.m_VU1.m_State));
 }
 
 std::string vuHashResult()
@@ -410,6 +425,14 @@ extern bool g_vuBlockChaining;
 void setVuBlockChaining(bool enabled)
 {
 	g_vuBlockChaining = enabled;
+}
+
+extern bool g_vuSkipFlagWrites;
+
+//VU status/clip flag pipeline writes nothing reads skipped (default on), used for new blocks from now on
+void setVuSkipFlagWrites(bool enabled)
+{
+	g_vuSkipFlagWrites = enabled;
 }
 
 //VU superblocks (several VU blocks compiled into one function), used for new blocks from now on
@@ -845,6 +868,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("eeHashResult", &eeHashResult);
 	function("vuHashResult", &vuHashResult);
 	function("setVuBlockChaining", &setVuBlockChaining);
+	function("setVuSkipFlagWrites", &setVuSkipFlagWrites);
 	function("eeDumpRequest", &eeDumpRequest);
 	function("eeStateDump", &eeStateDump);
 	function("setEeBatchSize", &setEeBatchSize);
