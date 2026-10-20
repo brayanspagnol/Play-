@@ -827,6 +827,13 @@ void pauseVm()
 	EM_ASM({ Module["audioSetPaused"](true); });
 }
 
+//Continues a VM held by pauseVm without rebooting it (e.g. the page held the game while a boot intro played).
+void resumeVm()
+{
+	EM_ASM({ Module["audioSetPaused"](false); });
+	g_virtualMachine->Resume();
+}
+
 void bootElf(std::string path)
 {
 	EM_ASM({ Module["audioSetPaused"](false); });
@@ -877,6 +884,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("bootElf", &bootElf);
 	function("bootDiscImage", &bootDiscImage);
 	function("pauseVm", &pauseVm);
+	function("resumeVm", &resumeVm);
 	function("setDiscImageUrl", &Js_SetDiscImageUrl);
 	function("getFrames", &getFrames);
 	function("clearStats", &clearStats);
