@@ -95,6 +95,8 @@ protected:
 	void SelectBlockSet();
 
 	std::unordered_map<uint128, BLOCK_SET, KEY_HASHER> m_blockSets;
+	//Module batching (see CBasicBlock::BatchModules): new blocks wait here
+	std::vector<std::weak_ptr<CBasicBlock>> m_batchPending;
 	std::vector<uint128> m_pageHashes;
 	std::vector<bool> m_dirtyPages;
 	bool m_contentsChanged = true;

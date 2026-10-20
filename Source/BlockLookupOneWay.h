@@ -48,6 +48,11 @@ public:
 		return m_blockTable[address / INSTRUCTION_SIZE];
 	}
 
+	BlockType* GetTable() const
+	{
+		return m_blockTable;
+	}
+
 	//Puts another block table in place (allocated with new[], m_tableSize entries), returns the previous one (caller owns it)
 	BlockType* ExchangeTable(BlockType* table)
 	{

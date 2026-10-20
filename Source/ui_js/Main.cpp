@@ -404,6 +404,13 @@ void setVuJitOptions(bool promotion, bool diff, bool names)
 }
 
 extern bool g_vuSuperBlocks;
+extern bool g_vuBlockChaining;
+
+//VU block chaining (blocks tail call the next one), used for new blocks from now on
+void setVuBlockChaining(bool enabled)
+{
+	g_vuBlockChaining = enabled;
+}
 
 //VU superblocks (several VU blocks compiled into one function), used for new blocks from now on
 void setVuSuperBlocks(bool enabled)
@@ -837,6 +844,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("setEeContextPromotion", &setEeContextPromotion);
 	function("eeHashResult", &eeHashResult);
 	function("vuHashResult", &vuHashResult);
+	function("setVuBlockChaining", &setVuBlockChaining);
 	function("eeDumpRequest", &eeDumpRequest);
 	function("eeStateDump", &eeStateDump);
 	function("setEeBatchSize", &setEeBatchSize);

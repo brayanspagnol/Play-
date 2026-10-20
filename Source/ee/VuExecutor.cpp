@@ -58,6 +58,7 @@ void CVuExecutor::ResetBlockSets()
 {
 	//(The current block set is in the lookup table and m_blocks; it gets a key at the next run)
 	m_blockSets.clear();
+	m_batchPending.clear();
 	uint32 pageCount = m_maxAddress / BLOCK_SET_PAGE_SIZE;
 	m_pageHashes.assign(pageCount, uint128{});
 	m_dirtyPages.assign(pageCount, true);
@@ -109,6 +110,8 @@ void CVuExecutor::SelectBlockSet()
 int CVuExecutor::Execute(int cycles)
 {
 	if(m_contentsChanged) SelectBlockSet();
+	//Block chaining reads the block table through the context (with MTVU, two executors share the VU1 context)
+	m_context.m_blockFnLookup = reinterpret_cast<uint32**>(m_blockLookup.GetTable());
 	return CGenericMipsExecutor::Execute(cycles);
 }
 #endif
@@ -216,6 +219,16 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
 	{
 		m_cachedBlocks.insert(std::make_pair(blockKey, result));
 	}
+#ifdef __EMSCRIPTEN__
+	extern uint32 g_eeBatchSize;
+	extern int g_vuExperiment;
+	//(Experiment bit 16: no batching)
+	if(!result->GetBatchModule().empty() && !(g_vuExperiment & 16))
+	{
+		m_batchPending.push_back(result);
+		if(m_batchPending.size() >= g_eeBatchSize) CBasicBlock::BatchModules(m_batchPending);
+	}
+#endif
 	return result;
 }
 

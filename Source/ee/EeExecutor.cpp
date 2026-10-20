@@ -116,28 +116,9 @@ void CEeExecutor::QueueForBatch(const BasicBlockPtr& block)
 
 void CEeExecutor::FlushBatch()
 {
-	std::vector<BasicBlockPtr> blocks;
-	std::vector<CWasmModuleBuilder::MODULE_BYTES> modules;
-	for(const auto& weakBlock : m_batchPending)
+	for(const auto& block : CBasicBlock::BatchModules(m_batchPending))
 	{
-		auto block = weakBlock.lock();
-		if(!block || block->GetBatchModule().empty()) continue;
-		modules.push_back({block->GetBatchModule().data(), static_cast<uint32>(block->GetBatchModule().size())});
-		blocks.push_back(std::move(block));
-	}
-	m_batchPending.clear();
-	if(blocks.empty()) return;
-	auto batch = CWasmModuleBuilder::BuildBatchModule(modules);
-	auto fctIds = batch.empty() ? std::vector<int>() : CMemoryFunction::CreateWasmBatch(batch.data(), batch.size(), static_cast<uint32>(blocks.size()));
-	for(uint32 i = 0; i < blocks.size(); i++)
-	{
-		if(fctIds.empty())
-		{
-			blocks[i]->GetBatchModule() = std::vector<uint8>();
-			continue;
-		}
-		blocks[i]->ReplaceWasmFunction(fctIds[i]);
-		m_blockLookup.UpdateFunctionIndex(blocks[i].get());
+		m_blockLookup.UpdateFunctionIndex(block.get());
 	}
 }
 
