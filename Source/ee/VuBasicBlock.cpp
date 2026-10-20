@@ -4,6 +4,7 @@
 #include "MemoryUtils.h"
 #include "Vpu.h"
 #include "VUShared.h"
+#include "../Ps2Const.h"
 #include <algorithm>
 #include <cstring>
 
@@ -801,14 +802,18 @@ void CVuBasicBlock::ComputeSkipFlagsHints(const std::vector<uint32>& fmacStallDe
 		}
 	}
 
+	//Status/clip: VU1 only. VU0's flag pipelines are copied into the EE context (macro mode), and
+	//the EE state must stay byte identical (state hashes, save states)
+	bool vu1 = (m_cacheVariant & PS2::MICROMEM1SIZE) != 0;
+
 	//Flag unused results
 	for(uint32 instructionIndex = 0; instructionIndex < maxInstructions; instructionIndex++)
 	{
 		if(!resultUsed[FLAGS_MAC][instructionIndex])
 		{
-			hints[instructionIndex] |= VUShared::COMPILEHINT_SKIP_FMAC_UPDATE | VUShared::COMPILEHINT_SKIP_STICKY_UPDATE;
+			hints[instructionIndex] |= VUShared::COMPILEHINT_SKIP_FMAC_UPDATE | (vu1 ? VUShared::COMPILEHINT_SKIP_STICKY_UPDATE : 0);
 		}
-		if(!resultUsed[FLAGS_CLIP][instructionIndex])
+		if(vu1 && !resultUsed[FLAGS_CLIP][instructionIndex])
 		{
 			hints[instructionIndex] |= VUShared::COMPILEHINT_SKIP_CLIP_UPDATE;
 		}
