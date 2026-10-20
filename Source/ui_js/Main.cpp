@@ -613,6 +613,18 @@ void setGsOptions(int resolutionFactor, bool forceBilinear, bool widescreen, int
 	gs->SetOutput((widescreen ? 854 : 640) * resolutionFactor, 480 * resolutionFactor, static_cast<CGSHandler::PRESENTATION_MODE>(presentationMode));
 }
 
+//Frame skip for slow machines (0 = off, n = n frames skipped after each drawn one), see CGSH_OpenGLJs.
+void setFrameSkip(int count)
+{
+	static_cast<CGSH_OpenGLJs*>(g_virtualMachine->GetGSHandler())->SetFrameSkip(std::clamp(count, 0, 3));
+}
+
+//Frames not drawn because of the frame skip since start (cumulative).
+uint32 getSkippedFrames()
+{
+	return static_cast<CGSH_OpenGLJs*>(g_virtualMachine->GetGSHandler())->GetSkippedFrames();
+}
+
 //Replaces the keyboard/gamepad bindings: keys = [[KeyboardEvent.code, PS2 button, positive], ...]
 //(button = PS2::CControllerInfo::BUTTON, positive only matters for axes), pad = PS2 button per standard
 //gamepad button index (-1 or missing = unbound).
@@ -834,6 +846,8 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("stateStatus", &stateStatus);
 	function("setFrameLimit", &setFrameLimit);
 	function("setGsOptions", &setGsOptions);
+	function("setFrameSkip", &setFrameSkip);
+	function("getSkippedFrames", &getSkippedFrames);
 	function("setInputBindings", &setInputBindings);
 	function("setGamepadEnabled", &setGamepadEnabled);
 	function("setVu1Threaded", &setVu1Threaded);
