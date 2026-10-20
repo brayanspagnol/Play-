@@ -3,6 +3,8 @@
 #include "MIPS.h"
 #include "MemoryFunction.h"
 #include "MemStream.h"
+#include "Jitter_Interpreter.h"
+#include "BlockCache.h"
 #ifdef AOT_BUILD_CACHE
 #include "StdStream.h"
 #include <mutex>
@@ -37,6 +39,11 @@ static_assert(sizeof(AOT_BLOCK_KEY) == 0x18, "AOT_BLOCK_KEY must be 24 bytes lon
 namespace Jitter
 {
 	class CJitter;
+};
+
+namespace AsyncCompile
+{
+	struct JOB;
 };
 
 extern "C"
@@ -113,6 +120,13 @@ public:
 		m_function.ReplaceWasmFunction(fctId);
 		m_batchModule = std::vector<uint8>();
 	}
+	//Async compile (AsyncCompile.h): the job of a block that still runs in the interpreter (null otherwise)
+	const std::shared_ptr<AsyncCompile::JOB>& GetAsyncJob() const
+	{
+		return m_asyncJob;
+	}
+	//Takes the compiled function of a block that ran in the interpreter
+	void SetCompiledFunction(CMemoryFunction&&);
 	//Index of the compiled function in the wasm function table
 	uint32 GetFunctionIndex() const
 	{
@@ -132,6 +146,8 @@ protected:
 	bool m_cacheable = true;
 
 	void CompileToStream(Framework::CMemStream&, bool contextPromotion);
+	//CompileToStream up to the end of the front end (statements in the jitter, not compiled yet)
+	void BeginCompile(CMipsJitter*, bool contextPromotion);
 #if defined(__EMSCRIPTEN__)
 	std::vector<uint8> m_batchModule;
 #endif
@@ -142,6 +158,15 @@ protected:
 		return false;
 	}
 #if defined(__EMSCRIPTEN__)
+	//Async compile: run from the Jitter's statements until the compiled function arrives
+	Jitter::InterpreterProgramPtr m_interpreterProgram;
+	std::shared_ptr<AsyncCompile::JOB> m_asyncJob;
+	//Front end on this thread, the rest on the helper thread; false: not possible, compile as usual
+	bool TryCompileAsync(const BlockCache::KEY*);
+	void SubmitAsyncJob(CMipsJitter*, bool hot);
+	uint32 m_interpretCount = 0;
+	BlockCache::KEY m_asyncCacheKey = {};
+	bool m_asyncAddToCache = false;
 	virtual void ExecuteDiff();
 	CMemoryFunction m_refFunction;
 	bool m_diffExecute = false;

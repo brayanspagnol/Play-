@@ -7,6 +7,7 @@
 #include "../Profiler.h"
 #if defined(__EMSCRIPTEN__)
 #include "WasmModuleBuilder.h"
+#include "AsyncCompile.h"
 #endif
 
 #if defined(__unix__) || defined(__ANDROID__) || defined(__APPLE__)
@@ -59,6 +60,10 @@ CEeExecutor::CEeExecutor(CMIPS& context, uint8* ram)
 
 int CEeExecutor::Execute(int cycles)
 {
+#if defined(__EMSCRIPTEN__)
+	//Blocks compiled on the helper thread (EE, IOP, VU0: all run on this thread) replace their interpreter
+	AsyncCompile::Update();
+#endif
 	m_executing = true;
 #if !defined(PROFILE) && !defined(DEBUGGER_INCLUDED)
 	//Same loop as CGenericMipsExecutor::Execute, but the call goes through the function index table
@@ -76,7 +81,10 @@ int CEeExecutor::Execute(int cycles)
 		}
 		else
 		{
-			m_blockLookup.FindBlockAt(address)->Execute();
+			auto block = m_blockLookup.FindBlockAt(address);
+			//A block that ran in the interpreter (async compile) and got its compiled function since
+			if(!block->IsEmpty() && (block->GetFunctionIndex() != 0)) m_blockLookup.UpdateFunctionIndex(block);
+			block->Execute();
 		}
 	}
 	m_context.m_State.nHasException &= ~MIPS_EXCEPTION_STATUS_QUOTADONE;
