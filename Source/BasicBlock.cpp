@@ -722,6 +722,7 @@ bool CBasicBlock::TryCompileAsync(const BlockCache::KEY* cacheKey)
 	}
 	m_interpreterProgram = program;
 	m_interpretCount = 0;
+	m_asyncWordsHash = ComputeWordsHash();
 	m_asyncCacheKey = cacheKey ? *cacheKey : BlockCache::KEY();
 	m_asyncAddToCache = (cacheKey != nullptr);
 	if((mode == AsyncCompile::MODE_INTERPRET) || !AsyncCompile::HasRoom())
@@ -743,7 +744,9 @@ void CBasicBlock::SubmitAsyncJob(CMipsJitter* jitter, bool hot)
 {
 	if(!jitter)
 	{
-		//(Same front end as in TryCompileAsync: the block's code hasn't changed, or it would have been dropped)
+		//The front end again: the job must compile what the interpreter runs. Code that changed without the
+		//block being dropped (no write protection, e.g. IOP RAM) keeps running in the interpreter instead.
+		if(ComputeWordsHash() != m_asyncWordsHash) return;
 		jitter = AsyncCompile::TakeJitter();
 		BeginCompile(jitter, UsesContextPromotion());
 	}
@@ -760,6 +763,17 @@ void CBasicBlock::SubmitAsyncJob(CMipsJitter* jitter, bool hot)
 	}
 	m_asyncJob = job;
 	AsyncCompile::Submit(job, hot);
+}
+
+uint64 CBasicBlock::ComputeWordsHash() const
+{
+	thread_local std::vector<uint32> words;
+	words.resize(((m_end - m_begin) / 4) + 1);
+	for(uint32 i = 0; i < words.size(); i++)
+	{
+		words[i] = m_context.m_pMemoryMap->GetInstruction(m_begin + (i * 4));
+	}
+	return XXH3_64bits(words.data(), words.size() * 4);
 }
 
 void CBasicBlock::SetCompiledFunction(CMemoryFunction&& function)

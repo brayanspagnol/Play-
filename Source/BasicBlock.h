@@ -174,6 +174,8 @@ protected:
 	uint32 m_interpretCount = 0;
 	BlockCache::KEY m_asyncCacheKey = {};
 	bool m_asyncAddToCache = false;
+	uint64 m_asyncWordsHash = 0;
+	uint64 ComputeWordsHash() const;
 	virtual void ExecuteDiff();
 	CMemoryFunction m_refFunction;
 	bool m_diffExecute = false;
