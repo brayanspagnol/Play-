@@ -8,6 +8,9 @@
 #include <array>
 #include <cmath>
 #include "maybe_unused.h"
+#if defined(__wasm_simd128__)
+#include <wasm_simd128.h>
+#endif
 #include "EndianUtils.h"
 #include "IPU_MacroblockAddressIncrementTable.h"
 #include "IPU_MacroblockTypeITable.h"
@@ -971,6 +974,26 @@ unsigned int CIPU::CINFIFO::GetSize() const
 unsigned int CIPU::CINFIFO::GetAvailableBits() const
 {
 	return std::max<int32>((m_size * 8) - m_bitPosition, 0);
+}
+
+//Copies up to count bytes from a byte aligned position and consumes them: same result as count
+//TryGetBits_MSBF(8) calls, with one copy and one discard of the read quadwords
+unsigned int CIPU::CINFIFO::ReadAlignedBytes(uint8* output, unsigned int count)
+{
+	assert((m_bitPosition & 7) == 0);
+	unsigned int position = m_bitPosition / 8;
+	unsigned int size = std::min(count, m_size - position);
+	memcpy(output, m_buffer + position, size);
+	m_bitPosition += size * 8;
+	unsigned int discard = (m_bitPosition / 128) * 16;
+	if(discard != 0)
+	{
+		memmove(m_buffer, m_buffer + discard, m_size - discard);
+		m_size -= discard;
+		m_bitPosition -= discard * 8;
+	}
+	m_lookupBitsDirty = true;
+	return size;
 }
 
 void CIPU::CINFIFO::Reset()
@@ -1957,6 +1980,62 @@ bool CIPU::CSETVQCommand::Execute()
 //CSC command implementation
 /////////////////////////////////////////////
 
+#if defined(__wasm_simd128__)
+//The scalar YCbCr -> RGBA conversion of CCSCCommand::Execute, 4 pixels at a time: same float operations in
+//the same order (wasm has no fused multiply-add here), so the output is bit identical
+static void ConvertBlockSimd(const uint8* block, uint32* output, uint32 alphaTh0, uint32 alphaTh1)
+{
+	const v128_t c128 = wasm_f32x4_splat(128.f);
+	const v128_t c255 = wasm_f32x4_splat(255.f);
+	const v128_t zero = wasm_f32x4_splat(0.f);
+	const v128_t kR = wasm_f32x4_splat(1.402f);
+	const v128_t kGb = wasm_f32x4_splat(0.34414f);
+	const v128_t kGr = wasm_f32x4_splat(0.71414f);
+	const v128_t kB = wasm_f32x4_splat(1.772f);
+	const v128_t th0 = wasm_i32x4_splat(alphaTh0);
+	const v128_t th1 = wasm_i32x4_splat(alphaTh1);
+	const v128_t alpha40 = wasm_i32x4_splat(0x40);
+	const v128_t alpha80 = wasm_i32x4_splat(0x80);
+	auto toFloats = [](v128_t bytes, v128_t* result) {
+		v128_t low = wasm_u16x8_extend_low_u8x16(bytes);
+		v128_t high = wasm_u16x8_extend_high_u8x16(bytes);
+		result[0] = wasm_f32x4_convert_u32x4(wasm_u32x4_extend_low_u16x8(low));
+		result[1] = wasm_f32x4_convert_u32x4(wasm_u32x4_extend_high_u16x8(low));
+		result[2] = wasm_f32x4_convert_u32x4(wasm_u32x4_extend_low_u16x8(high));
+		result[3] = wasm_f32x4_convert_u32x4(wasm_u32x4_extend_high_u16x8(high));
+	};
+	for(unsigned int i = 0; i < 16; i++)
+	{
+		//Chroma is subsampled 2x2: each Cb/Cr byte of row i / 2 covers 2 pixels
+		v128_t cb8 = wasm_v128_load64_zero(block + 0x100 + (i / 2) * 8);
+		v128_t cr8 = wasm_v128_load64_zero(block + 0x140 + (i / 2) * 8);
+		cb8 = wasm_i8x16_shuffle(cb8, cb8, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7);
+		cr8 = wasm_i8x16_shuffle(cr8, cr8, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7);
+		v128_t y[4], cb[4], cr[4];
+		toFloats(wasm_v128_load(block + i * 16), y);
+		toFloats(cb8, cb);
+		toFloats(cr8, cr);
+		for(unsigned int j = 0; j < 4; j++)
+		{
+			v128_t cbOffset = wasm_f32x4_sub(cb[j], c128);
+			v128_t crOffset = wasm_f32x4_sub(cr[j], c128);
+			v128_t r = wasm_f32x4_add(y[j], wasm_f32x4_mul(kR, crOffset));
+			v128_t g = wasm_f32x4_sub(wasm_f32x4_sub(y[j], wasm_f32x4_mul(kGb, cbOffset)), wasm_f32x4_mul(kGr, crOffset));
+			v128_t b = wasm_f32x4_add(y[j], wasm_f32x4_mul(kB, cbOffset));
+			//std::clamp(x, 0, 255) then truncation to uint8
+			r = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_pmin(c255, wasm_f32x4_pmax(zero, r)));
+			g = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_pmin(c255, wasm_f32x4_pmax(zero, g)));
+			b = wasm_i32x4_trunc_sat_f32x4(wasm_f32x4_pmin(c255, wasm_f32x4_pmax(zero, b)));
+			v128_t below0 = wasm_v128_and(wasm_v128_and(wasm_i32x4_lt(r, th0), wasm_i32x4_lt(g, th0)), wasm_i32x4_lt(b, th0));
+			v128_t below1 = wasm_v128_and(wasm_v128_and(wasm_i32x4_lt(r, th1), wasm_i32x4_lt(g, th1)), wasm_i32x4_lt(b, th1));
+			v128_t a = wasm_v128_andnot(wasm_v128_bitselect(alpha40, alpha80, below1), below0);
+			v128_t pixel = wasm_v128_or(wasm_v128_or(r, wasm_i32x4_shl(g, 8)), wasm_v128_or(wasm_i32x4_shl(b, 16), wasm_i32x4_shl(a, 24)));
+			wasm_v128_store(output + i * 16 + j * 4, pixel);
+		}
+	}
+}
+#endif
+
 CIPU::CCSCCommand::CCSCCommand()
 {
 	GenerateCbCrMap();
@@ -2007,6 +2086,14 @@ bool CIPU::CCSCCommand::Execute()
 			{
 				m_state = STATE_CONVERTBLOCK;
 			}
+			else if((m_IN_FIFO->GetBitIndex() & 7) == 0)
+			{
+				m_currentIndex += m_IN_FIFO->ReadAlignedBytes(m_block + m_currentIndex, BLOCK_SIZE - m_currentIndex);
+				if(m_currentIndex != BLOCK_SIZE)
+				{
+					return false;
+				}
+			}
 			else
 			{
 				uint32 blockValue = 0;
@@ -2023,15 +2110,18 @@ bool CIPU::CCSCCommand::Execute()
 		{
 			uint32 nPixel[0x100];
 
+			uint16 alphaTh0 = (m_TH0 & 0x1FF);
+			uint16 alphaTh1 = (m_TH1 & 0x1FF);
+
+#if defined(__wasm_simd128__)
+			ConvertBlockSimd(m_block, nPixel, alphaTh0, alphaTh1);
+#else
 			uint8* pY = m_block;
 			uint8* nBlockCb = m_block + 0x100;
 			uint8* nBlockCr = m_block + 0x140;
 
 			uint32* pPixel = nPixel;
 			unsigned int* pCbCrMap = m_nCbCrMap;
-
-			uint16 alphaTh0 = (m_TH0 & 0x1FF);
-			uint16 alphaTh1 = (m_TH1 & 0x1FF);
 
 			for(unsigned int i = 0; i < 16; i++)
 			{
@@ -2074,6 +2164,7 @@ bool CIPU::CCSCCommand::Execute()
 				pCbCrMap += 0x10;
 				pPixel += 0x10;
 			}
+#endif
 
 			if(m_command.ofm == 1)
 			{
