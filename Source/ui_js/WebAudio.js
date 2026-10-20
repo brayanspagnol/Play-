@@ -12,8 +12,7 @@ function playAudioWorkletMain() {
 	const N = 2 * HS;        // frame length, Hann window with 50% overlap
 	const SEEK = 512;        // search range for the best splice point, +/- 11.6 ms (one period down to 86 Hz)
 	const COARSE = 4;        // coarse search decimation
-	const TARGET = 4410;     // input frames kept queued (ring + stretcher), 100 ms
-	const MAX_FILL = 6 * TARGET;
+	const TARGET_DEFAULT = 4410; // input frames kept queued (ring + stretcher), 100 ms (Module.setAudioBufferMs)
 	const MIN_TEMPO = 0.1, MAX_TEMPO = 1.5; // below 10% speed the producer is effectively stalled: let it gap
 	const RATE_TAU = 0.5 * RATE;    // producer rate estimate time constant (frames)
 	const CORRECT_LOW = 0.5 * RATE; // a fill below target is corrected over ~0.5 s (draining leads to a gap)
@@ -43,12 +42,13 @@ function playAudioWorkletMain() {
 			this.ringFrames = this.hdr[3];
 			this.ring = new Int16Array(o.memory, o.ring + 16, this.ringFrames * 2);
 			this.stats = new Float64Array(o.stats);
+			this.target = o.target || TARGET_DEFAULT;
 			this.inL = new Float32Array(INCAP); this.inR = new Float32Array(INCAP); this.inM = new Float32Array(INCAP);
 			this.inBase = 0; this.inLen = 0;          // absolute input frame of inL[0], frames held
 			this.outL = new Float32Array(OUTCAP); this.outR = new Float32Array(OUTCAP);
 			this.outPos = 0; this.outLen = 0;
 			this.olaL = new Float32Array(HS); this.olaR = new Float32Array(HS); // second half of the last frame
-			this.running = false;   // false: prefilling (silence) until TARGET frames are queued
+			this.running = false;   // false: prefilling (silence) until this.target frames are queued
 			this.started = false;   // produced sound at least once (silence before that is not a gap)
 			this.pos = 0; this.nominal = 0;
 			this.tempo = 1; this.rate = 1;
@@ -56,6 +56,7 @@ function playAudioWorkletMain() {
 			this.lastWall = 0;
 			this.capture = null; this.capturePos = 0;
 			this.port.onmessage = (e) => {
+				if(e.data.target) this.target = e.data.target;
 				if(e.data.capture) { this.capture = new Int16Array(e.data.capture); this.capturePos = 0; this.stats[S_CAPTURE] = 0; }
 			};
 		}
@@ -137,8 +138,8 @@ function playAudioWorkletMain() {
 
 		step() { // produce HS output frames; false if there is not enough input
 			if(!this.running) {
-				if(this.inLen < TARGET || this.inLen < N + SEEK) return false;
-				this.start(this.inBase + this.inLen - TARGET);
+				if(this.inLen < this.target || this.inLen < N + SEEK) return false;
+				this.start(this.inBase + this.inLen - this.target);
 				return true;
 			}
 			const tempo = Math.abs(this.tempo - 1) < DEADBAND ? 1 : this.tempo;
@@ -198,16 +199,16 @@ function playAudioWorkletMain() {
 			this.rate += (produced / frames - this.rate) * (frames / RATE_TAU);
 
 			let queued = this.queued();
-			if(this.running && queued > MAX_FILL) { // far behind (should not happen with the tempo control): restart at the newest audio
-				s[S_DROPS]++; s[S_DROPPED] += queued - TARGET;
+			if(this.running && queued > 6 * this.target) { // far behind (should not happen with the tempo control): restart at the newest audio
+				s[S_DROPS]++; s[S_DROPPED] += queued - this.target;
 				this.fadeOut();
-				const drop = this.inLen - TARGET;
+				const drop = this.inLen - this.target;
 				this.inL.copyWithin(0, drop, this.inLen); this.inR.copyWithin(0, drop, this.inLen); this.inM.copyWithin(0, drop, this.inLen);
-				this.inBase += drop; this.inLen = TARGET;
-				queued = TARGET;
+				this.inBase += drop; this.inLen = this.target;
+				queued = this.target;
 			}
 			if(this.running) {
-				const t = Math.min(MAX_TEMPO, Math.max(MIN_TEMPO, this.rate + (queued - TARGET) / (queued < TARGET ? CORRECT_LOW : CORRECT_HIGH)));
+				const t = Math.min(MAX_TEMPO, Math.max(MIN_TEMPO, this.rate + (queued - this.target) / (queued < this.target ? CORRECT_LOW : CORRECT_HIGH)));
 				this.tempo += Math.max(-SLEW * frames, Math.min(SLEW * frames, t - this.tempo));
 			}
 
@@ -258,11 +259,12 @@ Module["webAudioStart"] = function(ring) {
 	const gain = ctx.createGain(); // page volume (Module.setAudioVolume)
 	gain.connect(ctx.destination);
 	let node = null;
+	let target = 0; // frames queued by the worklet, 0 = its default (100 ms)
 	const url = URL.createObjectURL(new Blob(["(" + playAudioWorkletMain.toString() + ")();"], { type: "text/javascript" }));
 	ctx.audioWorklet.addModule(url).then(() => {
 		node = new AudioWorkletNode(ctx, "play-audio", {
 			numberOfInputs: 0, outputChannelCount: [2],
-			processorOptions: { memory: HEAPU8.buffer, ring, stats },
+			processorOptions: { memory: HEAPU8.buffer, ring, stats, target },
 		});
 		node.connect(gain);
 	}, (e) => console.error("Audio worklet failed to load:", e));
@@ -281,6 +283,11 @@ Module["webAudioStart"] = function(ring) {
 	// Output volume, 0 (mute) to 1 (unchanged); a 15 ms ramp avoids clicks.
 	Module["setAudioVolume"] = (volume) => gain.gain.setTargetAtTime(Math.max(0, Math.min(1, +volume || 0)), ctx.currentTime, 0.015);
 	Module["getAudioVolume"] = () => gain.gain.value;
+	// Audio kept queued, 50-250 ms (default 100): more rides out longer stalls of a slow machine, adds latency.
+	Module["setAudioBufferMs"] = (ms) => {
+		target = Math.round(Math.max(50, Math.min(250, +ms || 100)) * 44.1);
+		node?.port.postMessage({ target });
+	};
 	// Output statistics: counters are cumulative since start, histograms count 128-frame render quanta.
 	Module["audioStats"] = () => {
 		const s = statsView;
