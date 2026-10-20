@@ -14,6 +14,7 @@ public:
 	void PushRel64(size_t) override;
 
 	void SetVariableAsConstant(size_t, uint32);
+	void ClearVariableStatus(size_t);
 
 	LABEL GetFirstBlockLabel();
 	LABEL GetLastBlockLabel();

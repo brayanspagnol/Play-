@@ -125,10 +125,13 @@ private:
 		std::vector<CBasicBlock::SUPERBLOCK_PART> parts;
 	};
 	void PartitionFunction(uint32) override;
-	std::vector<CBasicBlock::SUPERBLOCK_PART> PlanRegion(uint32) const;
+	std::vector<CBasicBlock::SUPERBLOCK_PART> PlanRegion(uint32);
+	std::vector<CBasicBlock::SUPERBLOCK_PART> PlanRegion(uint32, bool followCalls);
 	uint64 HashRegionWords(const std::vector<CBasicBlock::SUPERBLOCK_PART>&) const;
 	std::unordered_map<uint32, std::vector<REGION_PLAN>> m_regionPlans;
 	std::vector<CBasicBlock::SUPERBLOCK_PART> m_pendingRegionParts;
+	//Region entries by page of their parts (pages of 4 KB); entries may be stale, checked when used
+	std::unordered_map<uint32, std::vector<uint32>> m_regionPages;
 	//Hot entries: a dispatch address sampled g_eeRegionHotSamples times gets a region
 	//ponytail: fixed average period; counts restart only on Reset/state load (no decay)
 	enum

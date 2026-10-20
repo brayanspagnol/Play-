@@ -667,6 +667,11 @@ bool CBasicBlock::IsReducible(const std::vector<SUPERBLOCK_PART>& parts)
 		return -1;
 	};
 	assert(partCount <= 32);
+	auto successorsOf = [&](size_t p) {
+		std::vector<uint32> result(std::begin(parts[p].successors), std::end(parts[p].successors));
+		result.insert(result.end(), parts[p].returns.begin(), parts[p].returns.end());
+		return result;
+	};
 	std::vector<uint32> dominators(partCount, static_cast<uint32>((1ULL << partCount) - 1));
 	dominators[0] = 1;
 	for(bool changed = true; changed;)
@@ -677,7 +682,7 @@ bool CBasicBlock::IsReducible(const std::vector<SUPERBLOCK_PART>& parts)
 			uint32 newDominators = static_cast<uint32>((1ULL << partCount) - 1);
 			for(size_t p = 0; p < partCount; p++)
 			{
-				for(uint32 successor : parts[p].successors)
+				for(uint32 successor : successorsOf(p))
 				{
 					if(partIndex(successor) == static_cast<int>(i)) newDominators &= dominators[p];
 				}
@@ -700,9 +705,10 @@ bool CBasicBlock::IsReducible(const std::vector<SUPERBLOCK_PART>& parts)
 		{
 			int x = stack.back().first;
 			int successorIndex = stack.back().second++;
-			if(successorIndex < 2)
+			auto successors = successorsOf(x);
+			if(successorIndex < static_cast<int>(successors.size()))
 			{
-				int y = partIndex(parts[x].successors[successorIndex]);
+				int y = partIndex(successors[successorIndex]);
 				if((y >= 0) && !visited[y])
 				{
 					visited[y] = true;
@@ -720,7 +726,7 @@ bool CBasicBlock::IsReducible(const std::vector<SUPERBLOCK_PART>& parts)
 	}
 	for(size_t x = 0; x < partCount; x++)
 	{
-		for(uint32 successor : parts[x].successors)
+		for(uint32 successor : successorsOf(x))
 		{
 			int y = partIndex(successor);
 			if((y >= 0) && (rpo[y] <= rpo[x]) && !(dominators[x] & (1U << y))) return false;

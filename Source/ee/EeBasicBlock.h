@@ -13,6 +13,7 @@ public:
 	void SetIsAutoIdleTaintBlock();
 
 	static bool IsCodeIdleLoopBlock(CMIPS&, uint32 begin, uint32 end);
+	static bool MayCallOrRaise(CMIPS&, uint32 begin, uint32 end);
 
 	//Tier-2 region: the tier-1 blocks in parts (parts[0] starts at this block's begin) compiled into one
 	//function with direct jumps between them (see CompileRange). Empty: an ordinary block.
@@ -20,7 +21,8 @@ public:
 	bool IsSuperBlock() const override;
 	void CompileRange(CMipsJitter*) override;
 	void GetCodeWords(std::vector<uint32>&) const override;
-	//Hash of the part layout (relative to begin), mixed into cache keys of region code
+	//Hash of the part layout and address, mixed into cache keys of region code
+	static constexpr uint32 REGION_CODE_VERSION = 2;
 	static uint64 GetRegionLayoutHash(const std::vector<SUPERBLOCK_PART>&, uint32 begin);
 
 protected:

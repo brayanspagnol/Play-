@@ -2,6 +2,7 @@
 #include "offsetof_def.h"
 #include <algorithm>
 #include "xxhash.h"
+#include <map>
 
 void CEeBasicBlock::SetFpRoundingMode(Jitter::CJitter::ROUNDINGMODE fpRoundingMode)
 {
@@ -223,12 +224,13 @@ bool CEeBasicBlock::IsSuperBlock() const
 uint64 CEeBasicBlock::GetRegionLayoutHash(const std::vector<SUPERBLOCK_PART>& parts, uint32 begin)
 {
 	if(parts.empty()) return 0;
-	std::vector<uint32> layout;
+	//Region code has the part addresses as constants (constant PC): the layout is absolute, plus a format version
+	std::vector<uint32> layout = {begin, REGION_CODE_VERSION};
 	for(const auto& part : parts)
 	{
 		for(uint32 address : {part.begin, part.end, part.successors[0], part.successors[1]})
 		{
-			layout.push_back((address == MIPS_INVALID_PC) ? address : (address - begin));
+			layout.push_back(address);
 		}
 	}
 	return XXH3_64bits(layout.data(), layout.size() * sizeof(uint32));
@@ -252,6 +254,64 @@ void CEeBasicBlock::GetCodeWords(std::vector<uint32>& words) const
 	}
 }
 
+//Whether running these instructions may call a helper (memory access slow paths, COP0/COP1/COP2,
+//MMI helpers...) or raise an exception. Plain integer arithmetic and branches don't.
+bool CEeBasicBlock::MayCallOrRaise(CMIPS& context, uint32 begin, uint32 end)
+{
+	for(uint32 address = begin; address <= end; address += 4)
+	{
+		uint32 opcode = context.m_pMemoryMap->GetInstruction(address);
+		uint32 op = opcode >> 26;
+		uint32 rs = (opcode >> 21) & 0x1F;
+		uint32 rt = (opcode >> 16) & 0x1F;
+		uint32 funct = opcode & 0x3F;
+		switch(op)
+		{
+		case 0x00:
+			//SYSCALL, BREAK, MFSA/MTSA, traps, and unused codes may call or raise
+			if((funct == 0x0C) || (funct == 0x0D) || (funct == 0x01) || (funct == 0x05) || (funct == 0x0E) ||
+			   (funct == 0x15) || (funct == 0x1C) || (funct == 0x1D) || (funct == 0x1E) || (funct == 0x1F) ||
+			   (funct == 0x28) || (funct == 0x29) || ((funct >= 0x30) && (funct <= 0x37)) || (funct == 0x39) ||
+			   (funct == 0x3D))
+			{
+				return true;
+			}
+			break;
+		case 0x01:
+			//Branches only (no traps, no MTSAB/MTSAH)
+			if(!((rt <= 0x03) || ((rt >= 0x10) && (rt <= 0x13)))) return true;
+			break;
+		case 0x09:
+			//ADDIU R0, R0, x: syscall hack (see CMA_MIPSIV::ADDIU)
+			if((rs == 0) && (rt == 0)) return true;
+			break;
+		case 0x02:
+		case 0x03:
+		case 0x04:
+		case 0x05:
+		case 0x06:
+		case 0x07:
+		case 0x08:
+		case 0x0A:
+		case 0x0B:
+		case 0x0C:
+		case 0x0D:
+		case 0x0E:
+		case 0x0F:
+		case 0x14:
+		case 0x15:
+		case 0x16:
+		case 0x17:
+		case 0x18:
+		case 0x19:
+			break;
+		default:
+			return true;
+		}
+	}
+	return false;
+}
+
 void CEeBasicBlock::CompileRange(CMipsJitter* jitter)
 {
 	if(m_regionParts.empty())
@@ -260,84 +320,221 @@ void CEeBasicBlock::CompileRange(CMipsJitter* jitter)
 		return;
 	}
 
-	//Function layout (a general control flow graph, structured by the wasm backend):
-	//  regionBase = nPC (the executor only enters a block at its first address)
-	//  for each part, in address order (parts[0] is the entry):
-	//    part label: the part's code and epilog, as the tier-1 block (without chaining)
-	//    if(nHasException == 0) for each static successor that is a part: if(nPC - regionBase == its offset) goto its label
-	//    goto exit
-	//  exit: block chaining, as at the end of a tier-1 block
-	//Offsets are relative to the entry, so the code is position independent like other blocks. When code is
-	//invalidated while the region runs, the executor sets regionBase to an odd value: no comparison matches
-	//anymore and the region returns after the current part, as a tier-1 block would.
-	const size_t baseOffset = offsetof(CMIPS, m_jitFlagScratch[4]);
+	//Region (tier 2): one function, a general control flow graph structured by the wasm backend.
+	//  m_jitFlagScratch[4] = entry (an invalidation while the region runs makes it odd, see CEeExecutor)
+	//  for each part (parts[0] is the entry):
+	//    part label: [nPC = part start, if the part may call a helper: helpers read it]
+	//      the part's instructions with nPC as a compile time constant (part start)
+	//      cycleQuota -= part size
+	//      successor = nDelayedJumpAddr != INVALID ? branch target : fall through; nDelayedJumpAddr = INVALID
+	//      if(cycleQuota <= 0) { nHasException |= QUOTADONE; exit to successor }
+	//      if(the part may call or raise && (nHasException || invalidated)) exit to successor
+	//      goto the successor's part label, or exit to it
+	//  exit to T: nPC = T, return
+	//This is what the tier-1 blocks do between dispatches, without the context round trips: parts run with
+	//promoted symbols (GPRs, HI/LO, cycle quota, ...) in locals, and nPC is only written where it is read.
+	const size_t regionOffset = offsetof(CMIPS, m_jitFlagScratch[4]);
+	const size_t pcOffset = offsetof(CMIPS, m_State.nPC);
+	const size_t delayedJumpOffset = offsetof(CMIPS, m_State.nDelayedJumpAddr);
 	uint32 savedBegin = m_begin;
 	uint32 savedEnd = m_end;
 
-	jitter->PushRel(offsetof(CMIPS, m_State.nPC));
-	jitter->PullRel(baseOffset);
-
-	CompileProlog(jitter);
-
-	auto parts = m_regionParts;
-	std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.begin < b.begin; });
+	const auto& parts = m_regionParts;
 	assert(parts[0].begin == savedBegin);
 
-	std::vector<CMipsJitter::LABEL> partLabels;
-	for(size_t i = 0; i < parts.size(); i++)
+	jitter->PushCst(savedBegin);
+	jitter->PullRel(regionOffset);
+
+	std::map<uint32, CMipsJitter::LABEL> partLabels;
+	for(const auto& part : parts)
 	{
-		partLabels.push_back(jitter->CreateLabel());
+		partLabels[part.begin] = jitter->CreateLabel();
 	}
-	auto exitLabel = jitter->CreateLabel();
+	std::map<uint32, CMipsJitter::LABEL> exitLabels;
+	auto exitLabel = [&](uint32 target) {
+		auto exitIterator = exitLabels.find(target);
+		if(exitIterator != exitLabels.end()) return exitIterator->second;
+		auto label = jitter->CreateLabel();
+		exitLabels[target] = label;
+		return label;
+	};
+	auto dynamicExitLabel = jitter->CreateLabel();
+	bool usesDynamicExit = false;
+	auto endLabel = jitter->CreateLabel();
 
 	m_context.m_pArch->SetCompileHints(m_blockCompileHints);
 
-	for(size_t partIndex = 0; partIndex < parts.size(); partIndex++)
+	for(const auto& part : parts)
 	{
-		const auto& part = parts[partIndex];
-		jitter->MarkLabel(partLabels[partIndex]);
+		jitter->MarkLabel(partLabels[part.begin]);
 
 		m_begin = part.begin;
 		m_end = part.end;
-
-		for(uint32 address = m_begin; address <= m_end; address += 4)
+		bool mayCall = MayCallOrRaise(m_context, part.begin, part.end);
+		if(mayCall)
 		{
-			m_context.m_pArch->CompileInstruction(address, jitter, &m_context, address - m_begin);
+			jitter->PushCst(part.begin);
+			jitter->PullRel(pcOffset);
+		}
+		jitter->SetVariableAsConstant(pcOffset, part.begin);
+		for(uint32 address = part.begin; address <= part.end; address += 4)
+		{
+			m_context.m_pArch->CompileInstruction(address, jitter, &m_context, address - part.begin);
 			assert(jitter->IsStackEmpty());
 		}
+		jitter->ClearVariableStatus(pcOffset);
 		jitter->MarkLastBlockLabel();
 
-		m_compilingRegionPart = true;
-		CompileEpilog(jitter, false);
-		m_compilingRegionPart = false;
+		jitter->PushRel(offsetof(CMIPS, m_State.cycleQuota));
+		jitter->PushCst(((part.end - part.begin) / 4) + 1);
+		jitter->Sub();
+		jitter->PullRel(offsetof(CMIPS, m_State.cycleQuota));
 
-		jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
-		jitter->PushCst(0);
-		jitter->BeginIf(Jitter::CONDITION_EQ);
+		//Static branch target of the part (MIPS_INVALID_PC: none or dynamic)
+		uint32 takenTarget = MIPS_INVALID_PC;
+		bool dynamicTarget = false;
+		bool maySetDelayedJump = MaySetDelayedJump();
+		if(maySetDelayedJump)
 		{
-			for(size_t successorIndex = 0; successorIndex < 2; successorIndex++)
+			uint32 branchAddress = part.end;
+			uint32 opcode = m_context.m_pMemoryMap->GetInstruction(part.end - 4);
+			if((part.end != part.begin) && (m_context.m_pArch->IsInstructionBranch(&m_context, part.end - 4, opcode) == MIPS_BRANCH_NORMAL))
 			{
-				uint32 successor = part.successors[successorIndex];
-				if((successorIndex == 1) && (successor == part.successors[0])) continue;
-				for(size_t targetIndex = 0; targetIndex < parts.size(); targetIndex++)
-				{
-					if(parts[targetIndex].begin != successor) continue;
-					jitter->PushRel(offsetof(CMIPS, m_State.nPC));
-					jitter->PushRel(baseOffset);
-					jitter->Sub();
-					jitter->PushCst(successor - savedBegin);
-					jitter->BeginIf(Jitter::CONDITION_EQ);
-					{
-						jitter->Goto(partLabels[targetIndex]);
-					}
-					jitter->EndIf();
-				}
+				branchAddress = part.end - 4;
+			}
+			opcode = m_context.m_pMemoryMap->GetInstruction(branchAddress);
+			if(m_context.m_pArch->IsInstructionBranch(&m_context, branchAddress, opcode) != MIPS_BRANCH_NONE)
+			{
+				takenTarget = m_context.m_pArch->GetInstructionEffectiveAddress(&m_context, branchAddress, opcode);
+			}
+			//COP0 (ERET...) or a jump to a register: the target is only known at run time
+			dynamicTarget = (takenTarget == MIPS_INVALID_PC) || ((opcode >> 26) == 0x10);
+			for(uint32 address = part.begin; address < branchAddress; address += 4)
+			{
+				if((m_context.m_pMemoryMap->GetInstruction(address) >> 26) == 0x10) dynamicTarget = true;
 			}
 		}
-		jitter->EndIf();
-		jitter->Goto(exitLabel);
+
+		auto route = [&](uint32 target, bool internalAllowed) {
+			auto exit = exitLabel(target);
+			jitter->PushRel(offsetof(CMIPS, m_State.cycleQuota));
+			jitter->PushCst(0);
+			jitter->BeginIf(Jitter::CONDITION_LE);
+			{
+				jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
+				jitter->PushCst(MIPS_EXCEPTION_STATUS_QUOTADONE);
+				jitter->Or();
+				jitter->PullRel(offsetof(CMIPS, m_State.nHasException));
+				jitter->Goto(exit);
+			}
+			jitter->EndIf();
+			if(mayCall)
+			{
+				jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
+				jitter->PushRel(regionOffset);
+				jitter->PushCst(1);
+				jitter->And();
+				jitter->Or();
+				jitter->PushCst(0);
+				jitter->BeginIf(Jitter::CONDITION_NE);
+				{
+					jitter->Goto(exit);
+				}
+				jitter->EndIf();
+			}
+			auto partIterator = partLabels.find(target);
+			jitter->Goto((internalAllowed && (partIterator != partLabels.end())) ? partIterator->second : exit);
+		};
+
+		if(maySetDelayedJump)
+		{
+			jitter->PushRel(delayedJumpOffset);
+			jitter->PushCst(MIPS_INVALID_PC);
+			jitter->BeginIf(Jitter::CONDITION_NE);
+			{
+				if(dynamicTarget)
+				{
+					usesDynamicExit = true;
+					jitter->PushRel(offsetof(CMIPS, m_State.cycleQuota));
+					jitter->PushCst(0);
+					jitter->BeginIf(Jitter::CONDITION_LE);
+					{
+						jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
+						jitter->PushCst(MIPS_EXCEPTION_STATUS_QUOTADONE);
+						jitter->Or();
+						jitter->PullRel(offsetof(CMIPS, m_State.nHasException));
+					}
+					jitter->EndIf();
+					//Returns from calls followed into the region
+					if(!part.returns.empty())
+					{
+						if(mayCall)
+						{
+							jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
+							jitter->PushRel(regionOffset);
+							jitter->PushCst(1);
+							jitter->And();
+							jitter->Or();
+							jitter->PushCst(0);
+							jitter->BeginIf(Jitter::CONDITION_NE);
+							{
+								jitter->Goto(dynamicExitLabel);
+							}
+							jitter->EndIf();
+						}
+						jitter->PushRel(offsetof(CMIPS, m_State.cycleQuota));
+						jitter->PushCst(0);
+						jitter->BeginIf(Jitter::CONDITION_GT);
+						{
+							for(uint32 returnAddress : part.returns)
+							{
+								auto partIterator = partLabels.find(returnAddress);
+								if(partIterator == partLabels.end()) continue;
+								jitter->PushRel(delayedJumpOffset);
+								jitter->PushCst(returnAddress);
+								jitter->BeginIf(Jitter::CONDITION_EQ);
+								{
+									jitter->PushCst(MIPS_INVALID_PC);
+									jitter->PullRel(delayedJumpOffset);
+									jitter->Goto(partIterator->second);
+								}
+								jitter->EndIf();
+							}
+						}
+						jitter->EndIf();
+					}
+					jitter->Goto(dynamicExitLabel);
+				}
+				else
+				{
+					jitter->PushCst(MIPS_INVALID_PC);
+					jitter->PullRel(delayedJumpOffset);
+					route(takenTarget, takenTarget == part.successors[0]);
+				}
+			}
+			jitter->EndIf();
+		}
+		uint32 fallTarget = part.end + 4;
+		route(fallTarget, fallTarget == part.successors[1]);
 	}
-	jitter->MarkLabel(exitLabel);
+
+	for(const auto& exitPair : exitLabels)
+	{
+		jitter->MarkLabel(exitPair.second);
+		jitter->PushCst(exitPair.first);
+		jitter->PullRel(pcOffset);
+		jitter->Goto(endLabel);
+	}
+	if(usesDynamicExit)
+	{
+		jitter->MarkLabel(dynamicExitLabel);
+		jitter->PushRel(delayedJumpOffset);
+		jitter->PullRel(pcOffset);
+		jitter->PushCst(MIPS_INVALID_PC);
+		jitter->PullRel(delayedJumpOffset);
+		jitter->Goto(endLabel);
+	}
+	jitter->MarkLabel(endLabel);
 
 	m_begin = savedBegin;
 	m_end = savedEnd;

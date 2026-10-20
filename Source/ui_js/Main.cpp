@@ -556,6 +556,13 @@ void setEeRegionParts(uint32 parts)
 	g_eeRegionParts = parts;
 }
 
+//Tier-2 EE regions follow JAL calls into the callee and back
+extern bool g_eeRegionCalls;
+void setEeRegionCalls(bool enabled)
+{
+	g_eeRegionCalls = enabled;
+}
+
 //Tier-2 EE regions compiled with context promotion (GPRs in wasm locals across the region)
 extern bool g_eeRegionPromotion;
 void setEeRegionPromotion(bool enabled)
@@ -958,6 +965,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("eeRegionStats", &eeRegionStats);
 	function("setEeRegionHotSamples", &setEeRegionHotSamples);
 	function("setEeRegionPromotion", &setEeRegionPromotion);
+	function("setEeRegionCalls", &setEeRegionCalls);
 	function("eeEdgeProfile", &eeEdgeProfile);
 	function("setEeAutoIdle", &setEeAutoIdle);
 	function("eeAutoIdleStats", &eeAutoIdleStats);

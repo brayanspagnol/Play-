@@ -55,6 +55,8 @@ static CEeExecutor* g_eeExecutor = nullptr;
 uint32 g_eeRegionParts = 0;
 //Samples (one dispatch in REGION_SAMPLE_PERIOD) after which an entry is hot and gets a region
 uint32 g_eeRegionHotSamples = 64;
+//Regions follow JAL calls into the callee and back (return address checked at the JR RA)
+bool g_eeRegionCalls = true;
 //Region counters (eeRegionStats), see EE_REGION_STAT
 uint32 g_eeRegionStats[EE_REGION_STAT_COUNT] = {};
 uint64 g_eeDispatchCount = 0;
@@ -1185,6 +1187,7 @@ void CEeExecutor::Reset()
 	m_idleLoopBlocks.clear();
 #if defined(__EMSCRIPTEN__)
 	m_regionPlans.clear();
+	m_regionPages.clear();
 	m_pendingRegionParts.clear();
 	ResetRegionSampling();
 #endif
@@ -1224,6 +1227,25 @@ void CEeExecutor::ClearActiveBlocksInRange(uint32 start, uint32 end, bool execut
 	}
 #endif
 	CGenericMipsExecutor::ClearActiveBlocksInRange(start, end, executing);
+#if defined(__EMSCRIPTEN__)
+	//Regions with a part in these pages (the range scan only sees blocks overlapping their entry part)
+	if(!m_regionPages.empty())
+	{
+		std::set<CBasicBlock*> regions;
+		for(uint32 page = start / MIPS_PAGE_SIZE; page <= (end - 1) / MIPS_PAGE_SIZE; page++)
+		{
+			auto pageIterator = m_regionPages.find(page);
+			if(pageIterator == m_regionPages.end()) continue;
+			for(uint32 entry : pageIterator->second)
+			{
+				auto region = FindBlockStartingAt(entry);
+				if(region->IsSuperBlock()) regions.insert(region);
+			}
+			m_regionPages.erase(pageIterator);
+		}
+		if(!regions.empty()) DropBlocks(regions);
+	}
+#endif
 
 	//Auto idle loops whose analysis read code in this range are analyzed again
 	if(m_autoIdleLoops.empty()) return;
@@ -1309,11 +1331,6 @@ void CEeExecutor::PartitionFunction(uint32 startAddress)
 		CGenericMipsExecutor::PartitionFunction(startAddress);
 		return;
 	}
-	uint32 endAddress = startAddress;
-	for(const auto& part : plan->parts)
-	{
-		endAddress = std::max(endAddress, part.end);
-	}
 	g_eeRegionStats[EE_REGION_CREATED]++;
 	g_eeRegionStats[EE_REGION_PARTS] += plan->parts.size();
 	uint32 builds = ++m_regionBuildCounts[startAddress];
@@ -1321,9 +1338,20 @@ void CEeExecutor::PartitionFunction(uint32 startAddress)
 	if(builds == 2) g_eeRegionStats[EE_REGION_REBUILT_ENTRIES]++;
 	if(builds == 9) g_eeRegionStats[EE_REGION_REBUILT8_ENTRIES]++;
 	g_eeRegionStats[EE_REGION_MAX_BUILDS] = std::max(g_eeRegionStats[EE_REGION_MAX_BUILDS], builds);
+	//The region block spans its entry part (block lookups and range scans see that); invalidation finds it
+	//through the pages of all its parts, which are write protected like tier-1 blocks
 	m_pendingRegionParts = plan->parts;
-	CreateBlock(startAddress, endAddress);
+	CreateBlock(startAddress, plan->parts[0].end);
 	m_pendingRegionParts.clear();
+	for(const auto& part : plan->parts)
+	{
+		SetMemoryProtected(m_ram + part.begin, part.end + 4 - part.begin, true);
+		for(uint32 page = part.begin / MIPS_PAGE_SIZE; page <= part.end / MIPS_PAGE_SIZE; page++)
+		{
+			auto& entries = m_regionPages[page];
+			if(std::find(entries.begin(), entries.end(), startAddress) == entries.end()) entries.push_back(startAddress);
+		}
+	}
 }
 
 uint64 CEeExecutor::HashRegionWords(const std::vector<CBasicBlock::SUPERBLOCK_PART>& parts) const
@@ -1338,31 +1366,64 @@ uint64 CEeExecutor::HashRegionWords(const std::vector<CBasicBlock::SUPERBLOCK_PA
 	return hash;
 }
 
-//Tier-1 blocks statically reachable from head (breadth first) inside head's 4 KB page, so the region
-//only covers code that the tier-1 block at head already write protects and invalidation (which scans
-//MAX_BLOCK_SIZE back) finds it. Calls (JAL/JALR), JR, blocks with per-block game settings (idle loop,
-//FP rounding, accurate add/sub) and blocks crossing the page end are not parts. Returns the parts
+//Tier-1 blocks statically reachable from head (breadth first): branch targets and fall through inside the page
+//of the block, and with g_eeRegionCalls, JAL targets (anywhere in RAM) and the return address after the JAL,
+//which the callee's JR RA reaches through a run time check. Blocks with per-block game settings, idle loops,
+//kernel code (not write protected) and blocks crossing a page end are not parts. Returns the parts
 //(parts[0] = the block at head), a single part when no region is possible, none when head itself is excluded.
-std::vector<CBasicBlock::SUPERBLOCK_PART> CEeExecutor::PlanRegion(uint32 head) const
+std::vector<CBasicBlock::SUPERBLOCK_PART> CEeExecutor::PlanRegion(uint32 head)
+{
+	auto parts = PlanRegion(head, g_eeRegionCalls);
+	if(g_eeRegionCalls && (parts.size() == 1))
+	{
+		//(Irreducible with calls followed)
+		parts = PlanRegion(head, false);
+	}
+	return parts;
+}
+
+std::vector<CBasicBlock::SUPERBLOCK_PART> CEeExecutor::PlanRegion(uint32 head, bool followCalls)
 {
 	auto excluded = [&](uint32 address) {
-		return (m_idleLoopBlocks.count(address) != 0) || (m_blockFpRoundingModes.count(address) != 0) ||
-		       (m_blockFpUseAccurateAddSub.count(address) != 0) || m_context.HasBreakpointInRange(address, address);
+		return (address < 0x100000) || (address >= PS2::EE_RAM_SIZE) || (address & 3) ||
+		       (m_idleLoopBlocks.count(address) != 0) || (m_blockFpRoundingModes.count(address) != 0) ||
+		       (m_blockFpUseAccurateAddSub.count(address) != 0) || m_context.HasBreakpointInRange(address, address) ||
+		       (m_autoIdleTaintBlocks.count(address) != 0);
+	};
+	//Idle loops (the tier-1 block sets or checks the idle exception) stay tier-1 blocks. The automatic wait loop
+	//analysis runs when a tier-1 block is created (the head's ran before it got hot): parts without one that
+	//could be a wait loop (backward branch close by) are left out, so detection happens as without regions.
+	auto isIdleLoop = [&](uint32 begin, uint32 end) {
+		if(CEeBasicBlock::IsCodeIdleLoopBlock(m_context, begin, end)) return true;
+		if(HasBlockAt(begin) || (begin == head))
+		{
+			return std::any_of(m_autoIdleLoops.begin(), m_autoIdleLoops.end(), [begin](const AUTOIDLE_LOOP& loop) { return loop.blockStart == begin; });
+		}
+		if(!g_eeAutoIdle || (end == begin)) return false;
+		uint32 inst = m_context.m_pMemoryMap->GetInstruction(end - 4);
+		uint32 op = inst >> 26;
+		if((op == 0x00) || (op == 0x03)) return false;
+		uint32 target = GetStaticTarget(end - 4, inst);
+		return (target != MIPS_INVALID_PC) && (target <= end - 4) && ((end - 4 - target) <= 0x400);
 	};
 	if(excluded(head)) return {};
-	uint32 pageEnd = (head & ~(MIPS_PAGE_SIZE - 1)) + MIPS_PAGE_SIZE;
+	uint32 maxParts = std::min<uint32>(g_eeRegionParts, 32);
 	std::vector<CBasicBlock::SUPERBLOCK_PART> parts;
+	std::vector<uint32> callTargets; //Per part: JAL target followed (MIPS_INVALID_PC: none)
 	std::vector<uint32> queue = {head};
-	for(size_t i = 0; (i < queue.size()) && (parts.size() < std::min<uint32>(g_eeRegionParts, 32)); i++)
+	for(size_t i = 0; (i < queue.size()) && (parts.size() < maxParts); i++)
 	{
 		uint32 begin = queue[i];
+		if((i != 0) && excluded(begin)) continue;
+		uint32 pageStart = begin & ~(MIPS_PAGE_SIZE - 1);
+		uint32 pageEnd = pageStart + MIPS_PAGE_SIZE;
 		auto [end, branchAddress] = FindBlockEnd(begin);
-		if((end >= pageEnd) || ((i != 0) && excluded(begin)))
+		if((end >= pageEnd) || isIdleLoop(begin, end))
 		{
 			if(i == 0) break;
 			continue;
 		}
-		//Calls (JAL/JALR/BxxAL) exit (the callee returns with a JR); J/JAL/JR/JALR don't fall through
+		//Calls (JAL/JALR/BxxAL) exit unless followed (the callee returns with a JR); J/JAL/JR/JALR don't fall through
 		uint32 branchInstAddress = (m_context.m_pArch->IsInstructionBranch(&m_context, end - 4, m_context.m_pMemoryMap->GetInstruction(end - 4)) == MIPS_BRANCH_NORMAL) ? (end - 4) : end;
 		uint32 opcode = m_context.m_pMemoryMap->GetInstruction(branchInstAddress);
 		uint32 op = opcode >> 26;
@@ -1370,17 +1431,99 @@ std::vector<CBasicBlock::SUPERBLOCK_PART> CEeExecutor::PlanRegion(uint32 head) c
 		uint32 regimm = (opcode >> 16) & 0x1F;
 		bool isJump = (op == 0x02) || (op == 0x03) || ((op == 0x00) && ((special == 0x08) || (special == 0x09)));
 		bool isCall = (op == 0x03) || ((op == 0x00) && (special == 0x09)) || ((op == 0x01) && (regimm >= 0x10) && (regimm <= 0x13));
+		bool followCall = followCalls && (op == 0x03) && (branchAddress != MIPS_INVALID_PC) && !excluded(branchAddress);
 		CBasicBlock::SUPERBLOCK_PART part;
 		part.begin = begin;
 		part.end = end;
-		part.successors[0] = isCall ? MIPS_INVALID_PC : branchAddress;
+		part.successors[0] = (isCall && !followCall) ? MIPS_INVALID_PC : branchAddress;
 		part.successors[1] = isJump ? MIPS_INVALID_PC : (end + 4);
 		parts.push_back(part);
+		callTargets.push_back(followCall ? branchAddress : MIPS_INVALID_PC);
+		auto enqueue = [&](uint32 address) {
+			if(std::find(queue.begin(), queue.end(), address) == queue.end()) queue.push_back(address);
+		};
+		if(followCall)
+		{
+			enqueue(branchAddress);
+			enqueue(end + 4);
+			continue;
+		}
 		for(uint32 successor : part.successors)
 		{
-			if((successor < head) || (successor >= pageEnd) || (successor & 3)) continue;
-			if(std::find(queue.begin(), queue.end(), successor) != queue.end()) continue;
-			queue.push_back(successor);
+			if((successor < pageStart) || (successor >= pageEnd) || (successor & 3)) continue;
+			enqueue(successor);
+		}
+	}
+	auto partIndex = [&](uint32 address) -> int {
+		for(size_t i = 0; i < parts.size(); i++)
+		{
+			if(parts[i].begin == address) return static_cast<int>(i);
+		}
+		return -1;
+	};
+	//JR RA parts reachable from a followed call's target (through static edges) may return to its return address
+	for(size_t c = 0; c < parts.size(); c++)
+	{
+		if(callTargets[c] == MIPS_INVALID_PC) continue;
+		uint32 returnAddress = parts[c].end + 4;
+		if(partIndex(returnAddress) < 0) continue;
+		std::vector<bool> seen(parts.size(), false);
+		std::vector<int> stack;
+		int calleeIndex = partIndex(callTargets[c]);
+		if(calleeIndex < 0) continue;
+		stack.push_back(calleeIndex);
+		seen[calleeIndex] = true;
+		while(!stack.empty())
+		{
+			int x = stack.back();
+			stack.pop_back();
+			uint32 lastOpcode = m_context.m_pMemoryMap->GetInstruction(parts[x].end - 4);
+			bool isJrRa = (parts[x].end != parts[x].begin) && ((lastOpcode & 0xFFE0003F) == 0x03E00008); //JR RA (any hint)
+			if(isJrRa && (std::find(parts[x].returns.begin(), parts[x].returns.end(), returnAddress) == parts[x].returns.end()))
+			{
+				parts[x].returns.push_back(returnAddress);
+			}
+			for(uint32 successor : parts[x].successors)
+			{
+				int y = partIndex(successor);
+				if((y >= 0) && !seen[y])
+				{
+					seen[y] = true;
+					stack.push_back(y);
+				}
+			}
+		}
+	}
+	//Drop parts only reachable through returns that were not found
+	for(bool changed = true; changed;)
+	{
+		changed = false;
+		std::vector<bool> reached(parts.size(), false);
+		std::vector<int> stack = {0};
+		if(!parts.empty()) reached[0] = true;
+		while(!parts.empty() && !stack.empty())
+		{
+			int x = stack.back();
+			stack.pop_back();
+			std::vector<uint32> successors(std::begin(parts[x].successors), std::end(parts[x].successors));
+			successors.insert(successors.end(), parts[x].returns.begin(), parts[x].returns.end());
+			for(uint32 successor : successors)
+			{
+				int y = partIndex(successor);
+				if((y >= 0) && !reached[y])
+				{
+					reached[y] = true;
+					stack.push_back(y);
+				}
+			}
+		}
+		for(size_t i = parts.size(); i-- > 0;)
+		{
+			if(!reached[i])
+			{
+				parts.erase(parts.begin() + i);
+				changed = true;
+			}
 		}
 	}
 	if((parts.size() >= 2) && !CBasicBlock::IsReducible(parts)) parts.resize(1);
@@ -1417,7 +1560,10 @@ BasicBlockPtr CEeExecutor::BlockFactory(CMIPS& context, uint32 start, uint32 end
 		std::vector<uint32> words;
 		for(const auto& part : m_pendingRegionParts)
 		{
-			words.insert(words.end(), blockMemory + ((part.begin - start) / 4), blockMemory + ((part.end - start) / 4) + 1);
+			for(uint32 address = part.begin; address <= part.end; address += 4)
+			{
+				words.push_back(m_context.m_pMemoryMap->GetInstruction(address));
+			}
 		}
 		xxHash = XXH3_128bits(words.data(), words.size() * 4);
 	}
@@ -1433,6 +1579,11 @@ BasicBlockPtr CEeExecutor::BlockFactory(CMIPS& context, uint32 start, uint32 end
 	auto blockKey = std::make_pair(hash, blockSize);
 
 	bool hasBreakpoint = m_context.HasBreakpointInRange(start, end);
+#if defined(__EMSCRIPTEN__)
+	bool isRegion = !m_pendingRegionParts.empty();
+#else
+	bool isRegion = false;
+#endif
 
 	std::optional<Jitter::CJitter::ROUNDINGMODE> blockFpRoundingModeOverride;
 	if(auto blockFpRoundingModeIterator = m_blockFpRoundingModes.find(start);
@@ -1454,8 +1605,8 @@ BasicBlockPtr CEeExecutor::BlockFactory(CMIPS& context, uint32 start, uint32 end
 
 	bool fpUseAccurateAddSub = (m_blockFpUseAccurateAddSub.count(start) != 0);
 
-	bool isAutoIdleLoop = !hasBreakpoint && !isIdleLoopBlockOverride && !CEeBasicBlock::IsCodeIdleLoopBlock(context, start, end) && IsAutoIdleLoop(start, end);
-	bool isAutoIdleTaintBlock = (m_autoIdleTaintBlocks.count(start) != 0);
+	bool isAutoIdleLoop = !isRegion && !hasBreakpoint && !isIdleLoopBlockOverride && !CEeBasicBlock::IsCodeIdleLoopBlock(context, start, end) && IsAutoIdleLoop(start, end);
+	bool isAutoIdleTaintBlock = !isRegion && (m_autoIdleTaintBlocks.count(start) != 0);
 
 	bool isCacheableBlock = !hasBreakpoint && !blockFpRoundingModeOverride.has_value() && !isIdleLoopBlockOverride && !fpUseAccurateAddSub &&
 	                        !isAutoIdleLoop && !isAutoIdleTaintBlock;

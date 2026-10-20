@@ -80,6 +80,7 @@ public:
 		uint32 begin = 0;
 		uint32 end = 0;
 		uint32 successors[2] = {MIPS_INVALID_PC, MIPS_INVALID_PC}; //Branch target, fall through
+		std::vector<uint32> returns; //EE regions: return addresses of calls followed into the region (part ends with JR RA)
 	};
 	//True if the part graph (parts[0] = entry) is reducible, as the wasm structurer requires
 	//(at most 32 parts)

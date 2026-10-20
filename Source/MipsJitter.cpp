@@ -104,6 +104,11 @@ void CMipsJitter::SetVariableAsConstant(size_t variableId, uint32 value)
 	SetVariableStatus(variableId, status);
 }
 
+void CMipsJitter::ClearVariableStatus(size_t variableId)
+{
+	m_variableStatus.erase(variableId);
+}
+
 CMipsJitter::VARIABLESTATUS* CMipsJitter::GetVariableStatus(size_t variableId)
 {
 	auto statusIterator(m_variableStatus.find(variableId));
