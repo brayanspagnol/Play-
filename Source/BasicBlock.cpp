@@ -135,6 +135,8 @@ bool g_eeContextPromotion = false;
 bool g_eeRegionPromotion = false;
 
 extern uint32 g_jitPageAccess;
+//Memory access fast paths marked likely in a branch hint section (Module.setJitBranchHints)
+bool g_jitBranchHints = false;
 
 bool CBasicBlock::UsesModuleBatching() const
 {
@@ -234,7 +236,7 @@ void CBasicBlock::Compile()
 		cacheKey.size = wordCount * 4;
 		cacheKey.hints = m_blockCompileHints;
 		//0x24000000: superblock (0x04000000: structured parts, not the earlier dispatch loop)
-		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000) | (IsSuperBlock() ? 0x24000000 : 0) | (UsesBlockChaining() ? 0x10000000 : 0) | ((g_jitPageAccess != ~0U) ? (0x08000000 | (g_jitPageAccess & 0x3FF)) : 0);
+		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000) | (IsSuperBlock() ? 0x24000000 : 0) | (UsesBlockChaining() ? 0x10000000 : 0) | ((g_jitPageAccess != ~0U) ? (0x08000000 | (g_jitPageAccess & 0x3FF)) : 0) | (g_jitBranchHints ? 0x01000000 : 0);
 		cacheKey.hash[0] = xxHash.low64 ^ m_cacheSalt;
 		cacheKey.hash[1] = xxHash.high64 ^ BlockCache::CODEGEN_VERSION;
 
@@ -783,6 +785,7 @@ void CBasicBlock::CompileToStream(Framework::CMemStream& stream, bool contextPro
 	}
 	auto wasmCodeGen = static_cast<Jitter::CCodeGen_Wasm*>(jitter->GetCodeGen());
 	wasmCodeGen->SetContextPromotion(contextPromotion);
+	Jitter::CCodeGen_Wasm::SetBranchHints(g_jitBranchHints);
 	//Superblocks jump between their parts freely: general control flow structuring
 	wasmCodeGen->SetStructuredControlFlow(IsSuperBlock());
 	if(g_jitFunctionNames)

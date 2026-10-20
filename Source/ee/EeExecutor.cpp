@@ -48,6 +48,7 @@
 
 #endif
 
+
 static CEeExecutor* g_eeExecutor = nullptr;
 
 //Tier-2 EE regions (notes/tier2-m2b.md): most tier-1 blocks per region, 0 or 1 = off.
@@ -57,6 +58,19 @@ uint32 g_eeRegionParts = 0;
 uint32 g_eeRegionHotSamples = 64;
 //Regions follow JAL calls into the callee and back (return address checked at the JR RA)
 bool g_eeRegionCalls = true;
+//Debug: regions count their entries, parts and instructions run (EeRegionRunCounts)
+bool g_eeRegionCount = false;
+
+static CMIPS* g_eeRegionContext = nullptr;
+
+std::string EeRegionRunCounts()
+{
+	if(!g_eeRegionContext) return "";
+	const auto& scratch = g_eeRegionContext->m_jitFlagScratch;
+	char text[64];
+	snprintf(text, sizeof(text), "%u %u %u", scratch[5], scratch[6], scratch[7]);
+	return text;
+}
 //Region counters (eeRegionStats), see EE_REGION_STAT
 uint32 g_eeRegionStats[EE_REGION_STAT_COUNT] = {};
 uint64 g_eeDispatchCount = 0;
@@ -889,6 +903,7 @@ CEeExecutor::CEeExecutor(CMIPS& context, uint8* ram)
 	m_protectedPages.resize(PS2::EE_RAM_SIZE / MIPS_PAGE_SIZE, 0);
 	m_context.m_writeWatchHandler = &CEeExecutor::WriteWatchHandler;
 	m_context.m_blockFnLookup = m_blockLookup.GetFnTable();
+	g_eeRegionContext = &m_context;
 #endif
 }
 

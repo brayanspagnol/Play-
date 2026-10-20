@@ -556,6 +556,26 @@ void setEeRegionParts(uint32 parts)
 	g_eeRegionParts = parts;
 }
 
+//Debug: EE regions count entries, parts and instructions run ("entries parts instructions")
+extern bool g_eeRegionCount;
+std::string EeRegionRunCounts();
+void setEeRegionCount(bool enabled)
+{
+	g_eeRegionCount = enabled;
+}
+
+std::string eeRegionRunCounts()
+{
+	return EeRegionRunCounts();
+}
+
+//JIT memory access fast paths marked likely (wasm branch hints), for blocks compiled afterwards
+extern bool g_jitBranchHints;
+void setJitBranchHints(bool enabled)
+{
+	g_jitBranchHints = enabled;
+}
+
 //Tier-2 EE regions follow JAL calls into the callee and back
 extern bool g_eeRegionCalls;
 void setEeRegionCalls(bool enabled)
@@ -966,6 +986,9 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("setEeRegionHotSamples", &setEeRegionHotSamples);
 	function("setEeRegionPromotion", &setEeRegionPromotion);
 	function("setEeRegionCalls", &setEeRegionCalls);
+	function("setJitBranchHints", &setJitBranchHints);
+	function("setEeRegionCount", &setEeRegionCount);
+	function("eeRegionRunCounts", &eeRegionRunCounts);
 	function("eeEdgeProfile", &eeEdgeProfile);
 	function("setEeAutoIdle", &setEeAutoIdle);
 	function("eeAutoIdleStats", &eeAutoIdleStats);

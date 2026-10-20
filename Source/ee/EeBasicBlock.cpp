@@ -3,6 +3,8 @@
 #include <algorithm>
 #include "xxhash.h"
 #include <map>
+#include <string>
+#include <cstdio>
 
 void CEeBasicBlock::SetFpRoundingMode(Jitter::CJitter::ROUNDINGMODE fpRoundingMode)
 {
@@ -225,7 +227,8 @@ uint64 CEeBasicBlock::GetRegionLayoutHash(const std::vector<SUPERBLOCK_PART>& pa
 {
 	if(parts.empty()) return 0;
 	//Region code has the part addresses as constants (constant PC): the layout is absolute, plus a format version
-	std::vector<uint32> layout = {begin, REGION_CODE_VERSION};
+	extern bool g_eeRegionCount;
+	std::vector<uint32> layout = {begin, REGION_CODE_VERSION, g_eeRegionCount ? 1U : 0U};
 	for(const auto& part : parts)
 	{
 		for(uint32 address : {part.begin, part.end, part.successors[0], part.successors[1]})
@@ -341,9 +344,29 @@ void CEeBasicBlock::CompileRange(CMipsJitter* jitter)
 
 	const auto& parts = m_regionParts;
 	assert(parts[0].begin == savedBegin);
+	{
+		//(Block dumps list the parts)
+		extern thread_local std::string g_superBlockPartsText;
+		g_superBlockPartsText.clear();
+		for(const auto& part : parts)
+		{
+			char line[64];
+			snprintf(line, sizeof(line), "PART %08X %08X\n", part.begin, part.end);
+			g_superBlockPartsText += line;
+		}
+	}
 
 	jitter->PushCst(savedBegin);
 	jitter->PullRel(regionOffset);
+	extern bool g_eeRegionCount;
+	auto count = [&](uint32 index, uint32 value) {
+		if(!g_eeRegionCount) return;
+		jitter->PushRel(offsetof(CMIPS, m_jitFlagScratch[index]));
+		jitter->PushCst(value);
+		jitter->Add();
+		jitter->PullRel(offsetof(CMIPS, m_jitFlagScratch[index]));
+	};
+	count(5, 1);
 
 	std::map<uint32, CMipsJitter::LABEL> partLabels;
 	for(const auto& part : parts)
@@ -376,6 +399,8 @@ void CEeBasicBlock::CompileRange(CMipsJitter* jitter)
 			jitter->PushCst(part.begin);
 			jitter->PullRel(pcOffset);
 		}
+		count(6, 1);
+		count(7, ((part.end - part.begin) / 4) + 1);
 		jitter->SetVariableAsConstant(pcOffset, part.begin);
 		for(uint32 address = part.begin; address <= part.end; address += 4)
 		{
@@ -419,7 +444,7 @@ void CEeBasicBlock::CompileRange(CMipsJitter* jitter)
 			auto exit = exitLabel(target);
 			jitter->PushRel(offsetof(CMIPS, m_State.cycleQuota));
 			jitter->PushCst(0);
-			jitter->BeginIf(Jitter::CONDITION_LE);
+			jitter->BeginIf(Jitter::CONDITION_LE, -1);
 			{
 				jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
 				jitter->PushCst(MIPS_EXCEPTION_STATUS_QUOTADONE);
@@ -436,7 +461,7 @@ void CEeBasicBlock::CompileRange(CMipsJitter* jitter)
 				jitter->And();
 				jitter->Or();
 				jitter->PushCst(0);
-				jitter->BeginIf(Jitter::CONDITION_NE);
+				jitter->BeginIf(Jitter::CONDITION_NE, -1);
 				{
 					jitter->Goto(exit);
 				}
@@ -457,7 +482,7 @@ void CEeBasicBlock::CompileRange(CMipsJitter* jitter)
 					usesDynamicExit = true;
 					jitter->PushRel(offsetof(CMIPS, m_State.cycleQuota));
 					jitter->PushCst(0);
-					jitter->BeginIf(Jitter::CONDITION_LE);
+					jitter->BeginIf(Jitter::CONDITION_LE, -1);
 					{
 						jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
 						jitter->PushCst(MIPS_EXCEPTION_STATUS_QUOTADONE);
@@ -476,7 +501,7 @@ void CEeBasicBlock::CompileRange(CMipsJitter* jitter)
 							jitter->And();
 							jitter->Or();
 							jitter->PushCst(0);
-							jitter->BeginIf(Jitter::CONDITION_NE);
+							jitter->BeginIf(Jitter::CONDITION_NE, -1);
 							{
 								jitter->Goto(dynamicExitLabel);
 							}
@@ -484,7 +509,7 @@ void CEeBasicBlock::CompileRange(CMipsJitter* jitter)
 						}
 						jitter->PushRel(offsetof(CMIPS, m_State.cycleQuota));
 						jitter->PushCst(0);
-						jitter->BeginIf(Jitter::CONDITION_GT);
+						jitter->BeginIf(Jitter::CONDITION_GT, 1);
 						{
 							for(uint32 returnAddress : part.returns)
 							{
