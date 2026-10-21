@@ -133,6 +133,9 @@ bool g_eeBlockChaining = false;
 bool g_eeContextPromotion = false;
 
 extern uint32 g_jitPageAccess;
+//Memory access fast paths marked likely in a wasm branch hint section (Module.setJitBranchHints): TurboFan then
+//keeps the register spills and reloads around the slow path call out of the fast path
+bool g_jitBranchHints = true;
 
 bool CBasicBlock::UsesModuleBatching() const
 {
@@ -224,7 +227,7 @@ void CBasicBlock::Compile()
 		cacheKey.category = m_category;
 		cacheKey.size = wordCount * 4;
 		cacheKey.hints = m_blockCompileHints;
-		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000) | (IsSuperBlock() ? 0x20000000 : 0) | (UsesBlockChaining() ? 0x10000000 : 0) | ((g_jitPageAccess != ~0U) ? (0x08000000 | (g_jitPageAccess & 0x3FF)) : 0);
+		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000) | (IsSuperBlock() ? 0x20000000 : 0) | (UsesBlockChaining() ? 0x10000000 : 0) | ((g_jitPageAccess != ~0U) ? (0x08000000 | (g_jitPageAccess & 0x3FF)) : 0) | (g_jitBranchHints ? 0 : 0x01000000);
 		cacheKey.hash[0] = xxHash.low64;
 		cacheKey.hash[1] = xxHash.high64 ^ BlockCache::CODEGEN_VERSION;
 
@@ -685,6 +688,7 @@ void CBasicBlock::BeginCompile(CMipsJitter* jitter, bool contextPromotion)
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
 	auto wasmCodeGen = static_cast<Jitter::CCodeGen_Wasm*>(jitter->GetCodeGen());
 	wasmCodeGen->SetContextPromotion(contextPromotion);
+	Jitter::CCodeGen_Wasm::SetBranchHints(g_jitBranchHints);
 	if(g_jitFunctionNames)
 	{
 		const char* prefix = (m_category == BLOCK_CATEGORY_PS2_VU) ? (m_diffDataSize > 0x1000 ? "vu1" : "vu0") : (m_category == BLOCK_CATEGORY_PS2_EE) ? "ee" : "iop";

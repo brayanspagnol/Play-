@@ -535,6 +535,13 @@ void setEeContextPromotion(bool enabled)
 	g_eeContextPromotion = enabled;
 }
 
+//JIT memory access fast paths marked likely (wasm branch hints), for blocks compiled afterwards
+extern bool g_jitBranchHints;
+void setJitBranchHints(bool enabled)
+{
+	g_jitBranchHints = enabled;
+}
+
 //Automatic EE wait loop detection (see CEeExecutor): on/off, and the detected loops with their counters
 extern bool g_eeAutoIdle;
 std::string EeAutoIdleStats(bool);
@@ -905,6 +912,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("eeTimeVblank", &eeTimeVblank);
 	function("setEeContextPromotion", &setEeContextPromotion);
 	function("setEeAutoIdle", &setEeAutoIdle);
+	function("setJitBranchHints", &setJitBranchHints);
 	function("eeAutoIdleStats", &eeAutoIdleStats);
 	function("eeHashResult", &eeHashResult);
 	function("vuHashResult", &vuHashResult);
