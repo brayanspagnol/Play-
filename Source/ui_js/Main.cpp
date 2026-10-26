@@ -627,7 +627,8 @@ std::string eeRegionStats()
 	{
 		result += string_format("%u ", g_eeRegionStats[i]);
 	}
-	return result + string_format("%llu %u", static_cast<unsigned long long>(g_eeDispatchCount), g_eeRegionJitRuns);
+	extern uint32 g_eeRegionSampleCount;
+	return result + string_format("%llu %u %u", static_cast<unsigned long long>(g_eeDispatchCount), g_eeRegionJitRuns, g_eeRegionSampleCount);
 }
 
 //Automatic EE wait loop detection (see CEeExecutor): on/off, and the detected loops with their counters

@@ -56,7 +56,7 @@ static CEeExecutor* g_eeExecutor = nullptr;
 //Applies to blocks created afterwards.
 uint32 g_eeRegionParts = 0;
 //Samples (one dispatch in REGION_SAMPLE_PERIOD) after which an entry is hot and gets a region
-uint32 g_eeRegionHotSamples = 64;
+uint32 g_eeRegionHotSamples = 16;
 //Regions follow JAL calls into the callee and back (return address checked at the JR RA)
 bool g_eeRegionCalls = true;
 //Debug: regions count their entries, parts and instructions run (EeRegionRunCounts)
@@ -75,6 +75,7 @@ std::string EeRegionRunCounts()
 //Region counters (eeRegionStats), see EE_REGION_STAT
 uint32 g_eeRegionStats[EE_REGION_STAT_COUNT] = {};
 uint64 g_eeDispatchCount = 0;
+uint32 g_eeRegionSampleCount = 0;
 //Regions translated by the Jitter (persistent block cache misses), counted by CBasicBlock::Compile
 uint32 g_eeRegionJitRuns = 0;
 
@@ -918,6 +919,14 @@ int CEeExecutor::Execute(int cycles)
 	AsyncCompile::Update();
 	InstallPendingRegions();
 #endif
+	//Tier-2 hot entry detection: the PC at the start of each EE time slice. Slices start at points that don't
+	//depend on which code is compiled how (cycle quota, exceptions), so the hot set, and with it the region
+	//cache keys, is the same in every run of the same state (sampling dispatches was not: regions absorb them)
+	if(g_eeRegionParts >= 2)
+	{
+		g_eeRegionSampleCount++;
+		SampleRegionEntry(m_context.m_State.nPC & m_addressMask);
+	}
 	m_executing = true;
 #if !defined(PROFILE) && !defined(DEBUGGER_INCLUDED)
 	//Same loop as CGenericMipsExecutor::Execute, but the call goes through the function index table
@@ -929,17 +938,6 @@ int CEeExecutor::Execute(int cycles)
 	{
 		uint32 address = m_context.m_State.nPC & m_addressMask;
 		g_eeDispatchCount++;
-		//Tier-2 hot entry detection: sample one dispatch in REGION_SAMPLE_PERIOD on average. The period varies
-		//(deterministic xorshift) so loops whose length divides it don't send every sample to the same block,
-		//which made the hot set (and region cache keys) depend on the sampling phase
-		if((g_eeRegionParts >= 2) && (--m_regionSampleCountdown == 0))
-		{
-			m_regionSampleRng ^= m_regionSampleRng << 13;
-			m_regionSampleRng ^= m_regionSampleRng >> 17;
-			m_regionSampleRng ^= m_regionSampleRng << 5;
-			m_regionSampleCountdown = (REGION_SAMPLE_PERIOD / 2) + (m_regionSampleRng % REGION_SAMPLE_PERIOD);
-			SampleRegionEntry(address);
-		}
 		uint32 fctIdx = fnTable[address >> 16][(address & 0xFFFF) / 4];
 		if(fctIdx != 0)
 		{
