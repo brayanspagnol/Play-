@@ -1580,9 +1580,11 @@ void CGSH_OpenGL::RunAliasPass(int mode, const FramebufferPtr& dstFramebuffer, G
 //- destination alpha test without framebuffer fetch (the shader reads the copy),
 //- PSMCT16 frame buffer drawn with channels partly masked (masked bits taken from the copy, by the
 //  shader without blending, by a pass after the draw with it).
-//PSMCT16 to PSMCT16 copies are moved by half a pixel: the GS samples at the pixel's corner, GL at
-//its center, and channel shuffles map pixels to texels one to one (sprites 8 pixels wide, UVs on
-//texel centers would land on texel edges and pick the neighbor).
+//PSMCT16 to PSMCT16 copies sample half a texel up and left: the GS samples at the pixel's corner, GL
+//at its center, and channel shuffles map pixels to texels one to one (sprites 8 pixels wide, UVs on
+//texel centers would land on texel edges and pick the neighbor). The texture coordinates move, not
+//the geometry: moving the geometry by half a GS pixel leaves a column and a row of every sprite
+//undrawn above 1x (green stripes in God of War).
 void CGSH_OpenGL::DoRenderPassWithCopies(SHADERCAPS caps)
 {
 	const auto& framebuffer = m_currentFramebuffer;
@@ -1672,9 +1674,13 @@ void CGSH_OpenGL::DoRenderPassWithCopies(SHADERCAPS caps)
 		glActiveTexture(GL_TEXTURE0);
 	}
 
+	//Added to s and t before the division by q (texture matrix column 2 multiplies q)
+	float texShiftS = -0.5f * m_vertexParams.texMatrix[0 + (0 * 4)] / static_cast<float>(m_nTexWidth);
+	float texShiftT = -0.5f * m_vertexParams.texMatrix[1 + (1 * 4)] / static_cast<float>(m_nTexHeight);
 	if(ct16Copy)
 	{
-		MakeLinearZOrtho(m_vertexParams.projMatrix, -0.5f, fbWidth - 0.5f, -0.5f, fbHeight - 0.5f);
+		m_vertexParams.texMatrix[0 + (2 * 4)] += texShiftS;
+		m_vertexParams.texMatrix[1 + (2 * 4)] += texShiftT;
 		m_validGlState &= ~GLSTATE_VERTEX_PARAMS;
 	}
 
@@ -1682,7 +1688,8 @@ void CGSH_OpenGL::DoRenderPassWithCopies(SHADERCAPS caps)
 
 	if(ct16Copy)
 	{
-		MakeLinearZOrtho(m_vertexParams.projMatrix, 0, fbWidth, 0, fbHeight);
+		m_vertexParams.texMatrix[0 + (2 * 4)] -= texShiftS;
+		m_vertexParams.texMatrix[1 + (2 * 4)] -= texShiftT;
 		m_validGlState &= ~GLSTATE_VERTEX_PARAMS;
 	}
 	if(selfTexture)
