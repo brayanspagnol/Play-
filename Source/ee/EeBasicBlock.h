@@ -19,6 +19,10 @@ public:
 	//function with direct jumps between them (see CompileRange). Empty: an ordinary block.
 	void SetRegionParts(std::vector<SUPERBLOCK_PART>);
 	bool IsSuperBlock() const override;
+	const std::vector<SUPERBLOCK_PART>& GetRegionParts() const
+	{
+		return m_regionParts;
+	}
 	void CompileRange(CMipsJitter*) override;
 	void GetCodeWords(std::vector<uint32>&) const override;
 	//Hash of the part layout and address, mixed into cache keys of region code

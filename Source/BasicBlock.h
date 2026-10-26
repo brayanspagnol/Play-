@@ -143,6 +143,11 @@ public:
 	{
 		return m_asyncJob;
 	}
+	//Has its wasm function (not waiting for a helper thread, not interpreted)
+	bool IsReady() const
+	{
+		return !m_function.IsEmpty() && !m_interpreterProgram && !m_asyncJob;
+	}
 	//Takes the compiled function of a block that ran in the interpreter
 	void SetCompiledFunction(CMemoryFunction&&);
 	//Moves the pending blocks' own modules into one batch module (fewer, larger modules: better code

@@ -257,6 +257,17 @@ void CBasicBlock::Compile()
 			static const auto compileWasmZone = CProfiler::GetInstance().RegisterZone("COMPILE_WASM");
 			CProfilerZone profilerZone(compileWasmZone);
 #endif
+			if(IsSuperBlock() && (m_category == BLOCK_CATEGORY_PS2_EE) && (AsyncCompile::GetMode() == AsyncCompile::MODE_ON))
+			{
+				//EE region: goes into a helper thread's next batch module instead of a module of its own here
+				//(the executor installs it once it has its function)
+				auto job = std::make_shared<AsyncCompile::JOB>();
+				job->block = weak_from_this();
+				job->code = cachedCode;
+				m_asyncJob = job;
+				AsyncCompile::Submit(job, true);
+				return;
+			}
 			m_function = CMemoryFunction(cachedCode.data(), cachedCode.size());
 			m_chainFunctionIndex = GetFunctionIndex();
 			if(UsesModuleBatching()) m_batchModule = cachedCode;
@@ -836,6 +847,16 @@ bool CBasicBlock::TryCompileAsync(const BlockCache::KEY* cacheKey)
 	auto startTime = std::chrono::steady_clock::now();
 	auto jitter = AsyncCompile::TakeJitter();
 	BeginCompile(jitter, UsesContextPromotion());
+	if(IsSuperBlock() && (m_category == BLOCK_CATEGORY_PS2_EE))
+	{
+		//EE regions aren't interpreted: the executor keeps running the tier-1 blocks until the helper is done
+		m_asyncCacheKey = cacheKey ? *cacheKey : BlockCache::KEY();
+		m_asyncAddToCache = (cacheKey != nullptr);
+		m_asyncWordsHash = ComputeWordsHash();
+		SubmitAsyncJob(jitter, true);
+		AsyncCompile::AddSubmitTime(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - startTime).count());
+		return true;
+	}
 	auto program = jitter->BuildInterpreterProgram();
 	if(!program)
 	{

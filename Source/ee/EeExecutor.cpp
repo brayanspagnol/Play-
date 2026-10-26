@@ -916,6 +916,7 @@ int CEeExecutor::Execute(int cycles)
 #if defined(__EMSCRIPTEN__)
 	//Blocks compiled on the helper thread (EE, IOP, VU0: all run on this thread) replace their interpreter
 	AsyncCompile::Update();
+	InstallPendingRegions();
 #endif
 	m_executing = true;
 #if !defined(PROFILE) && !defined(DEBUGGER_INCLUDED)
@@ -1211,6 +1212,7 @@ void CEeExecutor::Reset()
 #if defined(__EMSCRIPTEN__)
 	m_regionPlans.clear();
 	m_regionPages.clear();
+	m_pendingRegions.clear();
 	m_pendingRegionParts.clear();
 	ResetRegionSampling();
 #endif
@@ -1362,11 +1364,34 @@ void CEeExecutor::PartitionFunction(uint32 startAddress)
 	if(builds == 9) g_eeRegionStats[EE_REGION_REBUILT8_ENTRIES]++;
 	g_eeRegionStats[EE_REGION_MAX_BUILDS] = std::max(g_eeRegionStats[EE_REGION_MAX_BUILDS], builds);
 	//The region block spans its entry part (block lookups and range scans see that); invalidation finds it
-	//through the pages of all its parts, which are write protected like tier-1 blocks
+	//through the pages of all its parts. With async compile a region that isn't in the block cache waits
+	//for a helper thread while the tier-1 blocks keep running (see InstallPendingRegions).
+	if(std::any_of(m_pendingRegions.begin(), m_pendingRegions.end(), [startAddress](const auto& pending) { return pending.first->GetBeginAddress() == startAddress; }))
+	{
+		CGenericMipsExecutor::PartitionFunction(startAddress);
+		return;
+	}
 	m_pendingRegionParts = plan->parts;
-	CreateBlock(startAddress, plan->parts[0].end);
+	auto region = BlockFactory(m_context, startAddress, plan->parts[0].end);
 	m_pendingRegionParts.clear();
-	for(const auto& part : plan->parts)
+	if(region->IsReady())
+	{
+		InstallRegion(region);
+		return;
+	}
+	m_pendingRegions.push_back({region, plan->hash});
+	CGenericMipsExecutor::PartitionFunction(startAddress);
+}
+
+void CEeExecutor::InstallRegion(const BasicBlockPtr& region)
+{
+	uint32 startAddress = region->GetBeginAddress();
+	auto existing = FindBlockStartingAt(startAddress);
+	if(!existing->IsEmpty()) DropBlocks({existing});
+	ResetBlockOutLinks(region.get());
+	m_blockLookup.AddBlock(region.get());
+	m_blocks.insert(region);
+	for(const auto& part : static_cast<CEeBasicBlock*>(region.get())->GetRegionParts())
 	{
 		SetMemoryProtected(m_ram + part.begin, part.end + 4 - part.begin, true);
 		for(uint32 page = part.begin / MIPS_PAGE_SIZE; page <= part.end / MIPS_PAGE_SIZE; page++)
@@ -1374,6 +1399,25 @@ void CEeExecutor::PartitionFunction(uint32 startAddress)
 			auto& entries = m_regionPages[page];
 			if(std::find(entries.begin(), entries.end(), startAddress) == entries.end()) entries.push_back(startAddress);
 		}
+	}
+}
+
+//Between dispatches: regions compiled by the helper threads replace the tier-1 block at their entry, if their
+//code didn't change meanwhile
+void CEeExecutor::InstallPendingRegions()
+{
+	if(m_pendingRegions.empty()) return;
+	for(auto it = m_pendingRegions.begin(); it != m_pendingRegions.end();)
+	{
+		auto& region = it->first;
+		if(!region->IsReady() && region->GetAsyncJob())
+		{
+			++it;
+			continue;
+		}
+		auto parts = static_cast<CEeBasicBlock*>(region.get())->GetRegionParts();
+		if(region->IsReady() && (HashRegionWords(parts) == it->second)) InstallRegion(region);
+		it = m_pendingRegions.erase(it);
 	}
 }
 

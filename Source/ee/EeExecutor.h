@@ -132,6 +132,10 @@ private:
 	std::vector<CBasicBlock::SUPERBLOCK_PART> m_pendingRegionParts;
 	//Region entries by page of their parts (pages of 4 KB); entries may be stale, checked when used
 	std::unordered_map<uint32, std::vector<uint32>> m_regionPages;
+	//Regions waiting for a helper thread (async compile), with the hash of their part words when planned
+	std::vector<std::pair<BasicBlockPtr, uint64>> m_pendingRegions;
+	void InstallRegion(const BasicBlockPtr&);
+	void InstallPendingRegions();
 	//Hot entries: a dispatch address sampled g_eeRegionHotSamples times gets a region
 	//ponytail: fixed average period; counts restart only on Reset/state load (no decay)
 	enum

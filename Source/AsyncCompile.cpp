@@ -70,6 +70,8 @@ namespace
 
 	void Compile(const JobPtr& job)
 	{
+		//(Code from the block cache: only goes in a batch)
+		if(!job->jitter) return;
 		//(Only expired() here: the block must never be destroyed on this thread)
 		if(!job->block.expired())
 		{
