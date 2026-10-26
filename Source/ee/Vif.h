@@ -768,6 +768,34 @@ protected:
 			if constexpr(UnpackElementSize(dataType) != 0)
 			{
 				constexpr uint32 elementSize = UnpackElementSize(dataType);
+				if constexpr(clGreaterEqualWl && !useMask)
+				{
+					//cl > wl at a cycle group start: whole groups (wl vectors written, cl - wl skipped) in one loop
+					if((cl > wl) && (m_readTick == 0) && (m_writeTick == 0) && stream.CanReadDirect())
+					{
+						uint32 groups = std::min<uint32>(currentNum / wl, stream.GetAvailableReadBytes() / (wl * elementSize));
+						if(groups != 0)
+						{
+							const uint8* src = stream.GetDirectPointer();
+							for(uint32 group = 0; group < groups; group++)
+							{
+								UnpackRunSimd<dataType, useMask, mode, usn>(src, wl, nDstAddr, vuMem, vuMemSize, 0);
+								src += wl * elementSize;
+								nDstAddr = (nDstAddr + (cl * 0x10)) & (vuMemSize - 1);
+							}
+							stream.Skip(groups * wl * elementSize);
+							currentNum -= groups * wl;
+							if(currentNum == 0)
+							{
+								//The tick loop stops right after the last vector: no skipped ticks after it
+								nDstAddr = (nDstAddr - ((cl - wl) * 0x10)) & (vuMemSize - 1);
+								m_writeTick = wl;
+								m_readTick = wl;
+							}
+							continue;
+						}
+					}
+				}
 				bool readPhase = clGreaterEqualWl ? (m_readTick < wl) : (m_writeTick < cl);
 				if(readPhase && stream.CanReadDirect())
 				{
@@ -792,6 +820,16 @@ protected:
 				}
 			}
 #endif
+			if(clGreaterEqualWl && (m_readTick >= wl))
+			{
+				//Rest of a cycle group (cl > wl): nothing read or written, same end state as one tick at a time
+				uint32 skip = cl - m_readTick;
+				nDstAddr = (nDstAddr + (skip * 0x10)) & (vuMemSize - 1);
+				m_writeTick = 0;
+				m_readTick = 0;
+				continue;
+			}
+
 			bool mustWrite = false;
 			uint128 writeValue;
 			memset(&writeValue, 0, sizeof(writeValue));
