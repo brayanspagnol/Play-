@@ -77,6 +77,8 @@ protected:
 	{
 		std::unique_ptr<CBasicBlock*[]> table;
 		BlockStore blocks;
+		//Blocks taken over from the set these contents came from (see SelectBlockSet)
+		std::vector<BasicBlockPtr> carriedBlocks;
 	};
 	struct KEY_HASHER
 	{
@@ -97,6 +99,8 @@ protected:
 	std::unordered_map<uint128, BLOCK_SET, KEY_HASHER> m_blockSets;
 	//Module batching (see CBasicBlock::BatchModules): new blocks wait here
 	std::vector<std::weak_ptr<CBasicBlock>> m_batchPending;
+	//Current set's blocks taken over from another set (m_blocks has the ones made for it)
+	std::vector<BasicBlockPtr> m_carriedBlocks;
 	std::vector<uint128> m_pageHashes;
 	std::vector<bool> m_dirtyPages;
 	bool m_contentsChanged = true;

@@ -2,6 +2,7 @@
 #include "VuBasicBlock.h"
 #include "VUShared.h"
 #include "xxhash.h"
+#include "../Ps2Const.h"
 
 bool g_vuSuperBlocks = false;
 extern bool g_vuContextPromotion;
@@ -58,6 +59,7 @@ void CVuExecutor::ResetBlockSets()
 {
 	//(The current block set is in the lookup table and m_blocks; it gets a key at the next run)
 	m_blockSets.clear();
+	m_carriedBlocks.clear();
 	m_batchPending.clear();
 	uint32 pageCount = m_maxAddress / BLOCK_SET_PAGE_SIZE;
 	m_pageHashes.assign(pageCount, uint128{});
@@ -71,12 +73,17 @@ void CVuExecutor::SelectBlockSet()
 	m_contentsChanged = false;
 	auto map = m_context.m_pMemoryMap->GetInstructionMap(0);
 	auto memory = reinterpret_cast<const uint8*>(map->pPointer);
+	//Pages whose contents differ from the ones the current set's blocks were made from
+	uint64 changedPages = 0;
+	static_assert(PS2::MICROMEM1SIZE / BLOCK_SET_PAGE_SIZE <= 64);
 	for(uint32 page = 0; page < m_pageHashes.size(); page++)
 	{
 		if(!m_dirtyPages[page]) continue;
 		m_dirtyPages[page] = false;
 		auto pageHash = XXH3_128bits(memory + (page * BLOCK_SET_PAGE_SIZE), BLOCK_SET_PAGE_SIZE);
+		if(memcmp(&m_pageHashes[page], &pageHash, sizeof(uint128)) == 0) continue;
 		memcpy(&m_pageHashes[page], &pageHash, sizeof(uint128));
+		changedPages |= (1ULL << page);
 	}
 	auto keyHash = XXH3_128bits(m_pageHashes.data(), m_pageHashes.size() * sizeof(uint128));
 	uint128 key;
@@ -92,11 +99,34 @@ void CVuExecutor::SelectBlockSet()
 	else
 	{
 		next.table.reset(m_blockLookup.CreateEmptyTable());
+		//Contents not seen before: keep the current set's blocks whose words did not change (a block's
+		//code and extent only depend on its own words). Games that keep rewriting part of micro memory
+		//(God of War: almost every MPG makes a new combination) then don't repartition the rest.
+		if(m_hasCurrentKey)
+		{
+			auto currentTable = m_blockLookup.GetTable();
+			auto carry = [&](const BasicBlockPtr& block) {
+				uint32 begin = block->GetBeginAddress();
+				uint32 firstPage = begin / BLOCK_SET_PAGE_SIZE;
+				uint32 lastPage = block->GetEndAddress() / BLOCK_SET_PAGE_SIZE;
+				uint64 blockPages = (~0ULL >> (63 - lastPage)) & (~0ULL << firstPage);
+				if(changedPages & blockPages) return;
+				uint32 entry = begin / 4;
+				if(currentTable[entry] != block.get()) return;
+				next.table[entry] = block.get();
+				next.carriedBlocks.push_back(block);
+			};
+			next.carriedBlocks.reserve(m_blocks.size() + m_carriedBlocks.size());
+			for(const auto& block : m_blocks) carry(block);
+			for(const auto& block : m_carriedBlocks) carry(block);
+		}
 	}
 	BLOCK_SET previous;
 	previous.table.reset(m_blockLookup.ExchangeTable(next.table.release()));
 	previous.blocks = std::move(m_blocks);
+	previous.carriedBlocks = std::move(m_carriedBlocks);
 	m_blocks = std::move(next.blocks);
+	m_carriedBlocks = std::move(next.carriedBlocks);
 	if(m_hasCurrentKey)
 	{
 		//ponytail: drops every parked set when full; LRU if a game cycles through more contents than that
