@@ -277,6 +277,8 @@ void CSubSystem::Reset(uint32 ramSize)
 	m_isIdle = false;
 }
 
+void EeAutoIdleNewSlice();
+
 int CSubSystem::ExecuteCpu(int quota)
 {
 	m_isIdle = false;
@@ -296,6 +298,7 @@ int CSubSystem::ExecuteCpu(int quota)
 		static const auto eeJitZone = CProfiler::GetInstance().RegisterZone("EEJIT");
 		CProfilerZone profilerZone(eeJitZone);
 #endif
+		EeAutoIdleNewSlice();
 		executed = (quota - m_EE.m_executor->Execute(quota));
 		m_os->NotifyCpuExecution(executed);
 	}

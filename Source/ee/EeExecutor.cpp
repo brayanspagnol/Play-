@@ -67,11 +67,59 @@ static CEeExecutor* g_eeExecutor = nullptr;
 //check had the same registers and no taint block ran in between.
 //Loops that code outside of them jumps into (other than to the head) are rejected, and blocks are
 //invalidated when the code read by the analysis changes.
+//Counter loops: a register read by the loop may also be a counter (addiu of a constant each iteration,
+//or a copy of one) if its value is only copied or compared with something that doesn't change (timeout
+//polls, delay loops). There the check skips iterations instead of the slice: after two consecutive
+//passes with the expected deltas, it advances the counters by the number of iterations that fit in the
+//rest of the slice (or until one of the loop's comparisons involving a counter would change its result,
+//e.g. the timeout or the end of a delay) and takes their cycles from the quota. The skipped iterations
+//are exactly the ones the EE would have run: same path, same memory, same registers at the end.
 
 bool g_eeAutoIdle = true;
 
 namespace
 {
+	enum
+	{
+		COUNTER_MAX_REGS = 4,
+		COUNTER_MAX_PREDS = 4,
+	};
+
+	enum COUNTER_PRED_OP : uint8
+	{
+		COUNTER_PRED_SLT,
+		COUNTER_PRED_SLTU,
+		COUNTER_PRED_EQ,
+	};
+
+	//Operand of a comparison in a counter loop: a constant, or a register's value at the start of the
+	//iteration plus an offset (32-bit add when the offset isn't 0)
+	struct COUNTER_OPERAND
+	{
+		bool isConst = true;
+		uint8 reg = 0;
+		int32 value = 0; //Constant (sign extended), or offset
+	};
+
+	struct COUNTER_PRED
+	{
+		COUNTER_PRED_OP op = COUNTER_PRED_EQ;
+		COUNTER_OPERAND a;
+		COUNTER_OPERAND b;
+	};
+
+	//Registers changed by a constant each iteration and comparisons that read them (none: plain wait loop)
+	struct COUNTER_LOOP
+	{
+		uint32 regCount = 0;
+		uint8 regs[COUNTER_MAX_REGS];
+		int32 steps[COUNTER_MAX_REGS];
+		uint32 predCount = 0;
+		COUNTER_PRED preds[COUNTER_MAX_PREDS];
+		bool ambiguous = false; //Another loop with the same head: no skipping
+		uint32 maxIterationCycles = 0;
+	};
+
 	struct AUTOIDLE_STAT
 	{
 		std::atomic<uint32> head = 0;
@@ -81,6 +129,8 @@ namespace
 		uint32 taints = 0;
 		std::atomic<uint32> checks = 0;
 		std::atomic<uint32> idles = 0;
+		std::atomic<uint32> skips = 0; //Iterations skipped in counter loops
+		COUNTER_LOOP counterLoop;
 	};
 	enum
 	{
@@ -102,6 +152,161 @@ namespace
 	};
 	AUTOIDLE_STATE g_autoIdleState;
 
+	//Previous pass through a counter loop's check (kept apart so an enclosing wait loop still idles)
+	struct COUNTER_STATE
+	{
+		uint32 head = MIPS_INVALID_PC;
+		bool tainted = false;
+		int32 quota = 0;
+		uint128 gpr[32];
+		uint32 hilo[8];
+	};
+	COUNTER_STATE g_counterState;
+
+	int32 GetCounterStep(const COUNTER_LOOP& loop, uint32 reg)
+	{
+		for(uint32 i = 0; i < loop.regCount; i++)
+		{
+			if(loop.regs[i] == reg) return loop.steps[i];
+		}
+		return 0;
+	}
+
+	//Value of a comparison operand at iteration j (0: the next one, -1: the one that just ended). Counters
+	//and offsets are 32-bit adds: the value is exact (and moves monotonically) while it stays in int32
+	//and, for unsigned compares, keeps the sign it had at iteration -1. Returns false outside that range.
+	bool GetCounterOperand(const COUNTER_OPERAND& operand, const COUNTER_LOOP& loop, const MIPSSTATE& state, int64 j, bool isUnsigned, int64& result)
+	{
+		if(operand.isConst)
+		{
+			result = operand.value;
+			return true;
+		}
+		const auto& reg = state.nGPR[operand.reg];
+		int64 step = GetCounterStep(loop, operand.reg);
+		if((step == 0) && (operand.value == 0))
+		{
+			result = static_cast<int64>(reg.nD0);
+			return true;
+		}
+		int64 base = static_cast<int64>(static_cast<int32>(reg.nV0)) + operand.value;
+		int64 first = base - step;
+		result = base + (j * step);
+		if((step == 0) && ((first < INT32_MIN) || (first > INT32_MAX))) result = static_cast<int32>(static_cast<uint32>(first)); //Wrapped constant offset
+		if((step != 0) && ((result < INT32_MIN) || (result > INT32_MAX) || (first < INT32_MIN) || (first > INT32_MAX))) return false;
+		if((step != 0) && isUnsigned && ((result < 0) != (first < 0))) return false;
+		return true;
+	}
+
+	bool EvalCounterPred(const COUNTER_PRED& pred, const COUNTER_LOOP& loop, const MIPSSTATE& state, int64 j, bool& result)
+	{
+		bool isUnsigned = (pred.op == COUNTER_PRED_SLTU);
+		int64 a = 0, b = 0;
+		if(!GetCounterOperand(pred.a, loop, state, j, isUnsigned, a) || !GetCounterOperand(pred.b, loop, state, j, isUnsigned, b)) return false;
+		switch(pred.op)
+		{
+		case COUNTER_PRED_SLT:
+			result = (a < b);
+			break;
+		case COUNTER_PRED_SLTU:
+			result = (static_cast<uint64>(a) < static_cast<uint64>(b));
+			break;
+		default:
+			result = (a == b);
+			break;
+		}
+		return true;
+	}
+
+	//Largest n <= limit such that the comparison gives the same result for iterations 0 to n - 1 as for
+	//the one that just ended (-1). In the counters' monotonic range, < can change only once and == can
+	//match only once.
+	int64 GetCounterPredLimit(const COUNTER_PRED& pred, const COUNTER_LOOP& loop, const MIPSSTATE& state, int64 limit)
+	{
+		bool observed = false;
+		if(!EvalCounterPred(pred, loop, state, -1, observed)) return 0;
+		auto same = [&](int64 j) {
+			bool result = false;
+			return EvalCounterPred(pred, loop, state, j, result) && (result == observed);
+		};
+		if(pred.op == COUNTER_PRED_EQ)
+		{
+			//Two equal operands become different on the next iteration (one of them moves)
+			if(observed) return 0;
+			//First match: the counter operand moves by its step, the other one is fixed
+			bool counterA = !pred.a.isConst && (GetCounterStep(loop, pred.a.reg) != 0);
+			const auto& counter = counterA ? pred.a : pred.b;
+			const auto& other = counterA ? pred.b : pred.a;
+			int64 step = GetCounterStep(loop, counter.reg);
+			int64 x0 = 0, y = 0;
+			if(GetCounterOperand(counter, loop, state, 0, false, x0) && GetCounterOperand(other, loop, state, 0, false, y))
+			{
+				int64 gap = y - x0;
+				if(((gap == 0) || ((gap > 0) == (step > 0))) && ((gap % step) == 0)) limit = std::min(limit, gap / step);
+			}
+		}
+		//Last iteration with the same result (monotonic, and the range check is monotonic too)
+		int64 lo = 0, hi = limit;
+		while(lo < hi)
+		{
+			int64 mid = lo + (hi - lo + 1) / 2;
+			if(same(mid - 1))
+				lo = mid;
+			else
+				hi = mid - 1;
+		}
+		return lo;
+	}
+
+	void CounterLoopCheck(MIPSSTATE& state, uint32 head, AUTOIDLE_STAT& stat)
+	{
+		auto& counterState = g_counterState;
+		const auto& loop = stat.counterLoop;
+		bool canSkip = !counterState.tainted && !loop.ambiguous && (counterState.head == head) && (state.nHasException == MIPS_EXCEPTION_NONE) &&
+		               (counterState.quota > state.cycleQuota) && (memcmp(counterState.hilo, state.nHI, sizeof(counterState.hilo)) == 0);
+		//Same registers as at the previous pass except the counters, which moved by their step
+		for(uint32 reg = 0; canSkip && (reg < 32); reg++)
+		{
+			const auto& prev = counterState.gpr[reg];
+			const auto& curr = state.nGPR[reg];
+			int32 step = GetCounterStep(loop, reg);
+			if(step == 0)
+			{
+				canSkip = (memcmp(&prev, &curr, sizeof(curr)) == 0);
+				continue;
+			}
+			canSkip = (static_cast<uint32>(curr.nV0 - prev.nV0) == static_cast<uint32>(step)) &&
+			          (curr.nV1 == ((curr.nV0 & 0x80000000) ? ~0U : 0U)) && (curr.nV2 == prev.nV2) && (curr.nV3 == prev.nV3);
+		}
+		if(canSkip)
+		{
+			int64 cyclesPerIteration = counterState.quota - state.cycleQuota;
+			//The EE stops at the first block that takes the quota to 0 or below: the skipped iterations must
+			//leave some, like the ones they replace
+			int64 count = (cyclesPerIteration <= loop.maxIterationCycles) ? ((state.cycleQuota - 1) / cyclesPerIteration) : 0;
+			for(uint32 i = 0; (i < loop.predCount) && (count > 0); i++)
+			{
+				count = std::min(count, GetCounterPredLimit(loop.preds[i], loop, state, count));
+			}
+			if(count > 0)
+			{
+				for(uint32 i = 0; i < loop.regCount; i++)
+				{
+					auto& reg = state.nGPR[loop.regs[i]];
+					reg.nV0 += static_cast<uint32>(count * loop.steps[i]);
+					reg.nV1 = (reg.nV0 & 0x80000000) ? ~0U : 0U;
+				}
+				state.cycleQuota -= static_cast<int32>(count * cyclesPerIteration);
+				stat.skips.fetch_add(static_cast<uint32>(count), std::memory_order_relaxed);
+			}
+		}
+		counterState.head = head;
+		counterState.tainted = false;
+		counterState.quota = state.cycleQuota;
+		memcpy(counterState.gpr, state.nGPR, sizeof(counterState.gpr));
+		memcpy(counterState.hilo, state.nHI, sizeof(counterState.hilo));
+	}
+
 	AUTOIDLE_STAT* FindAutoIdleStat(uint32 head)
 	{
 		uint32 count = g_autoIdleStatCount.load(std::memory_order_acquire);
@@ -112,18 +317,29 @@ namespace
 		return nullptr;
 	}
 
-	void AddAutoIdleStat(uint32 head, uint32 branch, uint32 insts, uint32 blocks, uint32 taints)
+	//Returns false if the loop can't be tracked (counter loops need their entry)
+	bool AddAutoIdleStat(uint32 head, uint32 branch, uint32 insts, uint32 blocks, uint32 taints, const COUNTER_LOOP& counterLoop)
 	{
-		if(FindAutoIdleStat(head)) return;
+		if(auto stat = FindAutoIdleStat(head))
+		{
+			//Analyzed again (code changed) or another loop branching to the same head
+			if(stat->branch != branch) stat->counterLoop.ambiguous = true;
+			bool ambiguous = stat->counterLoop.ambiguous;
+			stat->counterLoop = counterLoop;
+			stat->counterLoop.ambiguous = ambiguous;
+			return true;
+		}
 		uint32 index = g_autoIdleStatCount.load(std::memory_order_relaxed);
-		if(index >= AUTOIDLE_MAX_STATS) return;
+		if(index >= AUTOIDLE_MAX_STATS) return (counterLoop.regCount == 0);
 		auto& stat = g_autoIdleStats[index];
 		stat.head = head;
 		stat.branch = branch;
 		stat.insts = insts;
 		stat.blocks = blocks;
 		stat.taints = taints;
+		stat.counterLoop = counterLoop;
 		g_autoIdleStatCount.store(index + 1, std::memory_order_release);
+		return true;
 	}
 
 	void AddAutoIdleReject(uint32 head, uint32 branch, const char* reason)
@@ -226,9 +442,10 @@ namespace
 	{
 		VALUE_KIND kind = VALUE_UNKNOWN;
 		uint32 value = 0;
+		int32 offset = 0; //VALUE_ORIG: added to the register (32-bit add, addiu) when not 0
 		bool operator==(const VALUE& rhs) const
 		{
-			return (kind == rhs.kind) && (value == rhs.value);
+			return (kind == rhs.kind) && (value == rhs.value) && (offset == rhs.offset);
 		}
 	};
 
@@ -274,15 +491,44 @@ namespace
 				if(auto reason = Step(key, state)) return reason;
 			}
 			if(!m_hasBackEdge) return "no safe path back to the head";
-			//Registers read before being written must be the same at the start of every iteration
+			//Counters: registers read by the loop that it increments by a constant (addiu), and registers
+			//that end the iteration as a copy of one (the same value plus a constant, same step)
+			uint64 counters = 0;
+			std::array<int32, REG_COUNT> counterSteps = {};
+			for(uint32 reg = 1; reg < REG_HI; reg++)
+			{
+				const auto& value = m_backEdge[reg];
+				if((m_liveIn & (1ULL << reg)) && (value.kind == VALUE_ORIG) && (value.value == reg) && (value.offset != 0))
+				{
+					counters |= (1ULL << reg);
+					counterSteps[reg] = value.offset;
+				}
+			}
+			uint64 copies = 0;
+			for(uint32 reg = 1; reg < REG_COUNT; reg++)
+			{
+				const auto& value = m_backEdge[reg];
+				if((value.kind != VALUE_ORIG) || (value.value == reg) || !(counters & (1ULL << value.value))) continue;
+				if(reg >= REG_HI) return "a counter is copied to HI/LO";
+				copies |= (1ULL << reg);
+				counterSteps[reg] = counterSteps[value.value];
+			}
+			//Registers read before being written must be the same at the start of every iteration (or counters)
 			for(uint32 reg = 1; reg < REG_COUNT; reg++)
 			{
 				if(!(m_liveIn & (1ULL << reg))) continue;
 				const auto& value = m_backEdge[reg];
-				bool same = (value.kind == VALUE_CONST) || ((value.kind == VALUE_ORIG) && (value.value == reg));
-				if(!same) return "a register read by the loop changes every iteration (counter)";
+				bool same = (value.kind == VALUE_CONST) || ((value.kind == VALUE_ORIG) && (value.value == reg) && (value.offset == 0)) ||
+				            ((counters | copies) & (1ULL << reg));
+				if(!same) return "a register read by the loop changes every iteration";
 			}
+			if(auto reason = MakeCounterLoop(counters | copies, counterSteps)) return reason;
 			return CheckInteriorEntries();
+		}
+
+		const COUNTER_LOOP& GetCounterLoop() const
+		{
+			return m_counterLoop;
 		}
 
 		uint32 GetInstructionCount() const
@@ -317,6 +563,7 @@ namespace
 			MAX_DEPTH = 3,
 			MAX_SLOTS = 32,
 			MAX_TAINT_BLOCKS = 4,
+			MAX_PREDS = 16,
 			SCAN_WINDOW = 0x2000,
 			REG_V0 = 2,
 			REG_V1 = 3,
@@ -353,11 +600,88 @@ namespace
 			bool queued = false;
 		};
 
-		static VALUE Meet(const VALUE& a, const VALUE& b)
+		struct PRED
+		{
+			COUNTER_PRED_OP op;
+			VALUE a;
+			VALUE b;
+			bool operator==(const PRED& rhs) const
+			{
+				return (op == rhs.op) && (a == rhs.a) && (b == rhs.b);
+			}
+		};
+
+		VALUE Meet(const VALUE& a, const VALUE& b)
 		{
 			if((a.kind == VALUE_UNDEF) || (b.kind == VALUE_UNDEF)) return VALUE{VALUE_UNDEF, 0};
 			if(a == b) return a;
+			//The registers' values are lost (a counter can't flow there)
+			Use(a);
+			Use(b);
 			return VALUE{VALUE_UNKNOWN, 0};
+		}
+
+		//A register's original value is used for something else than a copy, an addiu or a comparison
+		void Use(const VALUE& value)
+		{
+			if(value.kind == VALUE_ORIG) m_escapes |= (1ULL << value.value);
+		}
+
+		//Comparison (slt*, branch) of two values: kept for counter loops
+		void Compare(COUNTER_PRED_OP op, const VALUE& a, const VALUE& b)
+		{
+			if((a.kind != VALUE_ORIG) && (b.kind != VALUE_ORIG)) return;
+			PRED pred = {op, a, b};
+			if(std::find(std::begin(m_preds), std::end(m_preds), pred) != std::end(m_preds)) return;
+			if(m_preds.size() >= MAX_PREDS)
+			{
+				Use(a);
+				Use(b);
+				return;
+			}
+			m_preds.push_back(pred);
+		}
+
+		const char* MakeCounterLoop(uint64 counters, const std::array<int32, REG_COUNT>& steps)
+		{
+			if(counters == 0) return nullptr;
+			if(counters & m_escapes) return "a counter is used by more than comparisons";
+			//An iteration executes each analyzed instruction (in its call context) at most once: bounds
+			//the cycles of an iteration, to tell an iteration from leaving and entering the loop again
+			if(m_hasInnerLoop) return "counter loop with an inner loop";
+			m_counterLoop.maxIterationCycles = static_cast<uint32>(m_nodes.size() * 2); //Delay slots aren't nodes
+			auto isCounter = [&](const VALUE& value) { return (value.kind == VALUE_ORIG) && (counters & (1ULL << value.value)); };
+			auto makeOperand = [](const VALUE& value) {
+				COUNTER_OPERAND operand;
+				operand.isConst = (value.kind == VALUE_CONST);
+				operand.reg = operand.isConst ? 0 : static_cast<uint8>(value.value);
+				operand.value = operand.isConst ? static_cast<int32>(value.value) : value.offset;
+				return operand;
+			};
+			for(const auto& pred : m_preds)
+			{
+				bool counterA = isCounter(pred.a);
+				bool counterB = isCounter(pred.b);
+				if(!counterA && !counterB) continue;
+				if(counterA && counterB) return "two counters compared";
+				const auto& other = counterA ? pred.b : pred.a;
+				if((other.kind != VALUE_CONST) && (other.kind != VALUE_ORIG)) return "a counter is compared with a changing value";
+				if((other.kind == VALUE_ORIG) && (other.value >= REG_HI)) return "a counter is compared with HI/LO";
+				if(m_counterLoop.predCount >= COUNTER_MAX_PREDS) return "too many counter comparisons";
+				auto& counterPred = m_counterLoop.preds[m_counterLoop.predCount++];
+				counterPred.op = pred.op;
+				counterPred.a = makeOperand(pred.a);
+				counterPred.b = makeOperand(pred.b);
+			}
+			for(uint32 reg = 1; reg < REG_HI; reg++)
+			{
+				if(!(counters & (1ULL << reg))) continue;
+				if(m_counterLoop.regCount >= COUNTER_MAX_REGS) return "too many counters";
+				m_counterLoop.regs[m_counterLoop.regCount] = static_cast<uint8>(reg);
+				m_counterLoop.steps[m_counterLoop.regCount] = steps[reg];
+				m_counterLoop.regCount++;
+			}
+			return nullptr;
 		}
 
 		const char* CheckInteriorEntries()
@@ -375,10 +699,12 @@ namespace
 			return nullptr;
 		}
 
-		VALUE Read(const STATE& state, uint32 reg)
+		//use: the value is used for something else than a copy, an addiu or a comparison
+		VALUE Read(const STATE& state, uint32 reg, bool use = true)
 		{
 			const auto& value = state.regs[reg];
 			if((value.kind == VALUE_ORIG) && (value.value == reg)) m_liveIn |= (1ULL << reg);
+			if(use) Use(value);
 			return value;
 		}
 
@@ -433,15 +759,20 @@ namespace
 				case 0x2D: //daddu
 				{
 					//Register moves
-					auto a = Read(state, rs);
-					auto b = Read(state, rt);
+					auto a = Read(state, rs, false);
+					auto b = Read(state, rt, false);
 					VALUE result;
 					if(rt == 0)
 						result = a;
 					else if(rs == 0)
 						result = b;
-					else if((a.kind == VALUE_CONST) && (b.kind == VALUE_CONST))
-						result = VALUE{VALUE_CONST, (funct == 0x25) ? (a.value | b.value) : (a.value + b.value)};
+					else
+					{
+						Use(a);
+						Use(b);
+						if((a.kind == VALUE_CONST) && (b.kind == VALUE_CONST))
+							result = VALUE{VALUE_CONST, (funct == 0x25) ? (a.value | b.value) : (a.value + b.value)};
+					}
 					return Write(state, rd, result);
 				}
 				case 0x04: //sllv
@@ -456,13 +787,15 @@ namespace
 				case 0x24: //and
 				case 0x26: //xor
 				case 0x27: //nor
-				case 0x2A: //slt
-				case 0x2B: //sltu
 				case 0x2C: //dadd
 				case 0x2E: //dsub
 				case 0x2F: //dsubu
 					Read(state, rs);
 					Read(state, rt);
+					return Write(state, rd);
+				case 0x2A: //slt
+				case 0x2B: //sltu
+					Compare((funct == 0x2A) ? COUNTER_PRED_SLT : COUNTER_PRED_SLTU, Read(state, rs, false), Read(state, rt, false));
 					return Write(state, rd);
 				case 0x0A: //movz
 				case 0x0B: //movn
@@ -473,13 +806,13 @@ namespace
 				case 0x0F: //sync
 					return true;
 				case 0x10: //mfhi
-					return Write(state, rd, Read(state, REG_HI));
+					return Write(state, rd, Read(state, REG_HI, false));
 				case 0x12: //mflo
-					return Write(state, rd, Read(state, REG_LO));
+					return Write(state, rd, Read(state, REG_LO, false));
 				case 0x11: //mthi
-					return Write(state, REG_HI, Read(state, rs));
+					return Write(state, REG_HI, Read(state, rs, false));
 				case 0x13: //mtlo
-					return Write(state, REG_LO, Read(state, rs));
+					return Write(state, REG_LO, Read(state, rs, false));
 				case 0x18: //mult
 				case 0x19: //multu
 					Read(state, rs);
@@ -511,8 +844,12 @@ namespace
 					state.spDelta += imm;
 					return true;
 				}
-				auto value = Read(state, rs);
-				return Write(state, rt, (value.kind == VALUE_CONST) ? VALUE{VALUE_CONST, value.value + imm} : VALUE{});
+				auto value = Read(state, rs, false);
+				if(value.kind == VALUE_CONST) return Write(state, rt, VALUE{VALUE_CONST, value.value + imm});
+				//32-bit adds keep track of the register they add to (counters)
+				if((value.kind == VALUE_ORIG) && (op <= 0x09)) return Write(state, rt, VALUE{VALUE_ORIG, value.value, value.offset + imm});
+				Use(value);
+				return Write(state, rt);
 			}
 			case 0x0D: //ori
 			{
@@ -521,6 +858,8 @@ namespace
 			}
 			case 0x0A: //slti
 			case 0x0B: //sltiu
+				Compare((op == 0x0A) ? COUNTER_PRED_SLT : COUNTER_PRED_SLTU, Read(state, rs, false), VALUE{VALUE_CONST, static_cast<uint32>(imm)});
+				return Write(state, rt);
 			case 0x0C: //andi
 			case 0x0E: //xori
 				Read(state, rs);
@@ -636,19 +975,20 @@ namespace
 			}
 			switch(op)
 			{
-			case 0x01:
-			case 0x06:
+			case 0x01: //bltz, bgez...: rs < 0
+				Compare(COUNTER_PRED_SLT, Read(state, rs, false), VALUE{VALUE_CONST, 0});
+				break;
+			case 0x06: //blez, bgtz...: 0 < rs
 			case 0x07:
 			case 0x16:
 			case 0x17:
-				Read(state, rs);
+				Compare(COUNTER_PRED_SLT, VALUE{VALUE_CONST, 0}, Read(state, rs, false));
 				break;
 			case 0x04:
 			case 0x05:
 			case 0x14:
 			case 0x15:
-				Read(state, rs);
-				Read(state, rt);
+				Compare(COUNTER_PRED_EQ, Read(state, rs, false), Read(state, rt, false));
 				break;
 			}
 			uint32 delayInst = m_context.m_pMemoryMap->GetInstruction(pc + 4);
@@ -675,6 +1015,8 @@ namespace
 				callee.depth++;
 				return Flow(callee, target, taken);
 			}
+			//Branch back to something else than the loop's head: inner loop
+			if((target <= pc) && ((key.depth != 0) || (target > m_head))) m_hasInnerLoop = true;
 			if(auto reason = Flow(key, target, taken)) return reason;
 			bool conditional = (op != 0x02) && !(((op & 0x0F) == 0x04) && (rs == 0) && (rt == 0));
 			if(conditional)
@@ -746,7 +1088,11 @@ namespace
 		std::array<VALUE, REG_COUNT> m_backEdge;
 		bool m_firstBackEdge = true;
 		uint64 m_liveIn = 0;
+		uint64 m_escapes = 0; //Registers whose original value is used for something else than a copy, an addiu or a comparison
+		std::vector<PRED> m_preds;
+		COUNTER_LOOP m_counterLoop;
 		bool m_hasBackEdge = false;
+		bool m_hasInnerLoop = false;
 	};
 }
 
@@ -759,6 +1105,12 @@ extern "C" void EeAutoIdleCheck(CMIPS* context)
 	uint32 head = state.nDelayedJumpAddr;
 	auto stat = FindAutoIdleStat(head);
 	if(stat) stat->checks.fetch_add(1, std::memory_order_relaxed);
+	if(stat && (stat->counterLoop.regCount != 0))
+	{
+		CounterLoopCheck(state, head, *stat);
+		return;
+	}
+	g_counterState.head = MIPS_INVALID_PC;
 	static_assert(sizeof(autoIdle.hilo) == (sizeof(state.nHI) * 4));
 	if(!autoIdle.tainted && (autoIdle.head == head) && (state.nHasException == MIPS_EXCEPTION_NONE) &&
 	   (memcmp(autoIdle.gpr, state.nGPR, sizeof(autoIdle.gpr)) == 0) &&
@@ -778,6 +1130,13 @@ extern "C" void EeAutoIdleCheck(CMIPS* context)
 extern "C" void EeAutoIdleTaint(CMIPS*)
 {
 	g_autoIdleState.tainted = true;
+	g_counterState.tainted = true;
+}
+
+//New EE time slice: counter loops measure the cycles of an iteration within one slice
+void EeAutoIdleNewSlice()
+{
+	g_counterState.head = MIPS_INVALID_PC;
 }
 
 //Detected loops ("L head branch instructions blocks taintBlocks checks idles") and rejected candidates
@@ -792,7 +1151,9 @@ std::string EeAutoIdleStats(bool reset)
 		auto& stat = g_autoIdleStats[i];
 		uint32 checks = reset ? stat.checks.exchange(0) : stat.checks.load();
 		uint32 idles = reset ? stat.idles.exchange(0) : stat.idles.load();
-		snprintf(line, sizeof(line), "L %08X %08X %u %u %u %u %u\n", stat.head.load(), stat.branch, stat.insts, stat.blocks, stat.taints, checks, idles);
+		uint32 skips = reset ? stat.skips.exchange(0) : stat.skips.load();
+		snprintf(line, sizeof(line), "L %08X %08X %u %u %u %u %u %u %u\n", stat.head.load(), stat.branch, stat.insts, stat.blocks, stat.taints, checks, idles,
+		         stat.counterLoop.regCount, skips);
 		result += line;
 	}
 	std::lock_guard<std::mutex> lock(g_autoIdleRejectMutex);
@@ -825,7 +1186,11 @@ bool CEeExecutor::IsAutoIdleLoop(uint32 start, uint32 end)
 		AddAutoIdleReject(head, branchAddress, reason);
 		return false;
 	}
-	AddAutoIdleStat(head, branchAddress, analyzer.GetInstructionCount(), analyzer.GetBlockCount(), static_cast<uint32>(analyzer.GetTaintBlocks().size()));
+	if(!AddAutoIdleStat(head, branchAddress, analyzer.GetInstructionCount(), analyzer.GetBlockCount(), static_cast<uint32>(analyzer.GetTaintBlocks().size()), analyzer.GetCounterLoop()))
+	{
+		AddAutoIdleReject(head, branchAddress, "too many loops");
+		return false;
+	}
 
 	//Taint blocks compiled before are recompiled once the EE leaves the JIT code (no idle until then)
 	for(uint32 taintBlock : analyzer.GetTaintBlocks())
@@ -1070,6 +1435,7 @@ void CEeExecutor::Reset()
 	m_autoIdleTaintBlocks.clear();
 	m_autoIdlePendingInvalidations.clear();
 	g_autoIdleState = AUTOIDLE_STATE();
+	g_counterState = COUNTER_STATE();
 	CGenericMipsExecutor::Reset();
 }
 

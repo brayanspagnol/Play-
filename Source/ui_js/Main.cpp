@@ -213,6 +213,20 @@ std::string getTimeline(double from)
 }
 
 #ifdef PROFILE
+//EE PC samples since the last eePcHistogram(true): "PC count" for the 96 most sampled PCs
+static std::map<uint32, uint32> g_eePcTotal;
+std::string eePcHistogram(bool reset)
+{
+	std::lock_guard<std::mutex> lock(g_profileMutex);
+	std::vector<std::pair<uint32, uint32>> items(g_eePcTotal.begin(), g_eePcTotal.end());
+	size_t count = std::min<size_t>(items.size(), 96);
+	std::partial_sort(items.begin(), items.begin() + count, items.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+	std::string result;
+	for(size_t i = 0; i < count; i++) result += string_format("%08X %u\n", items[i].first, items[i].second);
+	if(reset) g_eePcTotal.clear();
+	return result;
+}
+
 static std::string TopPcs(CProfiler::PcHistogram histogram)
 {
 	std::vector<std::pair<uint32, uint32>> items(histogram.begin(), histogram.end());
@@ -334,7 +348,9 @@ static void OnVmNewFrame()
 	static uint32 vblankCounter = 0;
 	if((++vblankCounter % 50) == 0)
 	{
-		g_profile.eePcs = TopPcs(CProfiler::GetInstance().TakePcHistogram(0));
+		auto eeHistogram = CProfiler::GetInstance().TakePcHistogram(0);
+		for(const auto& item : eeHistogram) g_eePcTotal[item.first] += item.second;
+		g_profile.eePcs = TopPcs(std::move(eeHistogram));
 		g_profile.iopPcs = TopPcs(CProfiler::GetInstance().TakePcHistogram(1));
 	}
 #endif
@@ -914,6 +930,9 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("setEeAutoIdle", &setEeAutoIdle);
 	function("setJitBranchHints", &setJitBranchHints);
 	function("eeAutoIdleStats", &eeAutoIdleStats);
+#ifdef PROFILE
+	function("eePcHistogram", &eePcHistogram);
+#endif
 	function("eeHashResult", &eeHashResult);
 	function("vuHashResult", &vuHashResult);
 	function("setVuBlockChaining", &setVuBlockChaining);
