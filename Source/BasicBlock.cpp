@@ -15,6 +15,7 @@
 #include <set>
 #include <map>
 #include "BlockCache.h"
+#include "AsyncCompile.h"
 #include "xxhash.h"
 #include "Jitter_CodeGen_Wasm.h"
 #include "WasmModuleBuilder.h"
@@ -135,8 +136,9 @@ bool g_eeContextPromotion = false;
 bool g_eeRegionPromotion = false;
 
 extern uint32 g_jitPageAccess;
-//Memory access fast paths marked likely in a branch hint section (Module.setJitBranchHints)
-bool g_jitBranchHints = false;
+//Memory access fast paths marked likely in a wasm branch hint section (Module.setJitBranchHints): TurboFan then
+//keeps the register spills and reloads around the slow path call out of the fast path
+bool g_jitBranchHints = true;
 
 bool CBasicBlock::UsesModuleBatching() const
 {
@@ -236,10 +238,18 @@ void CBasicBlock::Compile()
 		cacheKey.size = wordCount * 4;
 		cacheKey.hints = m_blockCompileHints;
 		//0x24000000: superblock (0x04000000: structured parts, not the earlier dispatch loop)
-		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000) | (IsSuperBlock() ? 0x24000000 : 0) | (UsesBlockChaining() ? 0x10000000 : 0) | ((g_jitPageAccess != ~0U) ? (0x08000000 | (g_jitPageAccess & 0x3FF)) : 0) | (g_jitBranchHints ? 0x01000000 : 0);
+		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000) | (IsSuperBlock() ? 0x24000000 : 0) | (UsesBlockChaining() ? 0x10000000 : 0) | ((g_jitPageAccess != ~0U) ? (0x08000000 | (g_jitPageAccess & 0x3FF)) : 0) | (g_jitBranchHints ? 0 : 0x01000000);
 		cacheKey.hash[0] = xxHash.low64 ^ m_cacheSalt;
 		cacheKey.hash[1] = xxHash.high64 ^ BlockCache::CODEGEN_VERSION;
 
+		size_t cachedSize = 0;
+		int cachedFunction = BlockCache::FindFunction(cacheKey, cachedSize);
+		if(cachedFunction != 0)
+		{
+			//Already in a module with the rest of its group (and never batched again)
+			m_function = CMemoryFunction::FromWasmFunction(cachedFunction, cachedSize);
+			return;
+		}
 		thread_local std::vector<uint8> cachedCode;
 		if(BlockCache::Find(cacheKey, cachedCode))
 		{
@@ -255,7 +265,6 @@ void CBasicBlock::Compile()
 	}
 #endif
 
-	Framework::CMemStream stream;
 	g_timelineCounts[TLC_JITRUNS].fetch_add(1, std::memory_order_relaxed);
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
 	if((m_category == BLOCK_CATEGORY_PS2_EE) && IsSuperBlock())
@@ -263,7 +272,12 @@ void CBasicBlock::Compile()
 		extern uint32 g_eeRegionJitRuns;
 		g_eeRegionJitRuns++;
 	}
+	if(!dumpBlock && TryCompileAsync(useBlockCache ? &cacheKey : nullptr))
+	{
+		return;
+	}
 #endif
+	Framework::CMemStream stream;
 #ifdef PROFILE
 	auto jitStart = std::chrono::steady_clock::now();
 #endif
@@ -776,7 +790,13 @@ void CBasicBlock::CompileToStream(Framework::CMemStream& stream, bool contextPro
 		Jitter::CCodeGen* codeGen = Jitter::CreateCodeGen();
 		jitter = new CMipsJitter(codeGen);
 	}
+	jitter->SetStream(&stream);
+	BeginCompile(jitter, contextPromotion);
+	jitter->End();
+}
 
+void CBasicBlock::BeginCompile(CMipsJitter* jitter, bool contextPromotion)
+{
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
 	{
 		//Replay experiment 0x100: superblocks without context promotion
@@ -800,11 +820,93 @@ void CBasicBlock::CompileToStream(Framework::CMemStream& stream, bool contextPro
 	m_compileOptimized = (m_category == BLOCK_CATEGORY_PS2_VU) && contextPromotion;
 	VUShared::ResetFlagForwarding(m_compileOptimized);
 	jitter->GetCodeGen()->SetExternalSymbolReferencedHandler([&](auto symbol, auto offset, auto refType) { this->HandleExternalFunctionReference(symbol, offset, refType); });
-	jitter->SetStream(&stream);
 	jitter->Begin();
 	CompileRange(jitter);
-	jitter->End();
 }
+
+#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+bool CBasicBlock::TryCompileAsync(const BlockCache::KEY* cacheKey)
+{
+	auto mode = AsyncCompile::GetMode();
+	if(mode == AsyncCompile::MODE_OFF) return false;
+	//(VU differential test: needs the compiled reference)
+	if((m_category == BLOCK_CATEGORY_PS2_VU) && g_vuDiffMode) return false;
+	if(IsEmpty()) return false;
+
+	auto startTime = std::chrono::steady_clock::now();
+	auto jitter = AsyncCompile::TakeJitter();
+	BeginCompile(jitter, UsesContextPromotion());
+	auto program = jitter->BuildInterpreterProgram();
+	if(!program)
+	{
+		jitter->Abandon();
+		AsyncCompile::ReturnJitter(jitter);
+		return false;
+	}
+	m_interpreterProgram = program;
+	m_interpretCount = 0;
+	m_asyncWordsHash = ComputeWordsHash();
+	m_asyncCacheKey = cacheKey ? *cacheKey : BlockCache::KEY();
+	m_asyncAddToCache = (cacheKey != nullptr);
+	if((mode == AsyncCompile::MODE_INTERPRET) || !AsyncCompile::HasRoom())
+	{
+		//Too many blocks waiting for the helper (a burst of new code): this one gets its job once it turns
+		//out to run often (SubmitAsyncJob from Execute), the statements would only take memory meanwhile
+		jitter->Abandon();
+		AsyncCompile::ReturnJitter(jitter);
+	}
+	else
+	{
+		SubmitAsyncJob(jitter, false);
+	}
+	AsyncCompile::AddSubmitTime(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - startTime).count());
+	return true;
+}
+
+void CBasicBlock::SubmitAsyncJob(CMipsJitter* jitter, bool hot)
+{
+	if(!jitter)
+	{
+		//The front end again: the job must compile what the interpreter runs. Code that changed without the
+		//block being dropped (no write protection, e.g. IOP RAM) keeps running in the interpreter instead.
+		if(ComputeWordsHash() != m_asyncWordsHash) return;
+		jitter = AsyncCompile::TakeJitter();
+		BeginCompile(jitter, UsesContextPromotion());
+	}
+	//The wasm code generator doesn't report external symbols (that's for native block linking), and the
+	//helper thread must not call back into this block
+	jitter->GetCodeGen()->SetExternalSymbolReferencedHandler([](auto, auto, auto) {});
+	auto job = std::make_shared<AsyncCompile::JOB>();
+	job->block = weak_from_this();
+	job->jitter = jitter;
+	if(m_asyncAddToCache && m_cacheable)
+	{
+		job->cacheKey = m_asyncCacheKey;
+		job->addToCache = true;
+	}
+	m_asyncJob = job;
+	AsyncCompile::Submit(job, hot);
+}
+
+uint64 CBasicBlock::ComputeWordsHash() const
+{
+	thread_local std::vector<uint32> words;
+	words.resize(((m_end - m_begin) / 4) + 1);
+	for(uint32 i = 0; i < words.size(); i++)
+	{
+		words[i] = m_context.m_pMemoryMap->GetInstruction(m_begin + (i * 4));
+	}
+	return XXH3_64bits(words.data(), words.size() * 4);
+}
+
+void CBasicBlock::SetCompiledFunction(CMemoryFunction&& function)
+{
+	m_function = std::move(function);
+	m_chainFunctionIndex = GetFunctionIndex();
+	m_interpreterProgram.reset();
+	m_asyncJob.reset();
+}
+#endif
 
 bool CBasicBlock::UsesContextPromotion() const
 {
@@ -875,6 +977,22 @@ void CBasicBlock::ExecuteDiff()
 void CBasicBlock::Execute()
 {
 #if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+	if(m_interpreterProgram)
+	{
+		//Blocks that keep running here go ahead of the others
+		if((++m_interpretCount == AsyncCompile::HOT_THRESHOLD) && (AsyncCompile::GetMode() == AsyncCompile::MODE_ON))
+		{
+			if(m_asyncJob)
+				AsyncCompile::Promote(m_asyncJob);
+			else
+				SubmitAsyncJob(nullptr, true);
+		}
+		//(Own reference: the block can get its compiled function while this runs, e.g. a VU microprogram
+		//started from this block swaps finished blocks in)
+		auto program = m_interpreterProgram;
+		program->Run(&m_context);
+		return;
+	}
 	if(m_diffExecute)
 	{
 		ExecuteDiff();
@@ -1002,6 +1120,16 @@ void CBasicBlock::HandleExternalFunctionReference(uintptr_t symbol, uint32 offse
 
 void CBasicBlock::CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& other)
 {
+#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+	if(other->m_interpreterProgram)
+	{
+		//Not compiled yet: get our own (same contents, so same compile settings)
+		m_blockCompileHints = other->m_blockCompileHints;
+		m_cacheVariant = other->m_cacheVariant;
+		Compile();
+		return;
+	}
+#endif
 #ifndef AOT_USE_CACHE
 	m_function = other->m_function.CreateInstance();
 #if defined(__EMSCRIPTEN__)

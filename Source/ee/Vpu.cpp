@@ -25,6 +25,7 @@
 #include <algorithm>
 #include "xxhash.h"
 #include "VuExecutor.h"
+#include "../AsyncCompile.h"
 
 //VU1 replay benchmark (WebAssembly debug tool): capture the inputs of the next N VU1 microprogram
 //starts (registers, micro and data memory), then replay them in a tight loop with the reference
@@ -93,6 +94,10 @@ void CVpu::Execute(int32 quota)
 	CProfilerZone profilerZone(m_vuProfilerZone);
 #endif
 
+#ifdef __EMSCRIPTEN__
+	//VU blocks compiled on the helper thread replace their interpreter (on the thread that runs them)
+	AsyncCompile::Update();
+#endif
 	m_ctx->m_executor->Execute(quota);
 	switch(m_ctx->m_State.nHasException)
 	{

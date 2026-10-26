@@ -12,6 +12,7 @@
 #include "AppConfig.h"
 #include "string_format.h"
 #include "BlockCache.h"
+#include "AsyncCompile.h"
 #include "ee/Vpu.h"
 #include "ee/VUShared.h"
 #include <future>
@@ -542,6 +543,23 @@ void setEeBatchSize(uint32 size)
 	g_eeBatchSize = size;
 }
 
+//Async block compile (AsyncCompile.h): 0 off, 1 on (default), 2 interpret new blocks forever (testing)
+void setAsyncCompile(uint32 mode)
+{
+	AsyncCompile::SetMode(static_cast<AsyncCompile::MODE>(mode));
+}
+
+void setAsyncCompileHelpers(uint32 count)
+{
+	AsyncCompile::SetHelperCount(count);
+}
+
+//Async compile stats (JSON, see AsyncCompile::GetStats)
+std::string asyncCompileStats()
+{
+	return AsyncCompile::GetStats();
+}
+
 //EE context promotion (MIPS state kept in wasm locals within a block); for blocks compiled afterwards
 extern bool g_eeContextPromotion;
 void setEeContextPromotion(bool enabled)
@@ -999,6 +1017,9 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("eeDumpRequest", &eeDumpRequest);
 	function("eeStateDump", &eeStateDump);
 	function("setEeBatchSize", &setEeBatchSize);
+	function("setAsyncCompile", &setAsyncCompile);
+	function("asyncCompileStats", &asyncCompileStats);
+	function("setAsyncCompileHelpers", &setAsyncCompileHelpers);
 	function("setJitPageAccess", &setJitPageAccess);
 	function("eeDumpResult", &eeDumpResult);
 	function("loadState", &loadState);
@@ -1012,6 +1033,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("setVu1Threaded", &setVu1Threaded);
 	function("setGsHack", &setGsHack);
 	function("setEeFrequencyScale", &setEeFrequencyScale);
+	function("blockCacheSalt", &BlockCache::GetSalt);
 	function("blockCacheEnable", &BlockCache::SetEnabled);
 	function("blockCacheClear", &BlockCache::Clear);
 	function("blockCacheLoad", &blockCacheLoad);

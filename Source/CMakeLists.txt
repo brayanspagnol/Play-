@@ -144,6 +144,8 @@ endif()
 set(COMMON_SRC_FILES
 	BasicBlock.cpp
 	BasicBlock.h
+	AsyncCompile.cpp
+	AsyncCompile.h
 	BlockCache.cpp
 	BlockCache.h
 	BiosDebugInfoProvider.h
@@ -577,6 +579,43 @@ target_include_directories(PlayCore
 		${CMAKE_CURRENT_SOURCE_DIR}/../deps/CodeGen/include
 )
 target_compile_definitions(PlayCore PUBLIC ${DEFINITIONS_LIST})
+
+if(TARGET_PLATFORM_JS)
+	#Persistent JIT block cache salt (BlockCache::GetSalt): a hash of every source that takes part in code
+	#generation (CodeGen, the MIPS/VU instruction compilers, block setup, the JIT import table) and the
+	#build flags, so cached code survives rebuilds that do not touch them. CMake re-runs when one changes.
+	file(GLOB_RECURSE BLOCKCACHE_SALT_FILES CONFIGURE_DEPENDS
+		RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/..
+		${CMAKE_CURRENT_SOURCE_DIR}/../deps/CodeGen/src/*
+		${CMAKE_CURRENT_SOURCE_DIR}/../deps/CodeGen/include/*
+	)
+	list(APPEND BLOCKCACHE_SALT_FILES
+		Source/BasicBlock.cpp Source/BasicBlock.h Source/BlockCache.cpp Source/BlockCache.h
+		Source/COP_FPU.cpp Source/COP_FPU.h Source/COP_SCU.cpp Source/COP_SCU.h Source/FpUtils.cpp Source/FpUtils.h
+		Source/MA_MIPSIV.cpp Source/MA_MIPSIV.h Source/MA_MIPSIV_Templates.cpp Source/MA_MIPSIV_Reflection.cpp
+		Source/MIPSInstructionFactory.cpp Source/MIPSInstructionFactory.h Source/MipsJitter.cpp Source/MipsJitter.h
+		Source/MIPS.h Source/MIPS.cpp Source/MemoryUtils.cpp Source/MemoryUtils.h Source/GenericMipsExecutor.h
+		Source/ee/COP_VU.cpp Source/ee/COP_VU.h Source/ee/EeBasicBlock.cpp Source/ee/EeBasicBlock.h
+		Source/ee/EeExecutor.cpp Source/ee/EeExecutor.h Source/ee/MA_EE.cpp Source/ee/MA_EE.h
+		Source/ee/MA_VU.cpp Source/ee/MA_VU.h Source/ee/MA_VU_Lower.cpp Source/ee/MA_VU_Upper.cpp
+		Source/ee/VuBasicBlock.cpp Source/ee/VuBasicBlock.h Source/ee/VuExecutor.cpp Source/ee/VuExecutor.h
+		Source/ee/VUShared.cpp Source/ee/VUShared.h Source/ee/Vpu.cpp Source/ee/Vpu.h
+		Source/iop/IopExecutor.cpp Source/iop/IopExecutor.h Source/ui_js/Ps2VmJs.cpp
+	)
+	list(SORT BLOCKCACHE_SALT_FILES)
+	list(REMOVE_DUPLICATES BLOCKCACHE_SALT_FILES)
+	set(BLOCKCACHE_SALT_DATA "${CMAKE_CXX_FLAGS}|${CMAKE_CXX_FLAGS_RELEASE}|${DEFINITIONS_LIST}")
+	foreach(SALT_FILE ${BLOCKCACHE_SALT_FILES})
+		if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../${SALT_FILE})
+			file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/../${SALT_FILE} SALT_FILE_HASH)
+			string(APPEND BLOCKCACHE_SALT_DATA "|${SALT_FILE}=${SALT_FILE_HASH}")
+			set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/../${SALT_FILE})
+		endif()
+	endforeach()
+	string(SHA256 BLOCKCACHE_SALT "${BLOCKCACHE_SALT_DATA}")
+	string(SUBSTRING ${BLOCKCACHE_SALT} 0 16 BLOCKCACHE_SALT)
+	set_source_files_properties(BlockCache.cpp PROPERTIES COMPILE_DEFINITIONS "BLOCKCACHE_SOURCE_HASH=\"${BLOCKCACHE_SALT}\"")
+endif()
 
 if(TARGET_PLATFORM_WIN32)
 	add_precompiled_header(PlayCore Pch.h FORCEINCLUDE SOURCE_CXX Pch.cpp)
