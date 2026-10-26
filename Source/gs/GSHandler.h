@@ -861,7 +861,14 @@ public:
 	{
 		assert(m_writeBufferSize < REGISTERWRITEBUFFER_SIZE);
 		if(m_writeBufferSize == REGISTERWRITEBUFFER_SIZE) return;
+		NoteEventWrite(write.first);
 		m_currentWriteBuffer[m_writeBufferSize++] = write;
+	}
+
+	//SIGNAL, FINISH and LABEL writes are acted on in ProcessWriteBuffer: only then is the new part of the buffer scanned
+	inline void NoteEventWrite(uint8 reg)
+	{
+		m_writeBufferHasEvents |= (reg >= GS_REG_SIGNAL) && (reg <= GS_REG_LABEL);
 	}
 
 	//WriteRegister in bulk (GIF PACKED loop): up to 'room' writes go at the returned pointer, then CommitWrites(count)
@@ -930,7 +937,7 @@ protected:
 	enum
 	{
 		REGISTERWRITEBUFFER_SIZE = 0x140000,
-		REGISTERWRITEBUFFER_SUBMIT_THRESHOLD = 0x100
+		REGISTERWRITEBUFFER_SUBMIT_THRESHOLD = 0x1000
 	};
 
 	enum LOD_CALC
@@ -1138,6 +1145,7 @@ protected:
 	uint32 m_writeBufferSize = 0;
 	uint32 m_writeBufferProcessIndex = 0;
 	uint32 m_writeBufferSubmitIndex = 0;
+	bool m_writeBufferHasEvents = false;
 
 	CRT_MODE m_crtMode;
 	std::thread m_thread;

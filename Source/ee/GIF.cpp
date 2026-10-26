@@ -232,6 +232,7 @@ uint32 CGIF::ProcessPacked(const uint8* memory, uint32 address, uint32 end)
 						m_signalState = SIGNAL_STATE_ENCOUNTERED;
 					}
 					writeRegister(reg, packet.nD0);
+					m_gs->NoteEventWrite(reg);
 				}
 				break;
 			case 0x0F:

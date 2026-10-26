@@ -184,6 +184,7 @@ void CGSHandler::ResetBase()
 	m_writeBufferSize = 0;
 	m_writeBufferProcessIndex = 0;
 	m_writeBufferSubmitIndex = 0;
+	m_writeBufferHasEvents = false;
 	m_writeBufferIndex = 0;
 	m_currentWriteBuffer = m_writeBuffers[m_writeBufferIndex];
 }
@@ -697,7 +698,7 @@ void CGSHandler::ProcessWriteBuffer(const CGsPacketMetadata* metadata)
 		    });
 	}
 #endif
-	for(uint32 writeIndex = m_writeBufferProcessIndex; writeIndex < m_writeBufferSize; writeIndex++)
+	for(uint32 writeIndex = m_writeBufferHasEvents ? m_writeBufferProcessIndex : m_writeBufferSize; writeIndex < m_writeBufferSize; writeIndex++)
 	{
 		const auto& write = m_currentWriteBuffer[writeIndex];
 		switch(write.first)
@@ -733,6 +734,7 @@ void CGSHandler::ProcessWriteBuffer(const CGsPacketMetadata* metadata)
 		break;
 		}
 	}
+	m_writeBufferHasEvents = false;
 	m_writeBufferProcessIndex = m_writeBufferSize;
 	uint32 submitPending = m_writeBufferProcessIndex - m_writeBufferSubmitIndex;
 	if(submitPending >= REGISTERWRITEBUFFER_SUBMIT_THRESHOLD)
