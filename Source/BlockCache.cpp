@@ -53,8 +53,8 @@ namespace
 	{
 		std::vector<const std::vector<uint8>*> codes;
 	};
-	//ponytail: fixed size; 64 is what the EE batching uses. Larger groups compile more unused code.
-	constexpr uint32 GROUP_SIZE = 64;
+	//ponytail: fixed size. 256 (not the EE batch size, 64): more of the EE link sites end in the same module
+	constexpr uint32 GROUP_SIZE = 256;
 
 	std::unordered_map<KEY, ENTRY, KeyHasher> g_entries;
 	std::unordered_map<uint32, GROUP> g_groups;
