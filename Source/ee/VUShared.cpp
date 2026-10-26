@@ -252,9 +252,57 @@ void VUShared::MakeComparableFromFloat(CMipsJitter* codeGen)
 	codeGen->PullTop();
 }
 
+namespace
+{
+	//An FMAC result whose MAC and sticky pipeline writes are both skipped only feeds the next sticky
+	//value (sticky = previous | sign/zero bits of each result). Instead of building its sign/zero bits
+	//(MakeSz), it is folded into two vectors: sign bits ORed, magnitudes min'ed (a lane is zero iff one
+	//of the results was zero there). The bits are built once, when the sticky value is needed.
+	thread_local bool g_stickyAccumulatorPending = false;
+	//(Flag forwarding helpers, defined further down)
+	bool CanSkipFlagWrite(const VUShared::FLAG_PIPEINFO&);
+	bool IsFlagForwardValid(const VUShared::FLAG_PIPEINFO&);
+	void SetFlagForwardValue(const VUShared::FLAG_PIPEINFO&, CMipsJitter*);
+	const size_t g_stickySignAccOffset = offsetof(CMIPS, m_jitStickyAcc[0]);
+	const size_t g_stickyZeroAccOffset = offsetof(CMIPS, m_jitStickyAcc[1]);
+}
+
 void VUShared::TestSZFlags(CMipsJitter* codeGen, uint8 dest, size_t regOffset, uint32 relativePipeTime, uint32 compileHints)
 {
 	if(IsExperiment(1)) return;
+	//(Experiment bit 8: no accumulator, to compare results)
+	if(!IsExperiment(8) && CanSkipFlagWrite(g_pipeInfoSticky) && (compileHints & COMPILEHINT_SKIP_STICKY_UPDATE) && (compileHints & COMPILEHINT_SKIP_FMAC_UPDATE))
+	{
+		if(!g_stickyAccumulatorPending)
+		{
+			if(!IsFlagForwardValid(g_pipeInfoSticky))
+			{
+				PushLatestFlagPipelineValue(g_pipeInfoSticky, codeGen);
+				SetFlagForwardValue(g_pipeInfoSticky, codeGen);
+				codeGen->PullTop();
+			}
+			codeGen->MD_PushCstExpandW(0U);
+			codeGen->MD_PullRel(g_stickySignAccOffset);
+			codeGen->MD_PushCstExpandW(0x7FFFFFFFU);
+			codeGen->MD_PullRel(g_stickyZeroAccOffset);
+			g_stickyAccumulatorPending = true;
+		}
+		bool x = DestinationHasElement(dest, 0), y = DestinationHasElement(dest, 1);
+		bool z = DestinationHasElement(dest, 2), w = DestinationHasElement(dest, 3);
+
+		codeGen->MD_PushRel(g_stickySignAccOffset);
+		codeGen->MD_PushRel(regOffset);
+		codeGen->MD_Or();
+		codeGen->MD_PullRel(g_stickySignAccOffset, x, y, z, w);
+
+		codeGen->MD_PushRel(g_stickyZeroAccOffset);
+		codeGen->MD_PushRel(regOffset);
+		codeGen->MD_PushCstExpandW(0x7FFFFFFFU);
+		codeGen->MD_And();
+		codeGen->MD_MinW();
+		codeGen->MD_PullRel(g_stickyZeroAccOffset, x, y, z, w);
+		return;
+	}
 	codeGen->MD_PushRel(regOffset);
 	codeGen->MD_MakeSignZero();
 
@@ -1897,6 +1945,17 @@ namespace
 		return -1;
 	}
 
+	bool IsFlagForwardValid(const VUShared::FLAG_PIPEINFO& pipeInfo)
+	{
+		int index = GetFlagScratchIndex(pipeInfo);
+		return g_flagForwardingEnabled && (index >= 0) && (g_flagForwardingValid & (1 << index));
+	}
+
+	bool CanSkipFlagWrite(const VUShared::FLAG_PIPEINFO& pipeInfo)
+	{
+		return g_vuSkipFlagWrites && g_flagForwardingEnabled && !g_vuDiffMode && (GetFlagScratchIndex(pipeInfo) >= 0);
+	}
+
 	//Value on top of the stack becomes the latest value of the pipeline (stack is unchanged)
 	void SetFlagForwardValue(const VUShared::FLAG_PIPEINFO& pipeInfo, CMipsJitter* codeGen)
 	{
@@ -1915,12 +1974,33 @@ bool VUShared::IsExperiment(int bit)
 
 void VUShared::ResetFlagForwarding(bool enabled)
 {
+	//(Flushed by the code before: a skipped result is always followed by a written one in its block)
+	assert(!g_stickyAccumulatorPending);
+	g_stickyAccumulatorPending = false;
 	g_flagForwardingEnabled = enabled;
 	g_flagForwardingValid = 0;
 }
 
+void VUShared::FlushStickyAccumulator(CMipsJitter* codeGen)
+{
+	if(!g_stickyAccumulatorPending) return;
+	g_stickyAccumulatorPending = false;
+	assert(IsFlagForwardValid(g_pipeInfoSticky));
+	//Lane value with the accumulated sign bit, zero iff the accumulated magnitude is (MakeSz tests f32 == 0)
+	codeGen->PushRel(offsetof(CMIPS, m_jitFlagScratch[1]));
+	codeGen->MD_PushRel(g_stickySignAccOffset);
+	codeGen->MD_PushCstExpandW(0x80000000U);
+	codeGen->MD_And();
+	codeGen->MD_PushRel(g_stickyZeroAccOffset);
+	codeGen->MD_Or();
+	codeGen->MD_MakeSignZero();
+	codeGen->Or();
+	codeGen->PullRel(offsetof(CMIPS, m_jitFlagScratch[1]));
+}
+
 void VUShared::PushLatestFlagPipelineValue(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* codeGen)
 {
+	if(pipeInfo.valueArray == g_pipeInfoSticky.valueArray) FlushStickyAccumulator(codeGen);
 	int index = GetFlagScratchIndex(pipeInfo);
 	if(g_flagForwardingEnabled && (index >= 0) && (g_flagForwardingValid & (1 << index)))
 	{
@@ -1944,7 +2024,7 @@ void VUShared::QueueInFlagPipeline(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* c
 
 	//Nothing reads this entry; the next instruction that needs the latest value gets it from the forwarding scratch
 	//(Not in the VU differential test, which compares the pipelines with the reference code's)
-	if(skipWrite && g_vuSkipFlagWrites && g_flagForwardingEnabled && !g_vuDiffMode && (GetFlagScratchIndex(pipeInfo) >= 0))
+	if(skipWrite && CanSkipFlagWrite(pipeInfo))
 	{
 		codeGen->PullTop();
 		return;
@@ -1998,6 +2078,8 @@ void VUShared::QueueInFlagPipeline(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* c
 
 void VUShared::ResetFlagPipeline(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* codeGen)
 {
+	//(Accumulated results are overwritten like the forwarded value: the reset sets every slot)
+	if(pipeInfo.valueArray == g_pipeInfoSticky.valueArray) g_stickyAccumulatorPending = false;
 	SetFlagForwardValue(pipeInfo, codeGen);
 
 	uint32 valueCursor = codeGen->GetTopCursor();

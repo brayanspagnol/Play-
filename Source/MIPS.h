@@ -181,6 +181,9 @@ public:
 	//MAC, sticky and clip flag pipelines by the block being executed (see VUShared flag forwarding),
 	//[3] number of blocks run by a VU superblock, [4] address a VU superblock was entered at
 	alignas(16) uint32 m_jitFlagScratch[8] = {};
+	//JIT scratch (VU): sign and magnitude accumulators of FMAC results whose sticky flag write is skipped
+	//(see VUShared::TestSZFlags)
+	alignas(16) uint128 m_jitStickyAcc[2] = {};
 
 	//Called by the slow path store proxies with the physical address and size written
 	typedef void (*WriteWatchHandler)(CMIPS*, uint32, uint32);

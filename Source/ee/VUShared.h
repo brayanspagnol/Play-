@@ -250,6 +250,8 @@ namespace VUShared
 	//in CMIPS::m_jitFlagScratch so later reads don't go through the ring buffer. Must be reset at the
 	//start of every block and around code that is only conditionally executed.
 	void ResetFlagForwarding(bool enabled);
+	//Folds the FMAC results accumulated for the sticky flags into the forwarded sticky value
+	void FlushStickyAccumulator(CMipsJitter*);
 	bool IsExperiment(int bit);
 
 	void CheckFlagPipelineImmediate(const FLAG_PIPEINFO&, CMIPS*, uint32);

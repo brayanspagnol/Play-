@@ -522,6 +522,7 @@ void CVuBasicBlock::CompileBody(CMipsJitter* jitter, bool allowSelfLoop)
 				jitter->PushRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
 				jitter->PushCst(MIPS_INVALID_PC);
 				//Conditionally executed code: don't forward flag values into or out of it
+				VUShared::FlushStickyAccumulator(jitter);
 				VUShared::ResetFlagForwarding(false);
 				jitter->BeginIf(Jitter::CONDITION_EQ);
 				{
@@ -544,6 +545,7 @@ void CVuBasicBlock::CompileBody(CMipsJitter* jitter, bool allowSelfLoop)
 	}
 
 	assert(!hasPendingXgKick);
+	VUShared::FlushStickyAccumulator(jitter);
 
 	if(!VUShared::IsExperiment(4))
 	//Increment pipeTime
