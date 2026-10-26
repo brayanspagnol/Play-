@@ -448,6 +448,13 @@ void CVif::ProcessPacket(StreamType& stream)
 
 		stream.ReadValue<4>(&m_CODE);
 
+		if((m_CODE.nCMD == CODE_CMD_NOP) && (m_CODE.nI == 0))
+		{
+			//Padding (GTA SA sends ~27k per frame): ExecuteCommand does nothing for it
+			m_NUM = m_CODE.nNUM;
+			continue;
+		}
+
 		if(m_CODE.nI != 0)
 		{
 			//Next command will be stalled (if not MARK)
@@ -1203,6 +1210,18 @@ void CVif::SkipUnpack(StreamType& stream, CODE nCommand)
 		//Groups of cl ticks: wl vectors read, then (cl - wl) skipped without data
 		while(currentNum != 0)
 		{
+			if((m_readTick == 0) && (m_writeTick == 0))
+			{
+				//At a group boundary: all but the last whole group with data in one step, each of them
+				//leaves the ticks at 0 again (a vector is left to read after it). The loop does the rest.
+				uint32 groups = std::min<uint32>(currentNum, stream.GetAvailableReadBytes() / elementSize) / wl;
+				if(groups > 1)
+				{
+					uint32 count = (groups - 1) * wl;
+					stream.Skip(count * elementSize);
+					currentNum -= count;
+				}
+			}
 			if(m_readTick < wl)
 			{
 				uint32 count = std::min<uint32>(std::min<uint32>(wl - m_readTick, currentNum), stream.GetAvailableReadBytes() / elementSize);
