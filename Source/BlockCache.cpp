@@ -185,15 +185,30 @@ EM_JS(int, BlockCacheCreateGroup, (uint32 groupId, uintptr_t code, uintptr_t siz
 	try
 	{
 		let module = new WebAssembly.Module(HEAP8.subarray(code, code + size));
+		//With link sites (see WasmCreateBatch in CodeGen), function i of the group is at table index linkBase + i.
+		//Those slots are set now and stay (one function per block address and code, see BlockCache::KEY)
+		let linked = WebAssembly.Module.imports(module).some(i => i.name == "linkBase");
+		let count = WebAssembly.Module.exports(module).length;
+		let linkBase = linked ? wasmTable.grow(count) : 0;
 		let instance = new WebAssembly.Instance(module, {
 			env: {
 				memory: wasmMemory,
 				fctTable : Module.codeGenImportTable,
-				blockTable : wasmTable
+				blockTable : wasmTable,
+				linkBase : linkBase
 			}
 		});
+		if(linked)
+		{
+			let permanentSlots = (Module.jitPermanentSlots ??= new Set());
+			for(let i = 0; i < count; i++)
+			{
+				setWasmTableEntry(linkBase + i, instance.exports["f" + i]);
+				permanentSlots.add(linkBase + i);
+			}
+		}
 		if(!Module.blockCacheGroups) Module.blockCacheGroups = new Map();
-		Module.blockCacheGroups.set(groupId, instance);
+		Module.blockCacheGroups.set(groupId, { instance : instance, linkBase : linked ? linkBase : -1 });
 		return 1;
 	}
 	catch(e)
@@ -205,8 +220,10 @@ EM_JS(int, BlockCacheCreateGroup, (uint32 groupId, uintptr_t code, uintptr_t siz
 EM_JS(int, BlockCacheGroupFunction, (uint32 groupId, uint32 index), {
 	//A slot of its own (not addFunction, which hands out the same slot again for the same function):
 	//two blocks with the same code each own and later free their slot
+	let group = Module.blockCacheGroups.get(groupId);
+	if(group.linkBase >= 0) return group.linkBase + index;
 	let slot = getEmptyTableSlot();
-	setWasmTableEntry(slot, Module.blockCacheGroups.get(groupId).exports["f" + index]);
+	setWasmTableEntry(slot, group.instance.exports["f" + index]);
 	return slot;
 });
 EM_JS(void, BlockCacheResetGroups, (), {

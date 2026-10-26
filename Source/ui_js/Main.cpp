@@ -497,6 +497,13 @@ void setEeBlockChaining(bool enabled)
 	g_eeBlockChaining = enabled;
 }
 
+//EE block linking (direct tail calls between blocks of one batch module); applies to blocks compiled afterwards
+extern bool g_eeBlockLinking;
+void setEeBlockLinking(bool enabled)
+{
+	g_eeBlockLinking = enabled;
+}
+
 //EE module batching: newly compiled EE blocks are moved into shared wasm modules of this many blocks (0 = off)
 extern uint32 g_jitPageAccess;
 //Guest loads/stores as single page-table statements (default) or the older if/else Jitter sequence
@@ -906,6 +913,7 @@ EMSCRIPTEN_BINDINGS(Play)
 	function("vuReplayResult", &vuReplayResult);
 	function("saveState", &saveState);
 	function("setEeBlockChaining", &setEeBlockChaining);
+	function("setEeBlockLinking", &setEeBlockLinking);
 	function("eeHashAfterLoad", &eeHashAfterLoad);
 	function("eeTimeAfterLoad", &eeTimeAfterLoad);
 	function("eeTimeResult", &eeTimeResult);

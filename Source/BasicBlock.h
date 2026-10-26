@@ -197,6 +197,9 @@ protected:
 	virtual void CompileEpilog(CMipsJitter*, bool);
 	//Block chaining (WebAssembly): the epilog tail calls the next block when there is no exception
 	bool UsesBlockChaining() const;
+	bool UsesBlockLinking() const;
+	uint32 GetStaticBranchTarget() const;
+	void CompileLink(CMipsJitter*, uint32);
 
 private:
 	void HandleExternalFunctionReference(uintptr_t, uint32, Jitter::CCodeGen::SYMBOL_REF_TYPE);

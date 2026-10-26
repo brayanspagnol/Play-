@@ -867,6 +867,8 @@ void CEeExecutor::FlushAutoIdleInvalidations()
 }
 
 
+extern bool g_eeBlockLinking;
+
 CEeExecutor::CEeExecutor(CMIPS& context, uint8* ram)
     : CGenericMipsExecutor(context, 0x20000000, BLOCK_CATEGORY_PS2_EE)
     , m_ram(ram)
@@ -1170,8 +1172,9 @@ BasicBlockPtr CEeExecutor::BlockFactory(CMIPS& context, uint32 start, uint32 end
 				basicBlock->SetRecycleCount(std::min<uint32>(RECYCLE_NOLINK_THRESHOLD, recycleCount + 1));
 				return basicBlock;
 			}
-			else
+			else if(!g_eeBlockLinking)
 			{
+				//(Not with block linking: link sites hold the guest addresses the code was compiled for)
 				auto result = std::make_shared<CEeBasicBlock>(context, start, end, m_blockCategory);
 				result->CopyFunctionFrom(basicBlock);
 				return result;

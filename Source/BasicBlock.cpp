@@ -129,6 +129,10 @@ std::atomic<uint32> g_vuBlockExecCount = 0;
 uint32 g_eeBatchSize = 64;
 //Block chaining switch (Module.setEeBlockChaining), read when blocks are compiled
 bool g_eeBlockChaining = false;
+//EE block linking (Module.setEeBlockLinking), read when blocks are compiled: a block whose next address is known
+//when it is compiled (fall-through, direct branch) tail calls the next block directly when module batching puts
+//both in the same module (see CWasmModuleBuilder::LINK_SITE)
+bool g_eeBlockLinking = true;
 //EE context promotion (Module.setEeContextPromotion), read when blocks are compiled
 bool g_eeContextPromotion = false;
 
@@ -190,6 +194,48 @@ bool CBasicBlock::UsesBlockChaining() const
 #endif
 }
 
+bool CBasicBlock::UsesBlockLinking() const
+{
+#if defined(__EMSCRIPTEN__) && !defined(AOT_ENABLED)
+	return g_eeBlockLinking && (m_category == BLOCK_CATEGORY_PS2_EE) && (m_context.m_blockFnLookup != nullptr) && !IsEmpty() && !UsesBlockChaining();
+#else
+	return false;
+#endif
+}
+
+//Target of the block's branch when it is known now: the only branch or jump of the block is the instruction before
+//the last one (the last is its delay slot) and has a constant target (not JR/JALR), and nothing else (ERET) can set
+//the delayed jump address. MIPS_INVALID_PC otherwise.
+uint32 CBasicBlock::GetStaticBranchTarget() const
+{
+	if(m_end == m_begin) return MIPS_INVALID_PC;
+	uint32 target = MIPS_INVALID_PC;
+	for(uint32 address = m_begin; address <= m_end; address += 4)
+	{
+		uint32 opcode = m_context.m_pMemoryMap->GetInstruction(address);
+		if((opcode >> 26) == 0x10) return MIPS_INVALID_PC; //COP0
+		auto branchType = m_context.m_pArch->IsInstructionBranch(&m_context, address, opcode);
+		if(branchType == MIPS_BRANCH_NONE) continue;
+		if((branchType != MIPS_BRANCH_NORMAL) || (address != m_end - 4)) return MIPS_INVALID_PC;
+		target = m_context.m_pArch->GetInstructionEffectiveAddress(&m_context, address, opcode);
+	}
+	return target;
+}
+
+//If no exception is pending (cycle quota, syscall, idle loop, ...), go on with the block at target (link site,
+//see CCodeGen_Wasm::Emit_ExternJmpLink): same as one more executor loop iteration. nPC is already target.
+void CBasicBlock::CompileLink(CMipsJitter* jitter, uint32 target)
+{
+	if(target == MIPS_INVALID_PC) return;
+	jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
+	jitter->PushCst(0);
+	jitter->BeginIf(Jitter::CONDITION_EQ);
+	{
+		jitter->JumpToLinked(target & 0x1FFFFFFF, offsetof(CMIPS, m_blockFnLookup)); //EE address mask (CEeExecutor)
+	}
+	jitter->EndIf();
+}
+
 void CBasicBlock::Compile()
 {
 #ifdef PROFILE
@@ -227,9 +273,12 @@ void CBasicBlock::Compile()
 		cacheKey.category = m_category;
 		cacheKey.size = wordCount * 4;
 		cacheKey.hints = m_blockCompileHints;
-		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000) | (IsSuperBlock() ? 0x20000000 : 0) | (UsesBlockChaining() ? 0x10000000 : 0) | ((g_jitPageAccess != ~0U) ? (0x08000000 | (g_jitPageAccess & 0x3FF)) : 0) | (g_jitBranchHints ? 0 : 0x01000000);
+		cacheKey.variant = m_cacheVariant | (UsesContextPromotion() ? 0 : 0x40000000) | (IsSuperBlock() ? 0x20000000 : 0) | (UsesBlockChaining() ? 0x10000000 : 0) | ((g_jitPageAccess != ~0U) ? (0x08000000 | (g_jitPageAccess & 0x3FF)) : 0) | (g_jitBranchHints ? 0 : 0x01000000) |
+		                   (((m_category == BLOCK_CATEGORY_PS2_EE) && !g_eeBlockLinking) ? 0x02000000 : 0);
 		cacheKey.hash[0] = xxHash.low64;
 		cacheKey.hash[1] = xxHash.high64 ^ BlockCache::CODEGEN_VERSION;
+		//Link sites hold guest addresses (the block's own and its targets): the same code elsewhere is other code
+		if(UsesBlockLinking()) cacheKey.hash[0] ^= static_cast<uint64>(m_begin) * 0x9E3779B97F4A7C15ULL;
 
 		size_t cachedSize = 0;
 		int cachedFunction = BlockCache::FindFunction(cacheKey, cachedSize);
@@ -543,12 +592,14 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 #else
 	bool fallThroughOnly = false;
 #endif
+	bool linking = UsesBlockLinking();
 	if(fallThroughOnly)
 	{
 		jitter->PushRel(offsetof(CMIPS, m_State.nPC));
 		jitter->PushCst(m_end - m_begin + 4);
 		jitter->Add();
 		jitter->PullRel(offsetof(CMIPS, m_State.nPC));
+		if(linking) CompileLink(jitter, m_end + 4);
 	}
 	else
 	{
@@ -584,6 +635,7 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 				}
 				jitter->EndIf();
 #endif
+				if(linking) CompileLink(jitter, GetStaticBranchTarget());
 			}
 		}
 		jitter->Else();
@@ -592,6 +644,7 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 			jitter->PushCst(m_end - m_begin + 4);
 			jitter->Add();
 			jitter->PullRel(offsetof(CMIPS, m_State.nPC));
+			if(linking) CompileLink(jitter, m_end + 4);
 
 #if !defined(AOT_BUILD_CACHE) && !defined(__EMSCRIPTEN__)
 			jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
@@ -689,6 +742,7 @@ void CBasicBlock::BeginCompile(CMipsJitter* jitter, bool contextPromotion)
 	auto wasmCodeGen = static_cast<Jitter::CCodeGen_Wasm*>(jitter->GetCodeGen());
 	wasmCodeGen->SetContextPromotion(contextPromotion);
 	Jitter::CCodeGen_Wasm::SetBranchHints(g_jitBranchHints);
+	wasmCodeGen->SetLinkAddress(UsesBlockLinking() ? m_begin : ~0U);
 	if(g_jitFunctionNames)
 	{
 		const char* prefix = (m_category == BLOCK_CATEGORY_PS2_VU) ? (m_diffDataSize > 0x1000 ? "vu1" : "vu0") : (m_category == BLOCK_CATEGORY_PS2_EE) ? "ee" : "iop";
