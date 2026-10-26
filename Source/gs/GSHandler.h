@@ -864,6 +864,17 @@ public:
 		m_currentWriteBuffer[m_writeBufferSize++] = write;
 	}
 
+	//WriteRegister in bulk (GIF PACKED loop): up to 'room' writes go at the returned pointer, then CommitWrites(count)
+	inline RegisterWrite* GetWriteBufferTail(uint32& room)
+	{
+		room = REGISTERWRITEBUFFER_SIZE - m_writeBufferSize;
+		return m_currentWriteBuffer + m_writeBufferSize;
+	}
+	inline void CommitWrites(uint32 count)
+	{
+		m_writeBufferSize += count;
+	}
+
 	void ProcessWriteBuffer(const CGsPacketMetadata*);
 	void SubmitWriteBuffer();
 	void FlushWriteBuffer();

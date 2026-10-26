@@ -106,13 +106,32 @@ void CGIF::SaveState(Framework::CZipArchiveWriter& archive)
 uint32 CGIF::ProcessPacked(const uint8* memory, uint32 address, uint32 end)
 {
 	uint32 start = address;
+	//State in locals, GS register writes straight into its write buffer (same drop-when-full rule as WriteRegister)
+	uint16 loops = m_loops;
+	uint8 regsTemp = m_regsTemp;
+	const uint8 regs = m_regs;
+	const uint64 regList = m_regList;
+	uint32 qtemp = m_qtemp;
+	uint32 room = 0;
+	uint32 writeCount = 0;
+	auto writes = m_gs->GetWriteBufferTail(room);
+	const auto writeRegister = [&](uint8 reg, uint64 value) {
+		if(writeCount == room) return;
+		writes[writeCount++] = CGSHandler::RegisterWrite(reg, value);
+	};
+	const auto saveState = [&]() {
+		m_gs->CommitWrites(writeCount);
+		m_loops = loops;
+		m_regsTemp = regsTemp;
+		m_qtemp = qtemp;
+	};
 
-	while((m_loops != 0) && (address < end))
+	while((loops != 0) && (address < end))
 	{
-		while((m_regsTemp != 0) && (address < end))
+		while((regsTemp != 0) && (address < end))
 		{
 			uint64 temp = 0;
-			uint32 regDesc = (uint32)((m_regList >> ((m_regs - m_regsTemp) * 4)) & 0x0F);
+			uint32 regDesc = (uint32)((regList >> ((regs - regsTemp) * 4)) & 0x0F);
 
 			uint128 packet = *reinterpret_cast<const uint128*>(memory + address);
 
@@ -120,7 +139,7 @@ uint32 CGIF::ProcessPacked(const uint8* memory, uint32 address, uint32 end)
 			{
 			case 0x00:
 				//PRIM
-				m_gs->WriteRegister(CGSHandler::RegisterWrite(GS_REG_PRIM, packet.nV0));
+				writeRegister(GS_REG_PRIM, packet.nV0);
 				break;
 			case 0x01:
 				//RGBA
@@ -128,19 +147,19 @@ uint32 CGIF::ProcessPacked(const uint8* memory, uint32 address, uint32 end)
 				temp |= (packet.nV[1] & 0xFF) << 8;
 				temp |= (packet.nV[2] & 0xFF) << 16;
 				temp |= (packet.nV[3] & 0xFF) << 24;
-				temp |= ((uint64)m_qtemp << 32);
-				m_gs->WriteRegister(CGSHandler::RegisterWrite(GS_REG_RGBAQ, temp));
+				temp |= ((uint64)qtemp << 32);
+				writeRegister(GS_REG_RGBAQ, temp);
 				break;
 			case 0x02:
 				//ST
-				m_qtemp = packet.nV2;
-				m_gs->WriteRegister(CGSHandler::RegisterWrite(GS_REG_ST, packet.nD0));
+				qtemp = packet.nV2;
+				writeRegister(GS_REG_ST, packet.nD0);
 				break;
 			case 0x03:
 				//UV
 				temp = (packet.nV[0] & 0x7FFF);
 				temp |= (packet.nV[1] & 0x7FFF) << 16;
-				m_gs->WriteRegister(CGSHandler::RegisterWrite(GS_REG_UV, temp));
+				writeRegister(GS_REG_UV, temp);
 				break;
 			case 0x04:
 				//XYZF2
@@ -150,11 +169,11 @@ uint32 CGIF::ProcessPacked(const uint8* memory, uint32 address, uint32 end)
 				temp |= (uint64)(packet.nV[3] & 0x00000FF0) << 52;
 				if(packet.nV[3] & 0x8000)
 				{
-					m_gs->WriteRegister(CGSHandler::RegisterWrite(GS_REG_XYZF3, temp));
+					writeRegister(GS_REG_XYZF3, temp);
 				}
 				else
 				{
-					m_gs->WriteRegister(CGSHandler::RegisterWrite(GS_REG_XYZF2, temp));
+					writeRegister(GS_REG_XYZF2, temp);
 				}
 				break;
 			case 0x05:
@@ -164,36 +183,36 @@ uint32 CGIF::ProcessPacked(const uint8* memory, uint32 address, uint32 end)
 				temp |= (uint64)(packet.nV[2] & 0xFFFFFFFF) << 32;
 				if(packet.nV[3] & 0x8000)
 				{
-					m_gs->WriteRegister(CGSHandler::RegisterWrite(GS_REG_XYZ3, temp));
+					writeRegister(GS_REG_XYZ3, temp);
 				}
 				else
 				{
-					m_gs->WriteRegister(CGSHandler::RegisterWrite(GS_REG_XYZ2, temp));
+					writeRegister(GS_REG_XYZ2, temp);
 				}
 				break;
 			case 0x06:
 				//TEX0_1
-				m_gs->WriteRegister(CGSHandler::RegisterWrite(GS_REG_TEX0_1, packet.nD0));
+				writeRegister(GS_REG_TEX0_1, packet.nD0);
 				break;
 			case 0x07:
 				//TEX0_2
-				m_gs->WriteRegister(CGSHandler::RegisterWrite(GS_REG_TEX0_2, packet.nD0));
+				writeRegister(GS_REG_TEX0_2, packet.nD0);
 				break;
 			case 0x08:
 				//CLAMP_1
-				m_gs->WriteRegister(CGSHandler::RegisterWrite(GS_REG_CLAMP_1, packet.nD0));
+				writeRegister(GS_REG_CLAMP_1, packet.nD0);
 				break;
 			case 0x09:
 				//CLAMP_2
-				m_gs->WriteRegister(CGSHandler::RegisterWrite(GS_REG_CLAMP_2, packet.nD0));
+				writeRegister(GS_REG_CLAMP_2, packet.nD0);
 				break;
 			case 0x0A:
 				//FOG
-				m_gs->WriteRegister(CGSHandler::RegisterWrite(GS_REG_FOG, (packet.nD1 >> 36) << 56));
+				writeRegister(GS_REG_FOG, (packet.nD1 >> 36) << 56);
 				break;
 			case 0x0D:
 				//XYZ3
-				m_gs->WriteRegister(CGSHandler::RegisterWrite(GS_REG_XYZ3, packet.nD0));
+				writeRegister(GS_REG_XYZ3, packet.nD0);
 				break;
 			case 0x0E:
 				//A + D
@@ -207,11 +226,12 @@ uint32 CGIF::ProcessPacked(const uint8* memory, uint32 address, uint32 end)
 						{
 							//If there is, we need to wait for previous signal to be cleared
 							m_signalState = SIGNAL_STATE_PENDING;
+							saveState();
 							return address - start;
 						}
 						m_signalState = SIGNAL_STATE_ENCOUNTERED;
 					}
-					m_gs->WriteRegister(CGSHandler::RegisterWrite(reg, packet.nD0));
+					writeRegister(reg, packet.nD0);
 				}
 				break;
 			case 0x0F:
@@ -223,16 +243,17 @@ uint32 CGIF::ProcessPacked(const uint8* memory, uint32 address, uint32 end)
 			}
 
 			address += 0x10;
-			m_regsTemp--;
+			regsTemp--;
 		}
 
-		if(m_regsTemp == 0)
+		if(regsTemp == 0)
 		{
-			m_loops--;
-			m_regsTemp = m_regs;
+			loops--;
+			regsTemp = regs;
 		}
 	}
 
+	saveState();
 	return address - start;
 }
 
