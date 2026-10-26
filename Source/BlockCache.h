@@ -13,7 +13,7 @@ namespace BlockCache
 {
 	//Mixed into every key: bump when the JIT output changes (CodeGen or block compilers), so
 	//entries from older code generators are never reused.
-	constexpr uint64 CODEGEN_VERSION = 3; //1: context fields as memarg offsets, 2: VU status/clip flag writes nothing reads skipped, 3: MakeSz/ExpandW wasm forms
+	constexpr uint64 CODEGEN_VERSION = 14; //1: context fields as memarg offsets, 2: VU status/clip flag writes nothing reads skipped, 3: MakeSz/ExpandW wasm forms, 14: ITOFn multiplies (not 4: kept apart from other branches sharing the cache)
 
 #pragma pack(push, 1)
 	struct KEY

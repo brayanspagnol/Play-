@@ -1001,8 +1001,9 @@ void VUShared::ITOF4(CMipsJitter* codeGen, uint8 dest, uint8 ft, uint8 fs)
 
 	codeGen->MD_PushRel(offsetof(CMIPS, m_State.nCOP2[fs]));
 	codeGen->MD_ToSingleI32();
-	codeGen->MD_PushCstExpandS(16.0f);
-	codeGen->MD_DivS();
+	//Same result as dividing by 16.0 (exact power of 2 scaling), a lot cheaper
+	codeGen->MD_PushCstExpandS(1.0f / 16.0f);
+	codeGen->MD_MulS();
 	PullVector(codeGen, dest, offsetof(CMIPS, m_State.nCOP2[ft]));
 }
 
@@ -1012,8 +1013,9 @@ void VUShared::ITOF12(CMipsJitter* codeGen, uint8 dest, uint8 ft, uint8 fs)
 
 	codeGen->MD_PushRel(offsetof(CMIPS, m_State.nCOP2[fs]));
 	codeGen->MD_ToSingleI32();
-	codeGen->MD_PushCstExpandS(4096.0f);
-	codeGen->MD_DivS();
+	//Same result as dividing by 4096.0 (exact power of 2 scaling), a lot cheaper
+	codeGen->MD_PushCstExpandS(1.0f / 4096.0f);
+	codeGen->MD_MulS();
 	PullVector(codeGen, dest, offsetof(CMIPS, m_State.nCOP2[ft]));
 }
 
@@ -1023,8 +1025,9 @@ void VUShared::ITOF15(CMipsJitter* codeGen, uint8 dest, uint8 ft, uint8 fs)
 
 	codeGen->MD_PushRel(offsetof(CMIPS, m_State.nCOP2[fs]));
 	codeGen->MD_ToSingleI32();
-	codeGen->MD_PushCstExpandS(32768.0f);
-	codeGen->MD_DivS();
+	//Same result as dividing by 32768.0 (exact power of 2 scaling), a lot cheaper
+	codeGen->MD_PushCstExpandS(1.0f / 32768.0f);
+	codeGen->MD_MulS();
 	PullVector(codeGen, dest, offsetof(CMIPS, m_State.nCOP2[ft]));
 }
 
