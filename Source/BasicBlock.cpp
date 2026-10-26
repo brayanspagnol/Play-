@@ -254,10 +254,12 @@ void CBasicBlock::Compile()
 	extern int g_vuExperiment;
 	//(The VU differential test always compiles, so every block gets its reference code)
 	bool dumpBlock = false;
-	if(m_category == BLOCK_CATEGORY_PS2_EE)
+	if((m_category == BLOCK_CATEGORY_PS2_EE) || (m_category == BLOCK_CATEGORY_PS2_VU))
 	{
+		//(VU blocks are requested as 0xF0000000 | address)
+		uint32 dumpKey = (m_category == BLOCK_CATEGORY_PS2_VU) ? (0xF0000000 | m_begin) : m_begin;
 		std::lock_guard<std::mutex> lock(g_eeDumpMutex);
-		dumpBlock = g_eeDumpRequest.count(m_begin) != 0;
+		dumpBlock = g_eeDumpRequest.count(dumpKey) != 0;
 	}
 	bool useBlockCache = BlockCache::IsEnabled() && !IsEmpty() && !dumpBlock && (g_vuExperiment == 0) && !(g_vuDiffMode && (m_category == BLOCK_CATEGORY_PS2_VU));
 	if(useBlockCache)
@@ -354,7 +356,7 @@ void CBasicBlock::Compile()
 		}
 		text += "\n";
 		std::lock_guard<std::mutex> lock(g_eeDumpMutex);
-		g_eeDumpResult[m_begin] = std::move(text); //latest compile wins
+		g_eeDumpResult[(m_category == BLOCK_CATEGORY_PS2_VU) ? (0xF0000000 | m_begin) : m_begin] = std::move(text); //latest compile wins
 	}
 	//(Not the executor's empty block: it compiles and runs the real block, which has its own test)
 	if(g_vuDiffMode && (m_category == BLOCK_CATEGORY_PS2_VU) && UsesContextPromotion() && !IsEmpty())

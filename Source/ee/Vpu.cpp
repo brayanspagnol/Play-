@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <atomic>
 #include <mutex>
+#include <map>
 #include <vector>
 #include <algorithm>
 #include "xxhash.h"
@@ -43,6 +44,13 @@ uint32 g_vuReplayTop = 0;
 uint32 g_vuReplayItop = 0;
 std::mutex g_vuReplayResultMutex;
 std::string g_vuReplayResult;
+
+//Experiment bit 64 (replay): function entries and body runs per VU block (key: begin, | 0x80000000 for runs)
+std::map<uint32, uint64> g_vuBlockCounts;
+extern "C" void VuBlockCount(CMIPS*, uint32 key)
+{
+	g_vuBlockCounts[key]++;
+}
 
 namespace
 {
@@ -368,6 +376,8 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 		}
 		memcpy(m_vuMem, capture.vuMem.data(), m_vuMemSize);
 		m_ctx->m_State.nPC = capture.address;
+		//(Blocks compiled on the helper replace their interpreter here, like in CVpu::Execute)
+		AsyncCompile::Update();
 		g_vuReplayTop = capture.top;
 		g_vuReplayItop = capture.itop;
 		for(uint32 i = 0; i < 1000; i++)
@@ -388,7 +398,7 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 	};
 
 	std::string result;
-	std::vector<uint64> refHashes;
+	std::vector<uint64> refHashes, promotedHashes;
 	g_vuDiffSuppressKick = true;
 	g_vuReplayIoActive = true;
 	int liveExperiment = g_vuExperiment;
@@ -414,6 +424,9 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 		extern std::atomic<uint32> g_vuBlockExecCount;
 		uint32 blocksBefore = g_vuBlockExecCount;
 #endif
+		g_vuBlockCounts.clear();
+		m_ctx->m_jitFlagScratch[5] = 0;
+		m_ctx->m_jitFlagScratch[6] = 0;
 		double start = emscripten_get_now();
 		for(uint32 i = 0; i < iterations; i++)
 		{
@@ -423,7 +436,19 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 #ifdef PROFILE
 		result += string_format("blocks/program %.1f\n", static_cast<double>(g_vuBlockExecCount - blocksBefore) / (iterations * g_vuCaptures.size()));
 #endif
-		uint32 mismatches = 0;
+		if(g_vuExperiment & 64)
+		{
+			double programs = iterations * g_vuCaptures.size();
+			result += string_format("calls/program %.1f, block runs/program %.1f\n", m_ctx->m_jitFlagScratch[5] / programs, m_ctx->m_jitFlagScratch[6] / programs);
+			if(round == 8)
+			{
+				std::vector<std::pair<uint64, uint32>> sorted;
+				for(const auto& entry : g_vuBlockCounts) sorted.emplace_back(entry.second, entry.first);
+				std::sort(sorted.rbegin(), sorted.rend());
+				for(const auto& entry : sorted) result += string_format("  %s %04X %.2f\n", (entry.second & 0x80000000) ? "run " : "call", entry.second & 0xFFFF, entry.first / programs);
+			}
+		}
+		uint32 mismatches = 0, promotedMismatches = 0;
 		if(round == 0)
 		{
 			refHashes = hashes;
@@ -432,9 +457,19 @@ void CVpu::RunReplayBenchmark(uint32 iterations)
 		{
 			for(size_t i = 0; i < hashes.size(); i++) mismatches += (hashes[i] != refHashes[i]) ? 1 : 0;
 		}
-		result += string_format("%s: %.1f us/program (%u programs x %u), mismatches %u\n",
+		//(Promoted code skips flag pipeline writes nothing reads, so it differs from the reference in
+		//the pipeline arrays; the third variant is compared with the promoted one too)
+		if(variant == 1) promotedHashes = hashes;
+		if(variant == 2)
+		{
+			for(size_t i = 0; i < hashes.size(); i++) promotedMismatches += (hashes[i] != promotedHashes[i]) ? 1 : 0;
+		}
+		result += string_format("%s: %.1f us/program (%u programs x %u), mismatches %u",
 		                        variantNames[variant], elapsed * 1000.0 / (iterations * g_vuCaptures.size()),
 		                        static_cast<uint32>(g_vuCaptures.size()), iterations, mismatches);
+		//(Fingerprint of all results: compares builds)
+		result += string_format(", results %016llx", static_cast<unsigned long long>(XXH64(hashes.data(), hashes.size() * sizeof(uint64), 0)));
+		result += (variant == 2) ? string_format(", vs promoted %u\n", promotedMismatches) : std::string("\n");
 	}
 	g_vuDiffSuppressKick = false;
 	g_vuReplayIoActive = false;

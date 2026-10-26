@@ -16,6 +16,7 @@ extern "C" void SDL_Proxy(uint32, uint64, CMIPS*);
 extern "C" void SDR_Proxy(uint32, uint64, CMIPS*);
 extern "C" void EeAutoIdleCheck(CMIPS*);
 extern "C" void EeAutoIdleTaint(CMIPS*);
+extern "C" void VuBlockCount(CMIPS*, uint32);
 
 static const struct
 {
@@ -43,6 +44,7 @@ static const struct
         {reinterpret_cast<uintptr_t>(&SDR_Proxy), "_SDR_Proxy", "viji"},
         {reinterpret_cast<uintptr_t>(&EeAutoIdleCheck), "_EeAutoIdleCheck", "vi"},
         {reinterpret_cast<uintptr_t>(&EeAutoIdleTaint), "_EeAutoIdleTaint", "vi"},
+        {reinterpret_cast<uintptr_t>(&VuBlockCount), "_VuBlockCount", "vii"},
 };
 
 //Defined by CodeGen (EM_JS): adds a function to this thread's Module.codeGenImportTable

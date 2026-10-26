@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <cstring>
 
+extern "C" void VuBlockCount(CMIPS*, uint32);
+extern bool g_vuDiffMode;
+
 #ifdef __EMSCRIPTEN__
 #include "Jitter_CodeGen_Wasm.h"
 #endif
@@ -66,8 +69,22 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
 		CompileSuperBlock(jitter);
 		return;
 	}
+	extern int g_vuExperiment;
+	//(Experiment bit 64: count function entries and block body runs in m_jitFlagScratch[5]/[6])
+	auto count = [&](size_t offset) {
+		if(!(g_vuExperiment & 64)) return;
+		jitter->PushRel(offset);
+		jitter->PushCst(1);
+		jitter->Add();
+		jitter->PullRel(offset);
+		jitter->PushCtx();
+		jitter->PushCst(m_begin | ((offset == offsetof(CMIPS, m_jitFlagScratch[6])) ? 0x80000000 : 0));
+		jitter->Call(reinterpret_cast<void*>(&VuBlockCount), 2, Jitter::CJitter::RETURN_VALUE_NONE);
+	};
 	CompileProlog(jitter);
+	count(offsetof(CMIPS, m_jitFlagScratch[5]));
 	jitter->MarkFirstBlockLabel();
+	count(offsetof(CMIPS, m_jitFlagScratch[6]));
 	CompileBody(jitter, !m_noSelfLoop);
 }
 
