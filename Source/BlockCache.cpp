@@ -1,5 +1,7 @@
 #include "BlockCache.h"
+#include <algorithm>
 #include <atomic>
+#include <tuple>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
@@ -93,7 +95,9 @@ uint32 BlockCache::Load(const uint8* data, size_t size)
 	std::lock_guard<std::mutex> lock(g_mutex);
 	uint32 count = 0;
 	size_t pos = 0;
-	std::unordered_map<uint32, uint32> openGroups; //category -> group id
+	//Entries with a guest address (EE link sites) are grouped by address: neighbouring blocks then share a module,
+	//where their link sites become direct calls. The others stay in file order.
+	std::vector<std::tuple<uint32, uint32, ENTRY*>> newEntries; //category, address, entry
 	while(size - pos >= sizeof(ENTRY_HEADER))
 	{
 		ENTRY_HEADER header;
@@ -112,17 +116,26 @@ uint32 BlockCache::Load(const uint8* data, size_t size)
 		{
 			g_totalBytes += header.codeSize;
 			count++;
-			auto& groupId = openGroups[header.key.category];
-			if((groupId == 0) || (g_groups[groupId].codes.size() == GROUP_SIZE))
-			{
-				groupId = g_nextGroupId++;
-			}
-			auto& group = g_groups[groupId];
 			auto& newEntry = inserted.first->second;
-			newEntry.group = groupId;
-			newEntry.index = static_cast<uint32>(group.codes.size());
-			group.codes.push_back(&newEntry.code);
+			uint32 address = CWasmModuleBuilder::GetLinkAddress({newEntry.code.data(), static_cast<uint32>(newEntry.code.size())});
+			newEntries.emplace_back(header.key.category, address, &newEntry);
 		}
+	}
+	std::stable_sort(newEntries.begin(), newEntries.end(), [](const auto& a, const auto& b) {
+		return std::make_pair(std::get<0>(a), std::get<1>(a)) < std::make_pair(std::get<0>(b), std::get<1>(b));
+	});
+	std::unordered_map<uint32, uint32> openGroups; //category -> group id
+	for(const auto& [category, address, newEntry] : newEntries)
+	{
+		auto& groupId = openGroups[category];
+		if((groupId == 0) || (g_groups[groupId].codes.size() == GROUP_SIZE))
+		{
+			groupId = g_nextGroupId++;
+		}
+		auto& group = g_groups[groupId];
+		newEntry->group = groupId;
+		newEntry->index = static_cast<uint32>(group.codes.size());
+		group.codes.push_back(&newEntry->code);
 	}
 	return count;
 }
