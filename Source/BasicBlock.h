@@ -200,6 +200,9 @@ protected:
 	bool UsesBlockLinking() const;
 	uint32 GetStaticBranchTarget() const;
 	void CompileLink(CMipsJitter*, uint32);
+	void CompileChaining(CMipsJitter*);
+	//Epilogs of blocks compiled inside a bigger function (VU superblock parts) don't chain
+	bool m_epilogNoChaining = false;
 
 private:
 	void HandleExternalFunctionReference(uintptr_t, uint32, Jitter::CCodeGen::SYMBOL_REF_TYPE);

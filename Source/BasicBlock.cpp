@@ -661,7 +661,14 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
 		jitter->EndIf();
 	}
 
-	if(UsesBlockChaining())
+	if(UsesBlockChaining() && !m_epilogNoChaining)
+	{
+		CompileChaining(jitter);
+	}
+}
+
+void CBasicBlock::CompileChaining(CMipsJitter* jitter)
+{
 	{
 		//Same as one more iteration of the executor loop: if there is no exception (cycle quota
 		//exhausted, syscall, idle loop, ...), look up the block at nPC and tail call it. No block

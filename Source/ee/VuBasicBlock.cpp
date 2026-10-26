@@ -136,12 +136,18 @@ void CVuBasicBlock::CompileSuperBlock(CMipsJitter* jitter)
 			m_begin = part.begin;
 			m_end = part.end;
 
-			jitter->PushRel(partCountOffset);
-			jitter->PushCst(1);
-			jitter->Add();
-			jitter->PullRel(partCountOffset);
+			if(g_vuDiffMode)
+			{
+				jitter->PushRel(partCountOffset);
+				jitter->PushCst(1);
+				jitter->Add();
+				jitter->PullRel(partCountOffset);
+			}
 
+			//Transitions between parts stay in this function: only its end chains to the next block
+			m_epilogNoChaining = true;
 			CompileBody(jitter, false);
+			m_epilogNoChaining = false;
 
 			//Back edges: the next part starts at or before this one
 			jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
@@ -166,6 +172,11 @@ void CVuBasicBlock::CompileSuperBlock(CMipsJitter* jitter)
 
 	m_begin = savedBegin;
 	m_end = savedEnd;
+
+	if(UsesBlockChaining())
+	{
+		CompileChaining(jitter);
+	}
 }
 
 void CVuBasicBlock::CompileBody(CMipsJitter* jitter, bool allowSelfLoop)

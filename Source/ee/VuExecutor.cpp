@@ -4,7 +4,7 @@
 #include "xxhash.h"
 #include "../Ps2Const.h"
 
-bool g_vuSuperBlocks = false;
+bool g_vuSuperBlocks = true; //Module.setVuSuperBlocks (bench &vusb=0)
 extern bool g_vuContextPromotion;
 
 // clang-format off
