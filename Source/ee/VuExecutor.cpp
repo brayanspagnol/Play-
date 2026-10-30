@@ -105,11 +105,24 @@ void CVuExecutor::SelectBlockSet()
 		if(m_hasCurrentKey)
 		{
 			auto currentTable = m_blockLookup.GetTable();
+			auto rangePages = [](uint32 begin, uint32 end) {
+				uint32 firstPage = begin / BLOCK_SET_PAGE_SIZE;
+				uint32 lastPage = end / BLOCK_SET_PAGE_SIZE;
+				return (~0ULL >> (63 - lastPage)) & (~0ULL << firstPage);
+			};
 			auto carry = [&](const BasicBlockPtr& block) {
 				uint32 begin = block->GetBeginAddress();
-				uint32 firstPage = begin / BLOCK_SET_PAGE_SIZE;
-				uint32 lastPage = block->GetEndAddress() / BLOCK_SET_PAGE_SIZE;
-				uint64 blockPages = (~0ULL >> (63 - lastPage)) & (~0ULL << firstPage);
+				//(A superblock's code depends on its parts' words only, not on the words between them)
+				const auto& parts = static_cast<const CVuBasicBlock*>(block.get())->GetSuperBlockParts();
+				uint64 blockPages = 0;
+				if(parts.size() > 1)
+				{
+					for(const auto& part : parts) blockPages |= rangePages(part.begin, part.end);
+				}
+				else
+				{
+					blockPages = rangePages(begin, block->GetEndAddress());
+				}
 				if(changedPages & blockPages) return;
 				uint32 entry = begin / 4;
 				if(currentTable[entry] != block.get()) return;
@@ -313,6 +326,14 @@ bool CVuExecutor::CanJoinSuperBlock(uint32 begin, uint32 end) const
 	if(CVuBasicBlock::IsConditionalBranch(lastLo)) return false;
 	if(lastHi & VUShared::VU_UPPEROP_BIT_E) return false;
 	if(m_context.HasBreakpointInRange(begin, end)) return false;
+	//(Keys hold the size: no content hash unless a key of this size exists)
+	uint32 blockSizeByte = ((end - begin) + 4) & ~3U;
+	bool keySizeUsed = !m_blockNoClamping.empty();
+	for(const auto& compileHints : g_blockCompileHints)
+	{
+		keySizeUsed |= (compileHints.blockKey.second == blockSizeByte);
+	}
+	if(!keySizeUsed) return true;
 	auto blockKey = ComputeBlockKey(begin, end);
 	if(m_blockNoClamping.find(blockKey) != std::end(m_blockNoClamping)) return false;
 	for(const auto& compileHints : g_blockCompileHints)

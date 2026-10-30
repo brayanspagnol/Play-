@@ -21,6 +21,10 @@ public:
 		uint32 end = 0;
 	};
 	void SetSuperBlockParts(std::vector<SUPERBLOCK_PART>);
+	const std::vector<SUPERBLOCK_PART>& GetSuperBlockParts() const
+	{
+		return m_superBlockParts;
+	}
 	bool IsSuperBlock() const override;
 	//Differential test of superblocks: runs reference blocks one at a time
 	typedef std::function<CBasicBlock*(uint32)> ReferenceBlockProvider;

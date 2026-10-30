@@ -13,7 +13,7 @@ namespace BlockCache
 {
 	//Mixed into every key: bump when the JIT output changes (CodeGen or block compilers), so
 	//entries from older code generators are never reused.
-	constexpr uint64 CODEGEN_VERSION = 32; //1: context fields as memarg offsets, 2: VU status/clip flag writes nothing reads skipped, 3: MakeSz/ExpandW wasm forms, 14: ITOFn multiplies (not 4: kept apart from other branches sharing the cache), 20: EE link sites, 30: VU superblock parts don't chain, 31: VU sticky accumulator, 32: no entry loads of promoted values written first (vu1d)
+	constexpr uint64 CODEGEN_VERSION = 50; //1: context fields as memarg offsets, 2: VU status/clip flag writes nothing reads skipped, 3: MakeSz/ExpandW wasm forms, 14: ITOFn multiplies (not 4: kept apart from other branches sharing the cache), 20: EE link sites, 30: VU superblock parts don't chain, 31: VU sticky accumulator, 32: no entry loads of promoted values written first (vu1d), 50: context array accesses with memarg offsets (vu1e)
 
 #pragma pack(push, 1)
 	struct KEY
