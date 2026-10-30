@@ -5,12 +5,14 @@
 #include <functional>
 #include <atomic>
 #include <array>
+#include <cstring>
 #include "signal/Signal.h"
 
 #include "bitmap/Bitmap.h"
 #include "Types.h"
 #include "Convertible.h"
 #include "../MailBox.h"
+#include "../uint128.h"
 #include "../Integer64.h"
 #include "zip/ZipArchiveWriter.h"
 #include "zip/ZipArchiveReader.h"
@@ -882,6 +884,92 @@ public:
 		m_writeBufferSize += count;
 	}
 
+	//GIF PACKED run copied raw into the write buffer and decoded on the GS thread (SubmitWriteBufferImpl):
+	//{PACKED_RUN_MARKER, REGS}, {(NREG - 1) | (first REGS index << 4), count | (Q << 32)}, then count raw qwords.
+	//GIF A+D writes to register PACKED_RUN_MARKER go to PACKED_RUN_MARKER & (REGISTER_MAX - 1) (same effect).
+	static constexpr uint8 PACKED_RUN_MARKER = 0xFF;
+
+	//One GIF PACKED qword other than A+D (0x0E): emit(reg, value) for the GS write it makes, Q state in qtemp
+	template <typename Emit>
+	static inline void DecodePackedQword(uint32 regDesc, const uint8* qword, uint32& qtemp, const Emit& emit)
+	{
+		uint128 packet;
+		memcpy(&packet, qword, sizeof(packet));
+		uint64 temp = 0;
+		switch(regDesc)
+		{
+		case 0x00:
+			//PRIM
+			emit(GS_REG_PRIM, packet.nV0);
+			break;
+		case 0x01:
+			//RGBA
+			temp = (packet.nV[0] & 0xFF);
+			temp |= (packet.nV[1] & 0xFF) << 8;
+			temp |= (packet.nV[2] & 0xFF) << 16;
+			temp |= (packet.nV[3] & 0xFF) << 24;
+			temp |= ((uint64)qtemp << 32);
+			emit(GS_REG_RGBAQ, temp);
+			break;
+		case 0x02:
+			//ST
+			qtemp = packet.nV2;
+			emit(GS_REG_ST, packet.nD0);
+			break;
+		case 0x03:
+			//UV
+			temp = (packet.nV[0] & 0x7FFF);
+			temp |= (packet.nV[1] & 0x7FFF) << 16;
+			emit(GS_REG_UV, temp);
+			break;
+		case 0x04:
+			//XYZF2
+			temp = (packet.nV[0] & 0xFFFF);
+			temp |= (packet.nV[1] & 0xFFFF) << 16;
+			temp |= (uint64)(packet.nV[2] & 0x0FFFFFF0) << 28;
+			temp |= (uint64)(packet.nV[3] & 0x00000FF0) << 52;
+			emit((packet.nV[3] & 0x8000) ? GS_REG_XYZF3 : GS_REG_XYZF2, temp);
+			break;
+		case 0x05:
+			//XYZ2
+			temp = (packet.nV[0] & 0xFFFF);
+			temp |= (packet.nV[1] & 0xFFFF) << 16;
+			temp |= (uint64)(packet.nV[2] & 0xFFFFFFFF) << 32;
+			emit((packet.nV[3] & 0x8000) ? GS_REG_XYZ3 : GS_REG_XYZ2, temp);
+			break;
+		case 0x06:
+			//TEX0_1
+			emit(GS_REG_TEX0_1, packet.nD0);
+			break;
+		case 0x07:
+			//TEX0_2
+			emit(GS_REG_TEX0_2, packet.nD0);
+			break;
+		case 0x08:
+			//CLAMP_1
+			emit(GS_REG_CLAMP_1, packet.nD0);
+			break;
+		case 0x09:
+			//CLAMP_2
+			emit(GS_REG_CLAMP_2, packet.nD0);
+			break;
+		case 0x0A:
+			//FOG
+			emit(GS_REG_FOG, (packet.nD1 >> 36) << 56);
+			break;
+		case 0x0D:
+			//XYZ3
+			emit(GS_REG_XYZ3, packet.nD0);
+			break;
+		case 0x0F:
+			//NOP
+			break;
+		default:
+			assert(0);
+			break;
+		}
+	}
+
 	void ProcessWriteBuffer(const CGsPacketMetadata*);
 	void SubmitWriteBuffer();
 	void FlushWriteBuffer();
@@ -1069,6 +1157,7 @@ protected:
 	void FeedImageDataImpl(const uint8*, uint32);
 	void ReadImageDataImpl(void*, uint32);
 	void SubmitWriteBufferImpl(const RegisterWrite*, const RegisterWrite*);
+	const RegisterWrite* ProcessPackedRun(const RegisterWrite*);
 
 	void UpdateFrameDumpState();
 

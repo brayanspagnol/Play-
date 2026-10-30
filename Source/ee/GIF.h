@@ -96,6 +96,9 @@ private:
 		MASKED_PATH3_XFER_DONE,
 	};
 
+	//Shorter PACKED runs are decoded here (a raw run costs two extra write buffer entries)
+	static constexpr uint32 PACKED_RUN_MIN_QWORDS = 4;
+
 	uint32 ProcessPacked(const uint8*, uint32, uint32);
 	uint32 ProcessRegList(const uint8*, uint32, uint32);
 	uint32 ProcessImage(const uint8*, uint32, uint32, uint32);

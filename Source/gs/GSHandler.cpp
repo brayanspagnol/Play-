@@ -703,6 +703,10 @@ void CGSHandler::ProcessWriteBuffer(const CGsPacketMetadata* metadata)
 		const auto& write = m_currentWriteBuffer[writeIndex];
 		switch(write.first)
 		{
+		case PACKED_RUN_MARKER:
+			//Raw GIF PACKED qwords (never A+D) follow the run header
+			writeIndex += 1 + static_cast<uint32>(m_currentWriteBuffer[writeIndex + 1].second);
+			break;
 		case GS_REG_SIGNAL:
 		{
 			auto signal = make_convertible<SIGNAL>(write.second);
@@ -902,6 +906,11 @@ void CGSHandler::SubmitWriteBufferImpl(const RegisterWrite* writeStart, const Re
 {
 	for(auto write = writeStart; write != writeEnd; write++)
 	{
+		if(write->first == PACKED_RUN_MARKER)
+		{
+			write = ProcessPackedRun(write);
+			continue;
+		}
 		WriteRegisterImpl(write->first, write->second);
 	}
 
@@ -909,6 +918,25 @@ void CGSHandler::SubmitWriteBufferImpl(const RegisterWrite* writeStart, const Re
 	assert(m_transferCount != 0);
 	m_transferCount--;
 #endif
+}
+
+//Decodes a run written by CGIF::ProcessPacked (see PACKED_RUN_MARKER), returns its last entry
+const CGSHandler::RegisterWrite* CGSHandler::ProcessPackedRun(const RegisterWrite* header)
+{
+	uint64 regList = header[0].second;
+	uint32 regs = (header[1].first & 0x0F) + 1;
+	uint32 regIndex = header[1].first >> 4;
+	uint32 count = static_cast<uint32>(header[1].second);
+	uint32 qtemp = static_cast<uint32>(header[1].second >> 32);
+	auto data = reinterpret_cast<const uint8*>(header + 2);
+	static_assert(sizeof(RegisterWrite) == 0x10, "A raw qword takes one write buffer entry");
+	const auto emit = [this](uint8 reg, uint64 value) { WriteRegisterImpl(reg, value); };
+	for(uint32 i = 0; i < count; i++)
+	{
+		DecodePackedQword(static_cast<uint32>((regList >> (regIndex * 4)) & 0x0F), data + (i * 0x10), qtemp, emit);
+		if(++regIndex == regs) regIndex = 0;
+	}
+	return header + 1 + count;
 }
 
 void CGSHandler::BeginTransfer()

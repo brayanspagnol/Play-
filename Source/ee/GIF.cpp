@@ -126,121 +126,74 @@ uint32 CGIF::ProcessPacked(const uint8* memory, uint32 address, uint32 end)
 		m_qtemp = qtemp;
 	};
 
+#ifndef DEBUGGER_INCLUDED
+	//No A+D in the register list: nothing here needs to be seen before the GS thread runs the writes, so the
+	//qwords go raw into the write buffer and the GS thread decodes them (CGSHandler::ProcessPackedRun)
+	if((loops != 0) && (address < end))
+	{
+		uint32 count = std::min<uint32>((end - address + 0x0F) / 0x10, (loops - 1) * regs + regsTemp);
+		bool hasAd = false;
+		for(uint32 i = 0; i < regs; i++)
+		{
+			hasAd |= ((regList >> (i * 4)) & 0x0F) == 0x0E;
+		}
+		if(!hasAd && (count >= PACKED_RUN_MIN_QWORDS) && (room >= count + 2))
+		{
+			uint32 regIndex = regs - regsTemp;
+			writes[0] = CGSHandler::RegisterWrite(CGSHandler::PACKED_RUN_MARKER, regList);
+			writes[1] = CGSHandler::RegisterWrite(static_cast<uint8>((regs - 1) | (regIndex << 4)), count | (static_cast<uint64>(qtemp) << 32));
+			memcpy(writes + 2, memory + address, count * 0x10);
+			writeCount = count + 2;
+			//Q after the run: from its last ST qword, if any
+			for(uint32 i = count; (i-- != 0) && (i + regs >= count);)
+			{
+				if(((regList >> (((regIndex + i) % regs) * 4)) & 0x0F) == 0x02)
+				{
+					qtemp = *reinterpret_cast<const uint32*>(memory + address + (i * 0x10) + 8);
+					break;
+				}
+			}
+			uint32 position = regIndex + count;
+			loops -= position / regs;
+			regsTemp = regs - (position % regs);
+			address += count * 0x10;
+			saveState();
+			return address - start;
+		}
+	}
+#endif
+
 	while((loops != 0) && (address < end))
 	{
 		while((regsTemp != 0) && (address < end))
 		{
-			uint64 temp = 0;
 			uint32 regDesc = (uint32)((regList >> ((regs - regsTemp) * 4)) & 0x0F);
 
-			uint128 packet = *reinterpret_cast<const uint128*>(memory + address);
-
-			switch(regDesc)
+			if(regDesc == 0x0E)
 			{
-			case 0x00:
-				//PRIM
-				writeRegister(GS_REG_PRIM, packet.nV0);
-				break;
-			case 0x01:
-				//RGBA
-				temp = (packet.nV[0] & 0xFF);
-				temp |= (packet.nV[1] & 0xFF) << 8;
-				temp |= (packet.nV[2] & 0xFF) << 16;
-				temp |= (packet.nV[3] & 0xFF) << 24;
-				temp |= ((uint64)qtemp << 32);
-				writeRegister(GS_REG_RGBAQ, temp);
-				break;
-			case 0x02:
-				//ST
-				qtemp = packet.nV2;
-				writeRegister(GS_REG_ST, packet.nD0);
-				break;
-			case 0x03:
-				//UV
-				temp = (packet.nV[0] & 0x7FFF);
-				temp |= (packet.nV[1] & 0x7FFF) << 16;
-				writeRegister(GS_REG_UV, temp);
-				break;
-			case 0x04:
-				//XYZF2
-				temp = (packet.nV[0] & 0xFFFF);
-				temp |= (packet.nV[1] & 0xFFFF) << 16;
-				temp |= (uint64)(packet.nV[2] & 0x0FFFFFF0) << 28;
-				temp |= (uint64)(packet.nV[3] & 0x00000FF0) << 52;
-				if(packet.nV[3] & 0x8000)
-				{
-					writeRegister(GS_REG_XYZF3, temp);
-				}
-				else
-				{
-					writeRegister(GS_REG_XYZF2, temp);
-				}
-				break;
-			case 0x05:
-				//XYZ2
-				temp = (packet.nV[0] & 0xFFFF);
-				temp |= (packet.nV[1] & 0xFFFF) << 16;
-				temp |= (uint64)(packet.nV[2] & 0xFFFFFFFF) << 32;
-				if(packet.nV[3] & 0x8000)
-				{
-					writeRegister(GS_REG_XYZ3, temp);
-				}
-				else
-				{
-					writeRegister(GS_REG_XYZ2, temp);
-				}
-				break;
-			case 0x06:
-				//TEX0_1
-				writeRegister(GS_REG_TEX0_1, packet.nD0);
-				break;
-			case 0x07:
-				//TEX0_2
-				writeRegister(GS_REG_TEX0_2, packet.nD0);
-				break;
-			case 0x08:
-				//CLAMP_1
-				writeRegister(GS_REG_CLAMP_1, packet.nD0);
-				break;
-			case 0x09:
-				//CLAMP_2
-				writeRegister(GS_REG_CLAMP_2, packet.nD0);
-				break;
-			case 0x0A:
-				//FOG
-				writeRegister(GS_REG_FOG, (packet.nD1 >> 36) << 56);
-				break;
-			case 0x0D:
-				//XYZ3
-				writeRegister(GS_REG_XYZ3, packet.nD0);
-				break;
-			case 0x0E:
 				//A + D
+				auto packet = *reinterpret_cast<const uint128*>(memory + address);
+				uint8 reg = static_cast<uint8>(packet.nD1);
+				if(reg == GS_REG_SIGNAL)
 				{
-					uint8 reg = static_cast<uint8>(packet.nD1);
-					if(reg == GS_REG_SIGNAL)
+					//Check if there's already a signal pending
+					auto csr = m_gs->ReadPrivRegister(CGSHandler::GS_CSR);
+					if((m_signalState == SIGNAL_STATE_ENCOUNTERED) || ((csr & CGSHandler::CSR_SIGNAL_EVENT) != 0))
 					{
-						//Check if there's already a signal pending
-						auto csr = m_gs->ReadPrivRegister(CGSHandler::GS_CSR);
-						if((m_signalState == SIGNAL_STATE_ENCOUNTERED) || ((csr & CGSHandler::CSR_SIGNAL_EVENT) != 0))
-						{
-							//If there is, we need to wait for previous signal to be cleared
-							m_signalState = SIGNAL_STATE_PENDING;
-							saveState();
-							return address - start;
-						}
-						m_signalState = SIGNAL_STATE_ENCOUNTERED;
+						//If there is, we need to wait for previous signal to be cleared
+						m_signalState = SIGNAL_STATE_PENDING;
+						saveState();
+						return address - start;
 					}
-					writeRegister(reg, packet.nD0);
-					m_gs->NoteEventWrite(reg);
+					m_signalState = SIGNAL_STATE_ENCOUNTERED;
 				}
-				break;
-			case 0x0F:
-				//NOP
-				break;
-			default:
-				assert(0);
-				break;
+				if(reg == CGSHandler::PACKED_RUN_MARKER) reg &= CGSHandler::REGISTER_MAX - 1;
+				writeRegister(reg, packet.nD0);
+				m_gs->NoteEventWrite(reg);
+			}
+			else
+			{
+				CGSHandler::DecodePackedQword(regDesc, memory + address, qtemp, writeRegister);
 			}
 
 			address += 0x10;
