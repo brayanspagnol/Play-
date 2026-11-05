@@ -352,7 +352,11 @@ void CIPU::LoadState(Framework::CZipArchiveReader& archive)
 	archive.BeginReadFile(STATE_NONINTRAIQ)->Read(m_nNonIntraIQ, sizeof(m_nNonIntraIQ));
 	archive.BeginReadFile(STATE_VQCLUT)->Read(m_nVQCLUT, sizeof(m_nVQCLUT));
 
-	assert(m_currentCmdId == IPU_INVALID_CMDID);
+	//A command word is not part of the state. An FDEC waiting for data has already advanced, so it resumes with FBP = 0.
+	if(m_currentCmdId == IPU_CMD_FDEC)
+	{
+		InitializeCommand(IPU_CMD_FDEC << 28);
+	}
 }
 
 void CIPU::CountTicks(uint32 ticks)
