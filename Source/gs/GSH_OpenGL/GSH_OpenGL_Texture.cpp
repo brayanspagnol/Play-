@@ -793,6 +793,11 @@ void CGSH_OpenGL::PalCache_Insert(const TEX0& tex0, const uint32* contents, GLui
 	texture->m_texture = textureHandle;
 	texture->m_live = true;
 	memcpy(texture->m_contents, contents, entryCount * sizeof(uint32));
+	texture->m_minAlpha = 255;
+	for(unsigned int i = 0; i < entryCount; i++)
+	{
+		texture->m_minAlpha = std::min(texture->m_minAlpha, contents[i] >> 24);
+	}
 
 	m_paletteCache.pop_back();
 	m_paletteCache.push_front(texture);

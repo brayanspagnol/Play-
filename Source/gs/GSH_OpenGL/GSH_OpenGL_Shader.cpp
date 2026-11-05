@@ -207,8 +207,9 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
 
 	shaderBuilder << "float combineColors(float a, float b)" << std::endl;
 	shaderBuilder << "{" << std::endl;
-	shaderBuilder << "	uint aInt = uint(a * 255.0);" << std::endl;
-	shaderBuilder << "	uint bInt = uint(b * 255.0);" << std::endl;
+	//The bias keeps a value that is exactly n / 255 from truncating to n - 1 (GLSL doesn't promise n / 255.0 * 255.0 >= n)
+	shaderBuilder << "	uint aInt = uint(a * 255.0 + 0.01);" << std::endl;
+	shaderBuilder << "	uint bInt = uint(b * 255.0 + 0.01);" << std::endl;
 	shaderBuilder << "	uint result = min((aInt * bInt) >> 7, 255u);" << std::endl;
 	shaderBuilder << "	return float(result) / 255.0;" << std::endl;
 	shaderBuilder << "}" << std::endl;
@@ -588,7 +589,7 @@ std::string CGSH_OpenGL::GenerateAlphaTestSection(ALPHA_TEST_METHOD testMethod, 
 		break;
 	}
 
-	shaderBuilder << "	uint textureColorAlphaInt = uint(textureColor.a * 255.0);" << std::endl;
+	shaderBuilder << "	uint textureColorAlphaInt = uint(textureColor.a * 255.0 + 0.01);" << std::endl;
 	shaderBuilder << test << std::endl;
 	shaderBuilder << "	{" << std::endl;
 

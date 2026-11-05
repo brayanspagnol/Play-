@@ -238,6 +238,7 @@ private:
 		uint32 m_csa;
 		GLuint m_texture;
 		uint32 m_contents[256];
+		uint32 m_minAlpha = 0;
 	};
 	typedef std::shared_ptr<CPalette> PalettePtr;
 	typedef std::list<PalettePtr> PaletteList;
@@ -368,6 +369,7 @@ private:
 	void Prim_Sprite();
 
 	void FlushVertexBuffer();
+	bool CanFailAlphaTest() const;
 	void DoRenderPass();
 
 	void CopyToFb(int32, int32, int32, int32, int32, int32, int32, int32, int32, int32);

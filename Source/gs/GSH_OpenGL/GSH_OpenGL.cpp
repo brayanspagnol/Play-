@@ -2066,6 +2066,29 @@ void CGSH_OpenGL::FlushVertexBuffer()
 			m_vertexBufferUploaded = false;
 			glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
 		}
+		else if(m_renderState.depthMask && !m_hasFramebufferFetchDepthExtension && m_renderState.shaderCaps.hasAlphaTest &&
+		        ((m_renderState.shaderCaps.alphaFailMethod == ALPHA_TEST_FAIL_RGBONLY) || (m_renderState.shaderCaps.alphaFailMethod == ALPHA_TEST_FAIL_FBONLY)) &&
+		        CanFailAlphaTest())
+		{
+			//Fragments failing the alpha test keep their color but must not write depth (nor alpha, for RGB
+			//only): a shader can't drop just these writes, so they get their own pass. If they wrote depth,
+			//the see-through parts of a texture would hide what is drawn behind them later.
+			auto passCaps = m_renderState.shaderCaps;
+			bool depthMask = m_renderState.depthMask;
+			bool colorMaskA = m_renderState.colorMaskA;
+			passCaps.alphaFailMethod = ALPHA_TEST_FAIL_KEEP;
+			DoRenderPassWithCopies(passCaps);
+			m_vertexBufferUploaded = true;
+			passCaps.alphaTestMethod = g_alphaTestInverse[passCaps.alphaTestMethod];
+			m_renderState.depthMask = false;
+			m_renderState.colorMaskA = colorMaskA && (m_renderState.shaderCaps.alphaFailMethod != ALPHA_TEST_FAIL_RGBONLY);
+			m_validGlState &= ~(GLSTATE_DEPTHMASK | GLSTATE_COLORMASK);
+			DoRenderPassWithCopies(passCaps);
+			m_vertexBufferUploaded = false;
+			m_renderState.depthMask = depthMask;
+			m_renderState.colorMaskA = colorMaskA;
+			m_validGlState &= ~(GLSTATE_DEPTHMASK | GLSTATE_COLORMASK);
+		}
 		else
 		{
 			DoRenderPassWithCopies(m_renderState.shaderCaps);
@@ -2088,6 +2111,30 @@ void CGSH_OpenGL::FlushVertexBuffer()
 		DoRenderPass();
 	}
 	m_vertexBuffer.clear();
+}
+
+//Whether a fragment of the vertex buffer may fail the alpha test. Most draws can't (opaque palette, GEQUAL
+//test): they are spared the second pass of FlushVertexBuffer, which doubles the draw calls.
+bool CGSH_OpenGL::CanFailAlphaTest() const
+{
+	const auto& caps = m_renderState.shaderCaps;
+	if(caps.alphaTestMethod == ALPHA_TEST_ALWAYS) return false;
+	if(caps.alphaTestMethod != ALPHA_TEST_GEQUAL) return true;
+
+	uint32 minVertexAlpha = 255;
+	for(const auto& vertex : m_vertexBuffer)
+	{
+		minVertexAlpha = std::min(minVertexAlpha, vertex.color >> 24);
+	}
+	uint32 minAlpha = minVertexAlpha;
+	if((caps.texSourceMode != TEXTURE_SOURCE_MODE_NONE) && caps.texHasAlpha)
+	{
+		//Expanded alpha (16-bit colors) and direct color textures: not known here
+		if(!caps.isIndexedTextureSource() || caps.texUseAlphaExpansion) return true;
+		uint32 minTexAlpha = m_paletteCache.front()->m_minAlpha; //front: the palette prepared last, this draw's
+		minAlpha = (caps.texFunction == TEX0_FUNCTION_MODULATE) ? ((minTexAlpha * minVertexAlpha) >> 7) : minTexAlpha;
+	}
+	return minAlpha < m_fragmentParams.alphaRef;
 }
 
 void CGSH_OpenGL::DoRenderPass()
