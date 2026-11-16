@@ -808,7 +808,7 @@ extern "C" void initVm()
 		//~100 ms queued, so it needs a smooth supply.
 		CAppConfig::GetInstance().SetPreferenceInteger(PREF_AUDIO_SPUBLOCKCOUNT, 10);
 		g_virtualMachine->ReloadSpuBlockCount();
-		CSH_WebAudio::Start();
+		CSH_WebAudio::Start(CPS2VM::OUTPUT_SAMPLE_RATE);
 		g_virtualMachine->CreateSoundHandler(CSH_WebAudio::GetFactoryFunction());
 	}
 

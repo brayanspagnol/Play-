@@ -3,6 +3,7 @@
 #include <cmath>
 #include <climits>
 #include <algorithm>
+#include <array>
 #include "string_format.h"
 #include "Log.h"
 #include "../states/RegisterStateCollectionFile.h"
@@ -65,6 +66,7 @@ using namespace Iop;
 #define STATE_SAMPLEREADER_REGS_ENDFLAG ("SR_EndFlag")
 #define STATE_SAMPLEREADER_REGS_DIDCHANGEREPEAT ("SR_DidChangeRepeat")
 #define STATE_SAMPLEREADER_REGS_BUFFER_FORMAT ("SR_Buffer%d")
+#define STATE_SAMPLEREADER_REGS_PREVSAMPLE ("SR_PrevSample")
 
 #define STATE_IRQWATCHER_REGS_PATH ("iop_spu/spu_irqwatcher.xml")
 
@@ -1243,6 +1245,7 @@ void CSpuBase::CSampleReader::Reset()
 	m_nextSampleAddr = 0;
 	m_repeatAddr = 0;
 	memset(m_buffer, 0, sizeof(m_buffer));
+	m_prevSample = 0;
 	m_pitch = 0;
 	m_srcSampleIdx = 0;
 	m_srcSamplingRate = 0;
@@ -1293,6 +1296,7 @@ void CSpuBase::CSampleReader::LoadState(const CRegisterState& channelState)
 	m_endFlag = channelState.GetRegister32(STATE_SAMPLEREADER_REGS_ENDFLAG) != 0;
 	m_didChangeRepeat = channelState.GetRegister32(STATE_SAMPLEREADER_REGS_DIDCHANGEREPEAT) != 0;
 	RegisterStateUtils::ReadArray(channelState, m_buffer, STATE_SAMPLEREADER_REGS_BUFFER_FORMAT);
+	m_prevSample = static_cast<int16>(channelState.GetRegister32(STATE_SAMPLEREADER_REGS_PREVSAMPLE)); //0 in older states
 
 	UpdateSampleStep();
 }
@@ -1311,6 +1315,7 @@ void CSpuBase::CSampleReader::SaveState(CRegisterState& channelState) const
 	channelState.SetRegister32(STATE_SAMPLEREADER_REGS_ENDFLAG, m_endFlag);
 	channelState.SetRegister32(STATE_SAMPLEREADER_REGS_DIDCHANGEREPEAT, m_didChangeRepeat);
 	RegisterStateUtils::WriteArray(channelState, m_buffer, STATE_SAMPLEREADER_REGS_BUFFER_FORMAT);
+	channelState.SetRegister32(STATE_SAMPLEREADER_REGS_PREVSAMPLE, static_cast<uint16>(m_prevSample));
 }
 
 void CSpuBase::CSampleReader::SetParams(uint32 address, uint32 repeat)
@@ -1320,6 +1325,7 @@ void CSpuBase::CSampleReader::SetParams(uint32 address, uint32 repeat)
 	m_repeatAddr = repeat & (m_ramSize - 1);
 	m_s1 = 0;
 	m_s2 = 0;
+	m_prevSample = 0;
 	m_nextValid = false;
 	m_done = false;
 	m_didChangeRepeat = false;
@@ -1343,14 +1349,43 @@ void CSpuBase::CSampleReader::SetPitch(uint32 baseSamplingRate, uint16 pitch)
 	UpdateSampleStep();
 }
 
+//4-point Gaussian interpolation of the SPU (nocash psx-spx "SPU Pitch"): 256 phases x 4 taps, built with the
+//generator published by Near (credited to nocash and Ryphecha), so the rows sum to ~0x7F80 like the hardware table.
+//Linear interpolation instead (what Play did) leaves strong images/aliases of bright or low-rate samples.
+static const auto g_gaussTable = []() {
+	std::array<std::array<int16, 4>, 256> result = {};
+	const double pi = 3.14159265358979323846;
+	double table[512] = {};
+	for(int n = 0; n < 512; n++)
+	{
+		double k = 0.5 + n;
+		double s = sin(pi * k * 2.048 / 1024);
+		double t = (cos(pi * k * 2.000 / 1023) - 1) * 0.50;
+		double u = (cos(pi * k * 4.000 / 1023) - 1) * 0.08;
+		table[511 - n] = s * (t + u + 1.0) / k;
+	}
+	double sum = 0;
+	for(double v : table) sum += v;
+	for(double& v : table) v *= 0x7F80 * 128 / sum;
+	for(int phase = 0; phase < 256; phase++)
+	{
+		double diff = (table[phase] + table[phase + 256] + table[511 - phase] + table[255 - phase] - 0x7F80) / 4;
+		result[255 - phase] = {static_cast<int16>(std::lround(table[phase] - diff)), static_cast<int16>(std::lround(table[phase + 256] - diff)),
+		                       static_cast<int16>(std::lround(table[511 - phase] - diff)), static_cast<int16>(std::lround(table[255 - phase] - diff))};
+		const auto& row = result[255 - phase];
+		assert(std::abs(row[0] + row[1] + row[2] + row[3] - 0x7F80) <= 2);
+	}
+	return result;
+}();
+
 int32 CSpuBase::CSampleReader::GetSample()
 {
 	uint32 srcSampleIdx = m_srcSampleIdx / PITCH_BASE;
-	int32 srcSampleAlpha = m_srcSampleIdx % PITCH_BASE;
-	int32 currentSample = m_buffer[srcSampleIdx];
-	int32 nextSample = m_buffer[srcSampleIdx + 1];
-	int32 resultSample = (currentSample * (PITCH_BASE - srcSampleAlpha) / PITCH_BASE) +
-	                     (nextSample * srcSampleAlpha / PITCH_BASE);
+	const auto& weights = g_gaussTable[(m_srcSampleIdx % PITCH_BASE) >> 4];
+	//Taps at srcSampleIdx - 1 .. srcSampleIdx + 2: phase 0 is centered on srcSampleIdx
+	int32 before = (srcSampleIdx == 0) ? m_prevSample : m_buffer[srcSampleIdx - 1];
+	int32 resultSample = ((weights[0] * before) >> 15) + ((weights[1] * m_buffer[srcSampleIdx]) >> 15) +
+	                     ((weights[2] * m_buffer[srcSampleIdx + 1]) >> 15) + ((weights[3] * m_buffer[srcSampleIdx + 2]) >> 15);
 	m_srcSampleIdx += m_sampleStep;
 	if(srcSampleIdx >= BUFFER_SAMPLES)
 	{
@@ -1362,6 +1397,7 @@ int32 CSpuBase::CSampleReader::GetSample()
 
 void CSpuBase::CSampleReader::AdvanceBuffer()
 {
+	m_prevSample = m_nextValid ? m_buffer[BUFFER_SAMPLES - 1] : 0;
 	if(m_nextValid)
 	{
 		memmove(m_buffer, m_buffer + BUFFER_SAMPLES, sizeof(int16) * BUFFER_SAMPLES);

@@ -10,7 +10,7 @@ struct SAMPLE_RING
 {
 	enum
 	{
-		FRAMES = 32768, //743 ms at 44.1 kHz
+		FRAMES = 32768, //683 ms at 48 kHz
 	};
 	std::atomic<uint32> write;
 	std::atomic<uint32> read;
@@ -21,10 +21,10 @@ struct SAMPLE_RING
 static_assert(sizeof(std::atomic<uint32>) == 4, "ring header layout");
 static SAMPLE_RING g_ring;
 
-void CSH_WebAudio::Start()
+void CSH_WebAudio::Start(unsigned int sampleRate)
 {
 	g_ring.frames = SAMPLE_RING::FRAMES;
-	MAIN_THREAD_EM_ASM({ Module["webAudioStart"]($0); }, &g_ring);
+	MAIN_THREAD_EM_ASM({ Module["webAudioStart"]($0, $1); }, &g_ring, sampleRate);
 }
 
 CSoundHandler::FactoryFunction CSH_WebAudio::GetFactoryFunction()

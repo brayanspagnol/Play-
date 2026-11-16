@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 const src = readFileSync(new URL("./WebAudio.js", import.meta.url), "utf8");
 let Processor = null;
 globalThis.AudioWorkletProcessor = class { constructor() { this.port = {}; } };
+globalThis.sampleRate = 44100;
 globalThis.registerProcessor = (name, cls) => { Processor = cls; };
 new Function("Module", src + "\nplayAudioWorkletMain();")({});
 

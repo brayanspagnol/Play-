@@ -8,8 +8,8 @@
 class CSH_WebAudio : public CSoundHandler
 {
 public:
-	//Creates the AudioContext and the worklet. Main thread only.
-	static void Start();
+	//Creates the AudioContext (at sampleRate, the rate Write gets) and the worklet. Main thread only.
+	static void Start(unsigned int sampleRate);
 	static FactoryFunction GetFactoryFunction();
 
 	void Reset() override;

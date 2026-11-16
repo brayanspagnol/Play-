@@ -1,5 +1,5 @@
 // Audio output of the web build (linked with --pre-js).
-// The VM thread writes SPU samples (44.1 kHz stereo int16) into a lock-free ring in wasm memory
+// The VM thread writes SPU samples (48 kHz stereo int16, the SPU2's own rate) into a lock-free ring in wasm memory
 // (SH_WebAudio.cpp). An AudioWorklet reads that ring directly from the shared wasm memory, so the
 // main thread is not involved. When the emulator runs slower than real time the worklet time-stretches
 // the audio (WSOLA: tempo change without pitch change) so it slows down with the game instead of
@@ -7,12 +7,12 @@
 
 // Runs inside the AudioWorkletGlobalScope (its source is loaded through a Blob URL).
 function playAudioWorkletMain() {
-	const RATE = 44100;
+	const RATE = sampleRate; // AudioWorkletGlobalScope: the context rate, which is the SPU output rate
 	const HS = 512;          // synthesis hop (output frames per WSOLA step), 11.6 ms
 	const N = 2 * HS;        // frame length, Hann window with 50% overlap
 	const SEEK = 512;        // search range for the best splice point, +/- 11.6 ms (one period down to 86 Hz)
 	const COARSE = 4;        // coarse search decimation
-	const TARGET_DEFAULT = 4410; // input frames kept queued (ring + stretcher), 100 ms (Module.setAudioBufferMs)
+	const TARGET_DEFAULT = Math.round(RATE / 10); // input frames kept queued (ring + stretcher), 100 ms (Module.setAudioBufferMs)
 	const MIN_TEMPO = 0.1, MAX_TEMPO = 1.5; // below 10% speed the producer is effectively stalled: let it gap
 	const RATE_TAU = 0.5 * RATE;    // producer rate estimate time constant (frames)
 	const CORRECT_LOW = 0.5 * RATE; // a fill below target is corrected over ~0.5 s (draining leads to a gap)
@@ -231,7 +231,7 @@ function playAudioWorkletMain() {
 			s[S_TEMPO] = this.running ? this.tempo : 0;
 			s[S_RATE] = this.rate;
 			s[S_FILL] = queued;
-			s[S_FILL_HIST + Math.min(FILL_BINS - 1, Math.floor(queued / 441))]++;
+			s[S_FILL_HIST + Math.min(FILL_BINS - 1, Math.floor(queued / (RATE / 100)))]++;
 			if(this.running) s[S_TEMPO_HIST + Math.min(TEMPO_BINS - 1, Math.floor((Math.abs(this.tempo - 1) < DEADBAND ? 1 : this.tempo) * 10))]++;
 
 			const cap = this.capture;
@@ -252,10 +252,10 @@ function playAudioWorkletMain() {
 }
 
 // Main thread side, called from SH_WebAudio.cpp (CSH_WebAudio::Start) with the ring address.
-Module["webAudioStart"] = function(ring) {
+Module["webAudioStart"] = function(ring, rate) {
 	const stats = new SharedArrayBuffer(8 * 80);
 	const statsView = new Float64Array(stats);
-	const ctx = new AudioContext({ sampleRate: 44100, latencyHint: "interactive" });
+	const ctx = new AudioContext({ sampleRate: rate, latencyHint: "interactive" });
 	const gain = ctx.createGain(); // page volume (Module.setAudioVolume)
 	gain.connect(ctx.destination);
 	let node = null;
@@ -285,7 +285,7 @@ Module["webAudioStart"] = function(ring) {
 	Module["getAudioVolume"] = () => gain.gain.value;
 	// Audio kept queued, 50-250 ms (default 100): more rides out longer stalls of a slow machine, adds latency.
 	Module["setAudioBufferMs"] = (ms) => {
-		target = Math.round(Math.max(50, Math.min(250, +ms || 100)) * 44.1);
+		target = Math.round(Math.max(50, Math.min(250, +ms || 100)) * rate / 1000);
 		node?.port.postMessage({ target });
 	};
 	// Output statistics: counters are cumulative since start, histograms count 128-frame render quanta.
@@ -293,7 +293,7 @@ Module["webAudioStart"] = function(ring) {
 		const s = statsView;
 		return {
 			state: ctx.state, outFrames: s[0], underruns: s[1], silentFrames: s[2], drops: s[3], droppedFrames: s[4],
-			tempo: s[5], rate: s[6], fillMs: s[7] / 44.1, stretchedFrames: s[8], inFrames: s[9], flushes: s[10],
+			tempo: s[5], rate: s[6], fillMs: s[7] * 1000 / rate, stretchedFrames: s[8], inFrames: s[9], flushes: s[10],
 			overflowFrames: hdr()[2], baseLatencyMs: ctx.baseLatency * 1000, outputLatencyMs: (ctx.outputLatency || 0) * 1000,
 			fillHist10ms: Array.from(s.subarray(12, 12 + 41)), tempoHist: Array.from(s.subarray(53, 53 + 16)),
 		};
@@ -301,7 +301,7 @@ Module["webAudioStart"] = function(ring) {
 	// Records the next `seconds` of output (what the worklet sends to the speakers) for offline checks.
 	let capture = null;
 	Module["audioCapture"] = (seconds) => {
-		capture = new SharedArrayBuffer(Math.round(seconds * 44100) * 4);
+		capture = new SharedArrayBuffer(Math.round(seconds * rate) * 4);
 		node.port.postMessage({ capture });
 	};
 	Module["audioCaptureWav"] = () => { // WAV bytes once the capture is complete, else null
@@ -309,8 +309,8 @@ Module["webAudioStart"] = function(ring) {
 		const data = new Uint8Array(capture), wav = new Uint8Array(44 + data.length), v = new DataView(wav.buffer);
 		const str = (o, t) => { for(let i = 0; i < t.length; i++) wav[o + i] = t.charCodeAt(i); };
 		str(0, "RIFF"); v.setUint32(4, 36 + data.length, true); str(8, "WAVEfmt ");
-		v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, 44100, true);
-		v.setUint32(28, 44100 * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+		v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true); v.setUint32(24, rate, true);
+		v.setUint32(28, rate * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
 		str(36, "data"); v.setUint32(40, data.length, true);
 		wav.set(data, 44);
 		return wav;

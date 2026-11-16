@@ -347,6 +347,7 @@ namespace Iop
 			uint32 m_nextSampleAddr = 0;
 			uint32 m_repeatAddr = 0;
 			int16 m_buffer[BUFFER_SAMPLES * 2];
+			int16 m_prevSample = 0; //last sample of the block before m_buffer (first tap of the Gaussian interpolation)
 			uint16 m_pitch;
 			int32 m_s1;
 			int32 m_s2;

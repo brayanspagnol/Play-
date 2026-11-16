@@ -21,6 +21,14 @@
 class CPS2VM : public CVirtualMachine
 {
 public:
+#ifdef __EMSCRIPTEN__
+	//Native SPU2 rate: voices at pitch 0x1000 and the sound data input (streams, movies) need no resampling
+	//(at 44.1 kHz the input was decimated by dropping samples). The browser resamples to the device if needed.
+	static constexpr unsigned int OUTPUT_SAMPLE_RATE = 48000;
+#else
+	static constexpr unsigned int OUTPUT_SAMPLE_RATE = 44100;
+#endif
+
 	struct CPU_UTILISATION_INFO
 	{
 		int32 eeTotalTicks = 0;
@@ -198,8 +206,8 @@ private:
 	//SPU update parameters
 	enum
 	{
-		DST_SAMPLE_RATE = 44100,
-		SAMPLES_PER_UPDATE = 45, //44100 / 45 -> 980 SPU updates per second
+		DST_SAMPLE_RATE = OUTPUT_SAMPLE_RATE,
+		SAMPLES_PER_UPDATE = 45, //44100 / 45 -> 980 SPU updates per second (48000 / 45 -> 1067)
 		SPU_UPDATE_TICKS_PRECISION = 32,
 		BLOCK_SIZE = SAMPLES_PER_UPDATE * 2,
 		MAX_BLOCK_COUNT = 400,
